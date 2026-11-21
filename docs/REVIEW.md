@@ -134,6 +134,21 @@ và `reason` của OOM nói "output dở vẫn còn, pull trước".
 | Dòng `0` của bảng exit **key theo field** (`state`, `reachable`) thay vì `—`; thêm câu "**Exit 0 means the command ran, not that the work is done**" | `roff status` trả **exit 0** cho job *đang chạy* (`cmd_status` → `emit({..., "state": "running"}, 0)`), còn dòng bảng cũ nói "the job finished cleanly → pull the artifacts" với cột field là `—` (tức "không có gì để đọc"). Agent monitor bằng `roff status` → thấy 0 → pull `$ROFF_OUT` rỗng → báo thành công trong khi job còn chạy. Đã verify live: `status` job đang chạy → exit 0 + `state: running`; `wait --timeout 3` → 124; `cancel` → 130; `status` sau cancel → 130 + `state: exited, exit: 130` |
 | Bước 6: "Always pass `--timeout`: without it `wait` blocks forever and prints nothing if the host goes down" | `roff wait` mặc định `--timeout 0` = chờ vô hạn; nhánh `unreachable` chỉ emit khi đã hết deadline → treo im lặng, không 255, không 124. Agent không có `--timeout` là treo session |
 
+### Vòng 6 — agent synthesis (chưa chạy xong) đã probe thêm 2 lỗi hợp đồng
+
+Agent synthesis của workflow **chưa sinh ra bản tổng hợp** (journal dừng ở `started Synthesize`),
+nhưng transcript của nó có probe thực nghiệm và phát hiện 2 chỗ bảng exit nói sai. Cả hai đã
+verify lại bằng code + host thật:
+
+| Sửa | Vì sao |
+|---|---|
+| Tách dòng `2` thành hai: `2` + `error` (input bị từ chối trước khi chạy) và `2` + `—` (argparse usage error, **không** có JSON) | `RoffError(2, …)` in JSON (`{"ok": false, "error": "unknown job nosuchjob …"}`) — còn argparse usage error thì in usage ra stderr và **không** có JSON. Bảng cũ gộp cả hai và nói "prints no JSON", sai với nửa kia. Agent gõ sai job id sẽ đi tìm JSON không tồn tại. Verify live: `status nosuchjob` → exit 2 + JSON; `logs` thiếu tham số → exit 2 + usage trên stderr, không JSON |
+| Dòng `255` đọc field `detail` (không phải `error`); decision rule 255 nói rõ "Permission denied (publickey)" là **key bị từ chối phía bạn**, không phải host chết | `error` chỉ là vỏ ("cannot resolve remote HOME on h"); nguyên nhân thật nằm ở `detail` ("Permission denied (publickey)."). Không nêu `detail` thì agent không phân biệt được "key hỏng → báo user" với "host chết → đổi host", và SKILL.md bảo "pick another host" — sai với lỗi key. Verify live (ssh giả, exit 255): `{"ok": false, "error": "cannot resolve remote HOME on h", "host": "h", "detail": "Permission denied (publickey)."}` |
+
+Hai sửa nhỏ kèm theo sau khi đọc lại SKILL.md từ đầu: dòng `124` bỏ lại `—` (cột field chỉ lặp
+lại cột "Do" — exit code 124 đã đủ để biết), và `wiped_since_last_probe` /
+`restarted_since_last_probe` ghi rõ "chỉ có mặt khi đúng" (code chỉ set khi `True`).
+
 ---
 
 ## 4. Còn mở (xếp theo payoff)
