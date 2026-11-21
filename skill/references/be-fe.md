@@ -47,6 +47,10 @@ roff tunnel start <host> --lport 13000 --rport 3000   # FE → http://127.0.0.1:
 curl -sf http://127.0.0.1:18000/health
 ```
 
+`tunnel start` also checks the remote port: exit 1 (`remote_listening: false`) means the
+server isn't up yet — go back to step 3, don't retry the tunnel blindly. `remote_listening:
+null` means the check couldn't run; the curl above is then the proof.
+
 FE must proxy API calls to the BE's remote port (or bind 0.0.0.0 and use the host's
 internal address) — the browser hits the tunnel, the FE server talks to BE server-side.
 

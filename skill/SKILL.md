@@ -24,15 +24,15 @@ says *why*. This table is the whole contract — read the field before acting.
 
 | Exit | JSON field | Means | Do |
 |---|---|---|---|
-| 0 | `state`, `reachable`, `error` | the command succeeded | for `wait`: `state` = exited and `exit` = 0 → pull the artifacts. For `status`: `state` = running → the job is still going, wait again. For `probe`/`hosts`: read `reachable` per host — `false` = the host is unusable, so read that host's `error`: "Permission denied" = your key was refused → tell the user; anything else = the host is down → pick another |
+| 0 | `state`, `reachable` | the command succeeded | for `wait`: `state` = exited and `exit` = 0 → pull the artifacts. For `status`: `state` = running → the job is still going, wait again. For `probe`/`hosts`: `reachable` is true (a single-host probe of an unreachable host exits 255, below) |
 | 1 | `exit` | the job ran and failed | `roff logs <id>` → fix the cause → resubmit. Never retry blind |
-| 1 | `error`, no `job` | a pre-job step failed (push, ensure, launch) — no job exists | read `error`, fix that step, rerun it. There is no job id to log |
+| 1 | `error`, no `job` | a pre-job step failed (push, ensure, launch, tunnel-to-a-dead-service) — no job exists | read `error`, fix that step, rerun it. There is no job id to log |
 | 2 | `error` | the input was rejected before anything ran | read `error` and fix that input: an unknown job id, a missing local dir, a malformed `--env`, an invalid setup name. Nothing ran, so there is no job to clean up |
 | 2 | — | argparse usage error | the usage message is on stderr and no JSON is printed — fix the command line |
 | 97 | `exit` = 97 | the workdir didn't exist on the host | the `--project` name was never pushed: `roff push` with the same name, then resubmit |
 | 124 | — | the wait timed out | not a failure: the job keeps running. `roff wait` again |
 | 130 | `exit` = 130 | the job was cancelled on purpose | don't resubmit; tell the user and ask |
-| 255 | `detail` | cannot talk to the host — unreachable, auth refused, or timeout | read `detail`: "Permission denied" = your key was refused, ask the user; unreachable or timeout = the host is down, pick another. Contact loss is not process death — the job may still be running. Never run locally |
+| 255 | `detail` | cannot talk to the host — unreachable, auth refused, or timeout (including a single-host `probe`) | read `detail`: "Permission denied" = your key was refused, ask the user; unreachable or timeout = the host is down, pick another. Contact loss is not process death — the job may still be running. Never run locally |
 | 69 | `reason` = host restarted | the job process died with the reboot | `$ROFF_OUT` may still hold partial output — `roff pull` first, then re-`ensure`, re-`push`, resubmit |
 | 69 | `reason` = job dir missing | the host was wiped | re-`probe`, re-`ensure`, re-`push`, resubmit |
 | 69 | `reason` = process vanished without an exit file | the job was OOM-killed or killed | `$ROFF_OUT` may still hold partial output — `roff pull` first, then use a host with more RAM or a smaller job. Do not resubmit the same job unchanged |
@@ -59,10 +59,10 @@ The job ledger survives everything local: `roff jobs` lists past jobs with ids/h
 
 1. **Discover + probe** (once per session, or when a host misbehaves):
    `roff probe <host>` probes one host. `roff hosts` probes every `~/.ssh/config` alias **one at a time** — serial by default, because a single-session bridge cannot take two concurrent ssh sessions (step 2). Add `--parallel` only when every alias is known to tolerate concurrent ssh.
-   The profile is a capability contract: `reachable` (false = the host is unusable — read `error` for the cause), `error` (present only when `reachable` is false — the ssh error text), `tools` (ffmpeg/node/python3/…), `gpu` (**null = no GPU; never emit CUDA commands or GPU claims**; the key is *absent* on an unreachable host, which means "unknown", not "no GPU"), `cores`, `mem_available_mb`, `load`, `disk_free_mb`, `durable_mount` (null on most hosts), `durable_local` (a **local** durable mount — the one the layout actually uses), `layout_root` (absolute path where `projects/`, `jobs/`, `toolchain/` live), `boot_id`, `instance_token`, `home`.
+   The profile is a capability contract: `reachable` (a single-host probe of an unusable host exits 255 with `detail`; in a `hosts`/`all` sweep it is `false` per host — read `error` for the cause), `error` (present only when `reachable` is false — the ssh error text), `tools` (ffmpeg/node/python3/…), `gpu` (**null = no GPU; never emit CUDA commands or GPU claims**; the key is *absent* on an unreachable host, which means "unknown", not "no GPU"), `cores`, `mem_available_mb`, `cgroup_mem_limit_mb` / `cgroup_mem_used_mb` (the container's real memory ceiling — **null = no cgroup limit found**), `load`, `disk_free_mb`, `durable_mount` (null on most hosts), `durable_local` (a **local** durable mount — the one the layout actually uses), `layout_root` (absolute path where `projects/`, `jobs/`, `toolchain/` live), `boot_id`, `instance_token`, `home`.
    `wiped_since_last_probe` / `restarted_since_last_probe` (each present only when true) mean: re-`ensure` toolchains and re-`push` projects before running — unless `layout_root` is on a durable mount, in which case the pushed project survived and only the job needs resubmitting.
    *Done when:* you hold a profile for the host you intend to use, and its `tools` list contains the binary the job needs (or you have a setup script for it).
-2. **Place**: pick a reachable host that has the needed tool (or can `ensure` it), enough free RAM/disk, lowest load. Prefer hosts with a `durable_mount` for long-lived data. A host that recycles (Muse containers restart on their own, often within hours) is only fit for **short** jobs unless its `layout_root` is durable: check `mem_available_mb` before sending anything heavy — a Muse container with ~600 MB free will OOM-kill a big transcode (exit 69, "process vanished").
+2. **Place**: pick a reachable host that has the needed tool (or can `ensure` it), enough free RAM/disk, lowest load. Prefer hosts with a `durable_mount` for long-lived data. A host that recycles (Muse containers restart on their own, often within hours) is only fit for **short** jobs unless its `layout_root` is durable. Memory sizing: when `cgroup_mem_limit_mb` is non-null, that limit minus `cgroup_mem_used_mb` is the job's real budget — exceed it and the job is OOM-killed (exit 69, "process vanished"). When it is null, jobs share host RAM: `mem_available_mb` is reclaimable-cache-aware and can read low (~600 MB) on a host that still runs multi-GB jobs fine — judge by `mem_mb` and `load`, not by that number alone.
    | Symptom | Means | Do |
    |---|---|---|
    | `reachable: false` and `error` says "Permission denied" | your key was refused on that host | tell the user — it is not a dead host |
@@ -71,7 +71,7 @@ The job ledger survives everything local: `roff jobs` lists past jobs with ids/h
    | two aliases in one `roff hosts` output share a host but differ in `instance_token` | that alias flapped to a new container | use the stable alias and tell the user |
    | probe error mentions `429` or `already active` | single-session bridge | serialize your ssh calls, or move to another host |
    | `gpu: null` | no GPU on that host | CPU only (libx264), never a CUDA command |
-   | `mem_available_mb` low | the job may be OOM-killed | pick a roomier host or shrink the job |
+   | `cgroup_mem_limit_mb` non-null and nearly used up | the job may be OOM-killed | pick a roomier host or shrink the job |
    **Single-session bridges** (colab `ProxyCommand`, some reverse tunnels) allow only ONE active ssh session — concurrent jobs or agents get HTTP 429 / connection closed. Don't fan out parallel jobs onto one.
    *Done when:* one alias is chosen, it is reachable, and it has the tool.
 3. **Setup once** (only when a needed tool is missing): `roff ensure <host> --setup <skill-dir>/setups/node.sh --name node`.
@@ -84,11 +84,11 @@ The job ledger survives everything local: `roff jobs` lists past jobs with ids/h
    Returns a job id immediately; the job survives ssh disconnects and agent restarts (ledger in `~/.local/state/roff/jobs`). The response also carries a `next` array of three ready-to-run commands — run them **in order, one at a time**: wait, then logs, then pull. In commands, write artifacts to `"$ROFF_OUT"` (the job's out dir) — the workdir is the project, not the job dir.
    *Done when:* you have the job id and it is in `roff jobs`.
 6. **Monitor**: `roff wait <id> --timeout <s>` (exit mirrors outcome) or `roff status <id>` / `roff logs <id> --tail 50`.
-   Always pass `--timeout`: without it `wait` blocks forever and prints nothing if the host goes down.
+   `wait` defaults to `--timeout 3600`; pass a bigger one for longer jobs. Never `--timeout 0`: it blocks forever and prints nothing if the host goes down.
    *Done when:* `wait` returns a terminal code — 0 (finished cleanly), 1 (the job failed), 69 (lost), 97 (workdir missing) or 130 (cancelled). **124 is not done**: the job is still running — wait again, and do not pull or report yet. With `status`, exit 0 alone proves nothing: read `state` — `running` = still going. Any other code is in the table above.
 7. **Fetch artifacts — mandatory**: `roff pull <id> --local <dir>` → sha256 manifest of the files this pull brought (stale files already in `<dir>` are not listed). A run whose artifacts were not fetched is not done. For non-job dirs: `roff pull --host h --remote '~/.roff/projects/p' --local dir`.
    Paths are resolved to absolute remote HOME automatically (colab bridges don't tilde-expand). If a host's profile is stale, `roff probe <host>` refreshes it (includes `home`).
-8. **Services / e2e** *(optional branch)*: start the server as a job (`setsid nohup … &` inside cmd), then `roff tunnel start <host> --lport <L> --rport <R>` → `http://127.0.0.1:<L>`. `roff tunnel list` / `tunnel stop <host> --lport <L>`. Always stop tunnels you opened when done.
+8. **Services / e2e** *(optional branch)*: start the server as a job (`setsid nohup … &` inside cmd), then `roff tunnel start <host> --lport <L> --rport <R>` → `http://127.0.0.1:<L>`. The start also checks the remote port: exit 1 with `remote_listening: false` = nothing serves `<R>` on the host — start the service first, then re-tunnel. `remote_listening: null` = could not check (no `ss`, unreadable `/proc/net`) — verify with one request through the tunnel. `roff tunnel list` / `tunnel stop <host> --lport <L>`. Always stop tunnels you opened when done.
    If curl resets though the tunnel reports up, a stale shared ssh master may own the port: the tunnel JSON's `note`/`master_pid` names it; `tunnel stop` cancels that forward. Re-start after stopping.
 
 ## Recipes

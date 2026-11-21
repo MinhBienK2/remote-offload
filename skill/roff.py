@@ -144,7 +144,12 @@ def have_rsync(host):
 
 
 def rsync_cmd():
-    return ["rsync", "-az", "--checksum", "-e", "ssh " + " ".join(shlex.quote(o) for o in SSH_OPTS)]
+    # Never preserve owner/group/perms: the remote user is usually different
+    # (and Muse durable mounts refuse chown outright — rsync exit 23 even
+    # though every file transferred). Content + mtime are what a build needs.
+    return ["rsync", "-rlptz", "--checksum", "--no-o", "--no-g", "--no-perms",
+            "--omit-dir-times",
+            "-e", "ssh " + " ".join(shlex.quote(o) for o in SSH_OPTS)]
 
 
 def load_profile(host):
@@ -203,6 +208,24 @@ inst=$(cat "$HOME/.roff/instance")
 cores=$(nproc 2>/dev/null || echo 0)
 mem=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
 memav=$(awk '/MemAvailable/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
+# Container memory truth: a cgroup limit is what OOM-kills a job, not host
+# MemAvailable (mostly reclaimable page cache). cgroup v2 then v1; null = no
+# limit found (jobs share host RAM).
+cglimit=null
+cgused=null
+cgmax=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo "")
+if [ -n "$cgmax" ]; then
+  if [ "$cgmax" != max ]; then cglimit=$((cgmax / 1048576)); fi
+  cur=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo "")
+  [ -n "$cur" ] && cgused=$((cur / 1048576))
+else
+  v1=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo "")
+  if [ -n "$v1" ] && [ "$v1" -lt 9000000000000000000 ] 2>/dev/null; then
+    cglimit=$((v1 / 1048576))
+    cur=$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null || echo "")
+    [ -n "$cur" ] && cgused=$((cur / 1048576))
+  fi
+fi
 load=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo "")
 diskbase="$HOME"; [ -n "$dlocal" ] && diskbase="$dlocal"
 disk=$(df -Pm "$diskbase" 2>/dev/null | awk 'NR==2{print $4}')
@@ -226,8 +249,8 @@ done
 dlocal_json=null
 [ -n "$dlocal" ] && dlocal_json="\"$dlocal\""
 os=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" || uname -s)
-printf '{"boot_id":"%s","instance_token":"%s","home":"%s","os":"%s","arch":"%s","cores":%s,"mem_mb":%s,"mem_available_mb":%s,"load":"%s","disk_free_mb":%s,"uptime_s":%s,"tools":%s,"gpu":%s,"durable_mount":%s,"durable_local":%s,"layout_root":"%s"}\n' \
-  "$boot" "$inst" "$HOME" "$os" "$(uname -m)" "$cores" "$mem" "$memav" "$load" "${disk:-0}" "$up" "$tools" "$gpu" "$durable" "$dlocal_json" "$ROOT"
+printf '{"boot_id":"%s","instance_token":"%s","home":"%s","os":"%s","arch":"%s","cores":%s,"mem_mb":%s,"mem_available_mb":%s,"cgroup_mem_limit_mb":%s,"cgroup_mem_used_mb":%s,"load":"%s","disk_free_mb":%s,"uptime_s":%s,"tools":%s,"gpu":%s,"durable_mount":%s,"durable_local":%s,"layout_root":"%s"}\n' \
+  "$boot" "$inst" "$HOME" "$os" "$(uname -m)" "$cores" "$mem" "$memav" "$cglimit" "$cgused" "$load" "${disk:-0}" "$up" "$tools" "$gpu" "$durable" "$dlocal_json" "$ROOT"
 '''
 
 
@@ -372,7 +395,13 @@ def cmd_probe(a):
         if not prof:
             raise RoffError(2, f"no cached profile for {a.host}; run probe first")
         emit({"ok": True, **prof})
-    emit({"ok": True, **safe_probe(a.host, a.timeout)})
+    prof = safe_probe(a.host, a.timeout)
+    # A single-host probe that cannot reach the host fails loudly (255), same
+    # as every other command. Sweeps ('all'/'hosts') stay 0 and report
+    # reachable per host.
+    if not prof.get("reachable"):
+        emit({"ok": False, **prof, "detail": prof.get("error", "")}, 255)
+    emit({"ok": True, **prof})
 
 
 def remote_home(host):
@@ -451,7 +480,9 @@ def transfer_up(host, local, remote, excludes, timeout):
     for e in excludes:
         cmd += ["--exclude", e]
     cmd += ["."]
-    rp_cmd = f'mkdir -p "{absr}" && tar -C "{absr}" -xf -'
+    # root tar restores archive ownership by default: same chown refusal on
+    # durable mounts. Extract as the remote user, with default permissions.
+    rp_cmd = f'mkdir -p "{absr}" && tar --no-same-owner --no-same-permissions -C "{absr}" -xf -'
     rp = subprocess.Popen(ssh_base(host) + [rp_cmd],
                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     tp = subprocess.Popen(cmd, stdout=rp.stdin, stderr=subprocess.PIPE)
@@ -731,9 +762,9 @@ def cmd_run(a):
     save_job(job)
     emit({"ok": True, "job": jid, "host": host, "pid": pid, "remote": remote,
           "workdir": workdir, "ensure": setup_info,
-          "next": [f"{SELF} wait {jid} --timeout 3600",
-                   f"{SELF} logs {jid} --tail 50",
-                   f"{SELF} pull {jid} --local ./out"]})
+          "next": [f"python3 {SELF} wait {jid} --timeout 3600",
+                   f"python3 {SELF} logs {jid} --tail 50",
+                   f"python3 {SELF} pull {jid} --local ./out"]})
 
 
 def remote_state(host, job, timeout=30):
@@ -792,14 +823,18 @@ def cmd_status(a):
 def cmd_logs(a):
     job = load_job(a.job)
     d = rpath(job["remote"])
-    p = ssh(job["host"], f'tail -n {int(a.tail)} "{d}/log" 2>/dev/null; echo; wc -l < "{d}/log" 2>/dev/null')
+    # Log content first, line count after a unique marker: log lines can look
+    # like anything (even digits), so the count must not be guessed from the
+    # tail. No trailing blank line in `lines`.
+    p = ssh(job["host"], f'tail -n {int(a.tail)} "{d}/log" 2>/dev/null; '
+                         f'printf "ROFF_TOTAL="; wc -l < "{d}/log" 2>/dev/null || echo 0')
     if p.returncode == 255:
         raise RoffError(255, f"logs: host unreachable: {job['host']}",
                         host=job["host"], detail=p.stderr.strip()[-400:])
-    lines = p.stdout.splitlines()
-    total = lines[-1].strip() if lines and lines[-1].strip().isdigit() else "0"
-    emit({"ok": True, "job": a.job, "total_lines": int(total),
-          "lines": lines[:-1] if total != "0" else lines})
+    content, _, total = p.stdout.rpartition("ROFF_TOTAL=")
+    lines = content.splitlines()
+    emit({"ok": True, "job": a.job, "total_lines": int(total.strip() or 0),
+          "lines": lines})
 
 
 def cmd_wait(a):
@@ -980,10 +1015,45 @@ def cmd_tunnel(a):
                   f"stop it with: ssh -O cancel -L {a.lport}:127.0.0.1:{a.rport} {a.host}")
     else:
         t_note = None
+    # A local listener proves only the ssh forward exists, not that anything
+    # on the host serves rport. Check the remote port itself; a dead service
+    # must not read as a healthy tunnel (curl would reset through it).
+    rp = ssh(a.host,
+             f'if command -v ss >/dev/null 2>&1; then ss -ltn 2>/dev/null; '
+             f'else cat /proc/net/tcp /proc/net/tcp6 2>/dev/null; fi', 15)
+    remote_listening = None
+    if rp.returncode == 0:
+        if "Local Address" in rp.stdout:
+            remote_listening = any(
+                ln.split()[3].endswith(f":{a.rport}")
+                for ln in rp.stdout.splitlines()[1:] if len(ln.split()) > 3)
+        else:
+            hexport = f"{a.rport:04X}"
+            remote_listening = any(
+                len(ln.split()) > 3 and ln.split()[1].endswith(":" + hexport)
+                and ln.split()[3] == "0A"
+                for ln in rp.stdout.splitlines())
+    if remote_listening is False:
+        # Tear the forward down, whoever owns it: killing proc does nothing
+        # when a shared ssh master adopted the -L — that listener would leak.
+        if owner is not None and owner != proc.pid:
+            subprocess.run(["ssh", *SSH_OPTS, "-O", "cancel",
+                            "-L", f"{a.lport}:127.0.0.1:{a.rport}", a.host],
+                           capture_output=True, timeout=15)
+        if proc.poll() is None:
+            proc.terminate()
+        try:
+            Path(errpath).unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RoffError(1, f"tunnel up but nothing is listening on {a.host}:{a.rport} — "
+                           f"start the service first (run it as a job), then re-tunnel",
+                        host=a.host, remote_listening=False)
     t = {"host": a.host, "lport": a.lport, "rport": a.rport,
          "pid": owner if (owner is not None and owner != proc.pid) else proc.pid,
          "master_pid": owner if (owner is not None and owner != proc.pid) else None,
          "url": f"http://127.0.0.1:{a.lport}",
+         "remote_listening": remote_listening,
          "note": t_note,
          "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
     f.write_text(json.dumps(t, indent=1))
@@ -1054,7 +1124,8 @@ def main():
 
     p = sub.add_parser("wait", help="poll until terminal state; exit mirrors job outcome")
     p.add_argument("job")
-    p.add_argument("--timeout", type=int, default=0, help="seconds; 0 = wait forever")
+    p.add_argument("--timeout", type=int, default=3600,
+                   help="seconds; 0 = wait forever (avoid: prints nothing if the host goes down)")
     p.set_defaults(fn=cmd_wait)
 
     p = sub.add_parser("pull", help="fetch artifacts (default: job out/) with sha256 manifest")

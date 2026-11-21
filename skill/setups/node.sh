@@ -22,7 +22,9 @@ TARBALL="node-${NODE_VERSION}-linux-${NARCH}.tar.xz"
 cd "$TC"
 if [ ! -x "$TC/node/bin/node" ]; then
   curl -fsSL "https://nodejs.org/dist/${NODE_VERSION}/${TARBALL}" -o "$TARBALL"
-  tar -xf "$TARBALL"
+  # root tar restores archive ownership by default; durable mounts (Muse
+  # /home/hatch) refuse chown — extract as the running user instead.
+  tar --no-same-owner --no-same-permissions -xf "$TARBALL"
   mv "node-${NODE_VERSION}-linux-${NARCH}" node
   rm -f "$TARBALL"
 fi

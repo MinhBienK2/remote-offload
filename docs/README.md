@@ -81,7 +81,12 @@ long-job disconnect survival + cancel, dead-host fail-loud + placement. Evidence
 exit-code ledgers in `docs/RETRO.md`. Real bugs found and fixed this way: tilde paths
 on Colab bridges, single-session bridge contention, stale ssh ControlMaster owning
 tunnel ports, secrets leaking into remote `argv` and the audit log, `~/.ssh/config`
-parsing that missed `Include` and mistook option keywords for host names.
+parsing that missed `Include` and mistook option keywords for host names. A later
+15-scenario sweep on four Muse containers added: rsync/tar ownership preservation
+failing on chown-restricted durable mounts (transfers now keep content+mtime only),
+container memory sizing via cgroup limits instead of host `MemAvailable`, tunnels
+verified against the remote listener (a dead service no longer reads as a healthy
+tunnel), and fail-loud single-host probes.
 
 ## License
 
