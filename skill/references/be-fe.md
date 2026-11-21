@@ -1,5 +1,7 @@
 # BE + FE on a remote host (setup-once, survives restarts)
 
+Commands below use `roff` = `python3 <skill-dir>/roff.py` (see SKILL.md).
+
 ## 1. Toolchain once, not per job
 
 `roff probe <host>` — if `tools.node`/`tools.npm` missing:
@@ -18,7 +20,7 @@ Python deps: same pattern — a setup script doing `pip3 install --user …` or 
 
 ```bash
 roff push <host> ./myapp --name myapp            # node_modules excluded by default
-roff run <host> --project myapp --ensure setups/node.sh --ensure-name node --cmd '
+roff run <host> --project myapp --ensure <skill-dir>/setups/node.sh --ensure-name node --cmd '
   [ -d node_modules ] || npm ci --no-audit --no-fund
   npm run build
 '

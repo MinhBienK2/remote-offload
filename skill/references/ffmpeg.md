@@ -1,5 +1,7 @@
 # ffmpeg / media offload
 
+Commands below use `roff` = `python3 <skill-dir>/roff.py` (see SKILL.md).
+
 Probe first: `roff probe <host>` — `tools.ffmpeg` must be present (Colab/muse images usually ship it). If missing, write an idempotent setup (static ffmpeg build into `~/.roff/toolchain/bin`) and `roff ensure`.
 
 ## Transcode a local file
@@ -13,7 +15,7 @@ roff run <host> --project media --cmd '
   ffprobe -v error -show_entries format=duration,size -of json "$ROFF_OUT/output.mp4" > "$ROFF_OUT/probe.json"
 '
 roff wait <id> --timeout 3600                    # long renders: big timeout, 124 = still running
-roff pull <id> --local ./out                     # sha256 manifest; verify before declaring done
+roff pull <id> --local ./out                     # sha256 manifest of the files this pull brought
 ```
 
 ## Generate + encode (no local input)
@@ -31,4 +33,4 @@ roff run <host> --cmd '
 - Write every output under `"$ROFF_OUT"`, then `roff pull`. Never leave results only on the host.
 - GPU encoding (`h264_nvenc`) only when `probe.gpu` is non-null AND `ffmpeg -encoders | grep nvenc` succeeds on that host; otherwise CPU libx264.
 - Many files: one job looping over inputs beats one job per file (ssh round-trips dominate).
-- Host restarted mid-render → `wait` returns 69: re-probe, re-push inputs, resubmit. Partial outputs on the host are gone.
+- Host restarted mid-render → `wait` returns 69. A reboot keeps the job directory, so partial output in `$ROFF_OUT` is usually still there: `roff pull` it before re-probing and resubmitting. Only a *wiped* host loses everything.

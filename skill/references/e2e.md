@@ -1,23 +1,23 @@
 # Headless browser e2e + screenshots on a remote host
 
+Commands below use `roff` = `python3 <skill-dir>/roff.py` (see SKILL.md).
+
 Two shapes; pick by what you need:
 
 ## A. Whole suite remote (preferred for heavy suites)
 
 Push the project, ensure node + a browser, run the suite as a job, pull reports/screenshots.
 
-Browser bootstrap (idempotent setup script, `roff ensure … --name playwright`):
+Browser bootstrap is a setup script, like node — run it with `roff ensure` **before** the job
+(`--ensure` on `roff run` takes a single script, so it cannot carry both):
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-export PATH="$HOME/.roff/toolchain/bin:$HOME/.local/bin:$PATH"
-command -v npx >/dev/null || { echo "ensure node first"; exit 1; }
-if [ ! -d "$HOME/.cache/ms-playwright" ] || ! ls "$HOME/.cache/ms-playwright"/chromium-* >/dev/null 2>&1; then
-  timeout 600 npx -y playwright@latest install --with-deps chromium \
-    || { echo "chromium download stalled/failed (weak host or CDN); pick another host or use executablePath"; exit 1; }
-fi
+roff ensure <host> --setup <skill-dir>/setups/node.sh --name node
+roff ensure <host> --setup <skill-dir>/setups/playwright-chromium.sh --name playwright
 ```
+
+If the project pins its own playwright version, edit `playwright-chromium.sh` to install that
+version — the browser build and the playwright package must agree.
 
 `--with-deps` needs root (these hosts are root). If apt is unavailable, install chromium
 via the distro package and point Playwright at it (`executablePath`). Xvfb is present on
@@ -25,9 +25,8 @@ these images but headless chromium does not need it.
 
 ```bash
 roff push <host> ./app --name app
-roff run <host> --project app --ensure setups/node.sh --ensure-name node --cmd '
+roff run <host> --project app --cmd '
   [ -d node_modules ] || npm ci --no-audit --no-fund
-  npx playwright install chromium   # no-op if ensure already did it
   npx playwright test --reporter=line
   cp -r test-results "$ROFF_OUT/" 2>/dev/null || true
 '

@@ -3,17 +3,24 @@
 
 Contract: every command prints one JSON object; exit codes are machine truth:
   0 ok | 1 job failed (remote exit in .exit) | 2 usage/contract error
-  69 job lost (host restarted/wiped) | 124 wait timeout | 130 cancelled
-  255 host unreachable (fail loudly; NEVER silently fall back to local)
+  69 job lost (host restarted/wiped/killed — read the JSON `reason`)
+  97 workdir missing on the host (project never pushed)
+  124 wait timeout (job keeps running) | 130 cancelled
+  255 cannot talk to the host (unreachable OR timed out)
+      (fail loudly; NEVER silently fall back to local)
+Payloads (job command, --env values, setup scripts) travel on stdin, never in
+remote argv — argv is visible to `ps` on the host.
 State: local ledger ~/.local/state/roff (jobs, host profiles, tunnels, audit).
 Remote layout: ~/.roff/{jobs/<id>,projects,setup,toolchain,env.sh,instance}.
 """
 import argparse
 import base64
 import concurrent.futures
+import glob
 import hashlib
 import json
 import os
+import re
 import shlex
 import signal
 import socket
@@ -57,11 +64,30 @@ def emit(obj, code=0):
     sys.exit(code)
 
 
+def redact_argv(argv):
+    """Strip secret values out of --env KEY=VALUE before they hit the audit log."""
+    out, redact_next = [], False
+    for a in argv:
+        if redact_next:
+            out.append(re.sub(r"(?<=^)([^=]+)=.*$", r"\1=<redacted>", a))
+            redact_next = False
+            continue
+        if a == "--env":
+            out.append(a)
+            redact_next = True
+            continue
+        if a.startswith("--env="):
+            out.append("--env=" + re.sub(r"^([^=]+)=.*$", r"\1=<redacted>", a.split("=", 1)[1]))
+            continue
+        out.append(a)
+    return out
+
+
 def audit(argv, code):
     try:
         with open(STATE / "audit.jsonl", "a") as f:
             f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                                "argv": argv, "exit": code}) + "\n")
+                                "argv": redact_argv(argv), "exit": code}) + "\n")
     except OSError:
         pass
 
@@ -70,14 +96,18 @@ def ssh_base(host):
     return ["ssh", *SSH_OPTS, host]
 
 
-def ssh(host, script, timeout=60, args=None):
-    """Run script via `ssh host bash -s -- args`. Returns CompletedProcess."""
-    remote = "bash -s --" + ("".join(" " + shlex.quote(x) for x in args) if args else "")
+def ssh(host, script, timeout=60):
+    """Run a script on the host via `ssh host bash -s`.
+
+    The script travels over stdin and NOTHING travels in argv: argv is visible
+    to `ps` on the host, so payloads (commands, env values) must never go there.
+    """
     try:
-        return subprocess.run(ssh_base(host) + [remote], input=script,
+        return subprocess.run(ssh_base(host) + ["bash -s"], input=script,
                               capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        raise RoffError(255, f"ssh {host} timed out after {timeout}s", host=host)
+        raise RoffError(255, f"ssh {host} timed out after {timeout}s "
+                             f"(host unreachable OR slow — not a job failure)", host=host)
 
 
 def ssh_ok(host, script, timeout=60, what="ssh"):
@@ -205,23 +235,95 @@ def probe_host(host, timeout=30):
     return prof
 
 
-def ssh_aliases():
-    cfg = Path.home() / ".ssh/config"
-    aliases = []
-    if cfg.exists():
-        for ln in cfg.read_text().splitlines():
+SSH_KEYWORDS = {
+    "host", "hostname", "user", "port", "identityfile", "identityagent",
+    "proxycommand", "proxyjump", "proxyusefdpass", "userknownhostsfile",
+    "stricthostkeychecking", "batchmode", "connecttimeout", "controlmaster",
+    "controlpath", "controlpersist", "serveraliveinterval", "serveralivecountmax",
+    "forwardagent", "compression", "exitonforwardfailure", "canonicalizehostname",
+    "pubkeyauthentication", "passwordauthentication", "kbdinteractiveauthentication",
+    "gssapiauthentication", "addkeystoagent", "identitiesonly", "sendenv", "setenv",
+    "localforward", "remoteforward", "dynamicforward", "requesttty", "sessiontype",
+    "globalknownhostsfile", "updatehostkeys", "hostkeyalgorithms", "hostkeyalias",
+    "ciphers", "macs", "kexalgorithms", "ipqos", "numberofpasswordprompts",
+    "include", "match", "tag", "securitykeyprovider", "canonicaldomains",
+    "ignoreunknown", "pubkeyacceptedalgorithms", "hostbasedauthentication",
+}
+
+
+def _ssh_config_lines():
+    """~/.ssh/config plus every file it Includes (glob), resolved transitively."""
+    root = Path.home() / ".ssh/config"
+    queue, seen, out = [root], set(), []
+    while queue:
+        f = queue.pop(0)
+        try:
+            rp = str(f.resolve())
+        except OSError:
+            continue
+        if rp in seen or not f.is_file():
+            continue
+        seen.add(rp)
+        try:
+            lines = f.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        out.append(lines)
+        for ln in lines:
             s = ln.strip()
-            if s.lower().startswith("host ") and not s.startswith("#"):
-                for tok in s.split()[1:]:
-                    if "*" not in tok and "?" not in tok and tok not in aliases:
-                        aliases.append(tok)
+            if not s or s.startswith("#"):
+                continue
+            parts = s.split(None, 1)
+            if len(parts) != 2 or parts[0].lower() != "include":
+                continue
+            for token in shlex.split(parts[1], comments=True):
+                pat = os.path.expanduser(token)
+                if not os.path.isabs(pat):
+                    pat = str(Path.home() / ".ssh" / pat)
+                queue.extend(Path(p) for p in sorted(glob.glob(pat)))
+    return out
+
+
+def ssh_aliases():
+    """Host aliases from ~/.ssh/config.
+
+    A `Host` line carries a pattern list that may be followed by option keywords:
+    `Host foo User root` declares ONE alias (foo), not three. Include directives
+    are expanded so aliases living in ~/.ssh/config.d/* are found too.
+    """
+    aliases = []
+    for lines in _ssh_config_lines():
+        for ln in lines:
+            s = ln.strip()
+            if not s or s.startswith("#"):
+                continue
+            parts = s.split()
+            if not parts or parts[0].lower() != "host":
+                continue
+            for tok in parts[1:]:
+                if tok.lower() in SSH_KEYWORDS:
+                    break
+                if "*" in tok or "?" in tok:
+                    continue
+                if tok not in aliases:
+                    aliases.append(tok)
     return aliases
+
+
+def safe_probe(host, timeout):
+    """probe_host that never raises: one hanging host must not kill a sweep."""
+    try:
+        return probe_host(host, timeout)
+    except RoffError as e:
+        return {"host": host, "reachable": False,
+                "error": e.payload.get("error", str(e)),
+                "probed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
 
 
 def cmd_hosts(a):
     aliases = ssh_aliases()
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-        profs = list(ex.map(lambda h: probe_host(h, a.timeout), aliases))
+        profs = list(ex.map(lambda h: safe_probe(h, a.timeout), aliases))
     emit({"ok": True, "hosts": profs})
 
 
@@ -229,7 +331,7 @@ def cmd_probe(a):
     if a.host == "all":
         targets = ssh_aliases()
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-            profs = list(ex.map(lambda h: probe_host(h, a.timeout), targets))
+            profs = list(ex.map(lambda h: safe_probe(h, a.timeout), targets))
         emit({"ok": True, "hosts": profs})
     if a.cached:
         prof = load_profile(a.host)
@@ -331,9 +433,23 @@ def transfer_down(host, remote, local, timeout):
                             f"tar pull failed (tar {tp.returncode}, ssh {rp.returncode})",
                             detail=(err + tp_err).decode()[-400:])
         mode = "tar"
-    files = [{"path": str(f.relative_to(local)), "bytes": f.stat().st_size,
-              "sha256": sha256_file(f)}
-             for f in sorted(local.rglob("*")) if f.is_file()]
+    # The manifest must list the files THIS pull brought, not whatever else is
+    # already in the local dir: a pre-existing --local dir would otherwise
+    # report stale artifacts as if this job had produced them.
+    listing_ok = False
+    remote_files = set()
+    rp = ssh(host, f"cd {shlex.quote(absr)} && find . -type f | sed 's|^\\./||'", 120)
+    if rp.returncode == 0:
+        listing_ok = True
+        remote_files = {ln.strip() for ln in rp.stdout.splitlines() if ln.strip()}
+    files = []
+    for f in sorted(local.rglob("*")):
+        if not f.is_file():
+            continue
+        rel = str(f.relative_to(local))
+        if listing_ok and rel not in remote_files:
+            continue
+        files.append({"path": rel, "bytes": f.stat().st_size, "sha256": sha256_file(f)})
     return mode, files
 
 
@@ -367,31 +483,58 @@ ENSURE_HEADER = 'mkdir -p "$HOME/.roff/toolchain/bin"\nexport PATH="$HOME/.roff/
 
 
 def ensure_setup(host, setup_path, name, force=False, timeout=1800):
-    """Idempotent bootstrap, stamped by script-hash + boot_id + instance_token.
-    Skip ONLY on the remote stamp: a reboot keeps ~/.roff but kills processes;
-    a wipe removes both, and the local profile copy is informational only."""
+    """Idempotent bootstrap, stamped by script-hash + the host's LIVE
+    boot_id + instance_token.
+
+    The stamp is compared against the host's current boot_id/instance_token,
+    read at ensure time — never against a cached profile (a stale cached
+    boot_id would make a restarted host look already-bootstrapped and the
+    setup would silently skip). After a reboot the stamp no longer matches
+    (boot_id changed) and the setup re-runs; after a wipe the stamp file is
+    gone and it re-runs from scratch.
+    """
     setup_path = Path(setup_path).expanduser().resolve()
     if not setup_path.is_file():
         raise RoffError(2, f"setup script not found: {setup_path}")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+        raise RoffError(2, f"invalid setup name {name!r} "
+                           f"(letters, digits, '.', '_', '-' only)")
     h = sha256_file(setup_path)
-    prof = load_profile(host) or probe_host(host)
-    if not prof.get("reachable"):
-        raise RoffError(255, f"ensure: host unreachable: {host}", host=host)
-    stamp = f"{h}:{prof['boot_id']}:{prof['instance_token']}"
-    rstamp = f"~/.roff/setup/{name}.stamp"
-    p = ssh(host, f"cat {rstamp} 2>/dev/null")
-    if not force and p.stdout.strip() == stamp:
+    probe = (
+        'if [ ! -f ~/.roff/instance ]; then mkdir -p ~/.roff; '
+        '(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid) > ~/.roff/instance; fi; '
+        'printf "STAMP="; cat ~/.roff/setup/' + name + '.stamp 2>/dev/null; echo; '
+        'printf "BOOT="; cat /proc/sys/kernel/random/boot_id 2>/dev/null; echo; '
+        'printf "INST="; cat ~/.roff/instance 2>/dev/null; echo'
+    )
+    p = ssh(host, probe, 60)
+    if p.returncode == 255:
+        raise RoffError(255, f"ensure: host unreachable: {host}", host=host,
+                        detail=p.stderr.strip()[-400:])
+    if p.returncode != 0:
+        raise RoffError(1, f"ensure: cannot read stamp state on {host} "
+                           f"(exit {p.returncode})", host=host,
+                        detail=(p.stderr or p.stdout).strip()[-400:])
+    fields = {}
+    for ln in p.stdout.splitlines():
+        if "=" in ln:
+            k, v = ln.split("=", 1)
+            fields[k.strip()] = v.strip()
+    stamp = f"{h}:{fields.get('BOOT', '')}:{fields.get('INST', '')}"
+    if not force and fields.get("STAMP", "") == stamp:
         return {"ensured": True, "skipped": True, "stamp": stamp}
     body = ENSURE_HEADER + setup_path.read_text()
     b64 = base64.b64encode(body.encode()).decode()
+    # The payload rides on stdin (inside the script), never in argv.
     script = (
         'set -e\nmkdir -p ~/.roff/setup\n'
-        f'printf "%s" "$1" | base64 -d > ~/.roff/setup/{name}.sh\n'
+        f'printf "%s" {shlex.quote(b64)} | base64 -d > ~/.roff/setup/{name}.sh\n'
+        f'chmod 700 ~/.roff/setup/{name}.sh\n'
         f"bash ~/.roff/setup/{name}.sh > ~/.roff/setup/{name}.log 2>&1\n"
-        f"printf '%s' {shlex.quote(stamp)} > {rstamp}\n"
+        f"printf '%s' {shlex.quote(stamp)} > ~/.roff/setup/{name}.stamp\n"
         "echo ROFF_ENSURE_OK\n"
     )
-    p = ssh(host, script, timeout, args=[b64])
+    p = ssh(host, script, timeout)
     if p.returncode != 0 or "ROFF_ENSURE_OK" not in p.stdout:
         tail = ssh(host, f"tail -15 ~/.roff/setup/{name}.log 2>/dev/null").stdout
         raise RoffError(1, f"ensure '{name}' failed on {host} (exit {p.returncode}); fix the setup script, do not retry blindly",
@@ -424,31 +567,56 @@ printf '%s' "$rc" > "$ROFF_JOB/exit.tmp" && mv "$ROFF_JOB/exit.tmp" "$ROFF_JOB/e
 
 LAUNCHER = r'''
 set -e
-d="$HOME/.roff/jobs/$1"
+umask 077
+JID=__JID__
+CMD_B64=__CMD__
+RUNNER_B64=__RUNNER__
+ENV_B64=__ENV__
+WD=__WD__
+d="$HOME/.roff/jobs/$JID"
 mkdir -p "$d/out"
-printf '%s' "$2" | base64 -d > "$d/cmd.sh"
-printf '%s' "$3" | base64 -d > "$d/run.sh"
-printf '%s' "$4" | base64 -d > "$d/env.sh"
+printf '%s' "$CMD_B64" | base64 -d > "$d/cmd.sh"
+printf '%s' "$RUNNER_B64" | base64 -d > "$d/run.sh"
+printf '%s' "$ENV_B64" | base64 -d > "$d/env.sh"
+chmod 700 "$d/cmd.sh" "$d/run.sh"
+chmod 600 "$d/env.sh"
+printf '%s' "$JID" > "$d/jobid"
 boot=$(cat /proc/sys/kernel/random/boot_id)
 printf '%s' "$boot" > "$d/boot"
-wd="$5"; case "$wd" in "~") wd="$HOME";; "~/"*) wd="$HOME/${wd#\~/}";; esac
-ROFF_JOB="$d" ROFF_WORKDIR="$wd" setsid nohup bash "$d/run.sh" >/dev/null 2>&1 < /dev/null &
+case "$WD" in
+  "~") WD="$HOME" ;;
+  "~/"*) WD="$HOME/${WD#\~/}" ;;
+esac
+ROFF_JOB="$d" ROFF_WORKDIR="$WD" setsid nohup bash "$d/run.sh" >/dev/null 2>&1 < /dev/null &
 pid=$!
 printf '%s' "$pid" > "$d/pid"
 echo "ROFF_PID=$pid"
 '''
 
 
+def usable_profile(host, timeout=30):
+    """A cached profile is only trusted when it says reachable=True.
+
+    `push`/`pull` write a profile that only knows the remote HOME — no
+    `reachable` key at all. Trusting that cache would make a perfectly
+    healthy host look dead (exit 255).
+    """
+    prof = load_profile(host)
+    if prof and prof.get("reachable"):
+        return prof
+    return probe_host(host, timeout)
+
+
 def cmd_run(a):
     host = a.host
-    prof = load_profile(host) or probe_host(host)
+    prof = usable_profile(host)
     if not prof.get("reachable"):
         raise RoffError(255, f"run: host unreachable: {host} — fail loudly, do not run locally", host=host)
     setup_info = None
     if a.ensure:
         setup_info = ensure_setup(host, a.ensure, a.ensure_name or Path(a.ensure).stem,
                                   timeout=a.setup_timeout)
-        prof = load_profile(host)  # ensure may have refreshed
+        prof = load_profile(host) or prof  # ensure may have refreshed
     jid = time.strftime("%y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
     home = remote_home(host)
     remote = f"{home}/.roff/jobs/{jid}"
@@ -465,12 +633,17 @@ def cmd_run(a):
         k, v = kv.split("=", 1)
         env_lines.append(f"export {k}={shlex.quote(v)}")
     env_block = ("\n".join(env_lines) + "\n") if env_lines else ""
-    wd = workdir.replace("~/", "$HOME/", 1) if workdir.startswith("~") else workdir
     def b64(s):
         return base64.b64encode(s.encode()).decode()
-    script = LAUNCHER
-    p = ssh(host, script, a.submit_timeout,
-            args=[jid, b64(a.cmd), b64(RUNNER), b64(env_block), wd])
+    # The job payload (command, runner, env) rides on stdin inside the script:
+    # argv on the host is visible to `ps`, so nothing secret goes there.
+    script = (LAUNCHER
+              .replace("__JID__", shlex.quote(jid))
+              .replace("__CMD__", shlex.quote(b64(a.cmd)))
+              .replace("__RUNNER__", shlex.quote(b64(RUNNER)))
+              .replace("__ENV__", shlex.quote(b64(env_block)))
+              .replace("__WD__", shlex.quote(workdir)))
+    p = ssh(host, script, a.submit_timeout)
     if p.returncode == 255:
         raise RoffError(255, f"run: host unreachable: {host}", host=host,
                         detail=p.stderr.strip()[-400:])
@@ -510,18 +683,34 @@ def remote_state(host, job, timeout=30):
     if out == "STATE=running":
         return {"state": "running"}
     if out == "STATE=rebooted":
-        return {"state": "lost", "reason": "host restarted since submit (boot_id changed); job and possibly toolchain are gone"}
+        return {"state": "lost", "reason": "host restarted since submit (boot_id changed) — the job process is dead but $ROFF_OUT may still hold partial output: pull first, then re-ensure and resubmit"}
     if out == "STATE=missing":
-        return {"state": "lost", "reason": "job dir missing — host wiped/recreated; re-probe and re-ensure, then resubmit"}
-    return {"state": "lost", "reason": "process vanished without exit file (OOM kill or wipe)"}
+        return {"state": "lost", "reason": "job dir missing — host wiped/recreated; re-probe, re-ensure, re-push, then resubmit"}
+    return {"state": "lost", "reason": "process vanished without an exit file (OOM-killed or killed) — $ROFF_OUT may still hold partial output: pull first, then use a host with more RAM"}
+
+
+def job_exit_code(rc):
+    """Remote exit code -> local exit code: 0 ok, 130 cancelled, else 1 failed."""
+    if rc == 0:
+        return 0
+    if rc == 130:
+        return 130
+    return 1
 
 
 def cmd_status(a):
     job = load_job(a.job)
     st = remote_state(job["host"], job)
-    emit({"ok": st["state"] in ("running", "exited"), "job": a.job,
-          "host": job["host"], **st},
-         0 if st["state"] in ("running", "exited") else (255 if st["state"] == "unreachable" else 69))
+    state = st["state"]
+    if state == "exited":
+        rc = st["exit"]
+        emit({"ok": rc == 0, "job": a.job, "host": job["host"], **st},
+             job_exit_code(rc))
+    if state == "running":
+        emit({"ok": True, "job": a.job, "host": job["host"], **st}, 0)
+    if state == "unreachable":
+        emit({"ok": False, "job": a.job, "host": job["host"], **st}, 255)
+    emit({"ok": False, "job": a.job, "host": job["host"], **st}, 69)
 
 
 def cmd_logs(a):
@@ -546,7 +735,7 @@ def cmd_wait(a):
         if s == "exited":
             rc = st["exit"]
             emit({"ok": rc == 0, "job": a.job, "host": job["host"], **st},
-                 0 if rc == 0 else 1)
+                 job_exit_code(rc))
         if s == "lost":
             emit({"ok": False, "job": a.job, "host": job["host"], **st}, 69)
         if s == "unreachable":

@@ -3,6 +3,11 @@
 Date: 2026-11-21 (local +0700). Helper: `roff.py` (python3 stdlib, plain ssh/rsync/tar, no daemon).
 Skill installed at `~/.agents/skills/remote-offload/` (symlink to this dir). Host aliases below are anonymized labels of a real private fleet (Colab bridge + reverse-tunnel boxes).
 
+> **Note (later the same day):** the repo layout changed after this retro — the skill now lives
+> in `skill/` (`skill/SKILL.md`, `skill/roff.py`, `skill/references/`, `skill/setups/`) and this
+> file moved to `docs/`. The paths named below reflect the layout at the time of the tests.
+> See `docs/REVIEW.md` for what was changed and why.
+
 ## What was built
 
 A standalone, harness-agnostic skill that teaches an agent to offload compute-heavy work
