@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""roff — remote-offload helper. Plain ssh/rsync, python3 stdlib only, no daemon.
+"""roff — remote-offload helper. Plain ssh/rsync/tar, python3 stdlib only, no daemon.
 
 Contract: every command prints one JSON object; exit codes are machine truth:
   0 ok | 1 job failed (remote exit in .exit) | 2 usage/contract error
