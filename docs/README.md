@@ -16,7 +16,8 @@ ln -s "$PWD/remote-offload/skill" ~/.agents/skills/remote-offload   # or your ha
 
 `skill/` is the whole shipped package; `docs/` is for humans and never reaches the agent.
 Any agent that reads SKILL.md-style skills picks it up from the description
-(triggers: heavy tasks, "offload", "chạy remote", "đẩy sang máy khác").
+(triggers: heavy tasks, "offload", "chạy remote", "đẩy sang máy khác", running
+something on another machine, reaching a service on a remote host).
 
 The CLI also works standalone:
 

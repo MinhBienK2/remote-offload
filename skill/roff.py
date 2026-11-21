@@ -323,18 +323,27 @@ def safe_probe(host, timeout):
                 "probed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
 
 
+def probe_many(hosts, timeout, parallel=False):
+    """Probe hosts. Serial by default: a single-session bridge (colab
+    ProxyCommand, some reverse tunnels) allows only ONE active ssh session,
+    and parallel probes to it come back 429 / kex closed. Use --parallel
+    only when every alias is known to tolerate concurrent ssh."""
+    if parallel:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            return list(ex.map(lambda h: safe_probe(h, timeout), hosts))
+    return [safe_probe(h, timeout) for h in hosts]
+
+
 def cmd_hosts(a):
     aliases = ssh_aliases()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-        profs = list(ex.map(lambda h: safe_probe(h, a.timeout), aliases))
+    profs = probe_many(aliases, a.timeout, a.parallel)
     emit({"ok": True, "hosts": profs})
 
 
 def cmd_probe(a):
     if a.host == "all":
         targets = ssh_aliases()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-            profs = list(ex.map(lambda h: safe_probe(h, a.timeout), targets))
+        profs = probe_many(targets, a.timeout, a.parallel)
         emit({"ok": True, "hosts": profs})
     if a.cached:
         prof = load_profile(a.host)
@@ -887,14 +896,18 @@ def main():
     ap.add_argument("--transport", choices=["auto", "rsync", "tar"], default="auto")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("hosts", help="enumerate ~/.ssh/config aliases + probe all (parallel)")
+    p = sub.add_parser("hosts", help="enumerate ~/.ssh/config aliases + probe all (serial by default)")
     p.add_argument("--timeout", type=int, default=25)
+    p.add_argument("--parallel", action="store_true",
+                   help="probe aliases concurrently — only safe when no host is a single-session bridge")
     p.set_defaults(fn=cmd_hosts)
 
     p = sub.add_parser("probe", help="capability contract for one host (or 'all'); null gpu = no CUDA claims")
     p.add_argument("host")
     p.add_argument("--cached", action="store_true")
     p.add_argument("--timeout", type=int, default=30)
+    p.add_argument("--parallel", action="store_true",
+                   help="with 'all': probe aliases concurrently — only safe when no host is a single-session bridge")
     p.set_defaults(fn=cmd_probe)
 
     p = sub.add_parser("push", help="sync local dir -> remote project dir")

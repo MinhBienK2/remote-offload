@@ -107,18 +107,24 @@ và `reason` của OOM nói "output dở vẫn còn, pull trước".
 | SKILL.md: bảng "Place" thêm các nhánh thực sự xảy ra (`reachable:false`, `gpu:null`, RAM thấp) và chuyển dòng "sibling alias" về đúng nơi có dữ liệu | Một dòng trước đây cần dữ liệu mà bước 1 không thu thập được |
 | SKILL.md: bỏ "never bare `out/`" (phủ định nằm cạnh mệnh đề dương của nó) | Không đổi hành vi, bớt load |
 
+### Vòng 3 — sau khi verify của workflow xác nhận finding còn sống
+
+| Sửa | Vì sao |
+|---|---|
+| `roff hosts` / `roff probe all` **serial mặc định**, thêm `--parallel` opt-in | Verify của critique "hierarchy" giữ lại đúng 1 finding: guardrail single-session bridge nằm *sau* lệnh phá nó, và `roff hosts` fan-out 8 alias đồng thời → 429 trên bridge 1 session (fleet có `comfy` + `colab-comfy` = cùng 1 box). Giờ lệnh discovery tự tuân thủ guardrail của chính nó |
+| `description`: gộp 3 cụm tiếng Việt thành 2 (một branch viết 3 lần), bỏ "remote host" trần (over-fire), thêm nhánh "reach a service running on a remote host (tunnel / port forward)" mà skill thực sự hỗ trợ | Theo `writing-for-agents`: synonym của một branch là một branch viết hai lần; và pointer phải nêu **mọi** branch skill phục vụ |
+
 ---
 
 ## 4. Còn mở (xếp theo payoff)
 
 | # | Vấn đề | Chỗ | Payoff |
 |---|---|---|---|
-| 1 | `roff hosts` probe song song 8 alias → đụng single-session bridge (fleet có `comfy`+`colab-comfy` = cùng 1 box) | `roff.py` `cmd_hosts` | Cao |
-| 2 | Bước "Place" vẫn là prose dày (giờ có bảng symptom→meaning→do nhưng còn 1 đoạn dài) | `SKILL.md` bước 2 | TB |
-| 3 | `setups/playwright-chromium.sh` dùng `playwright@latest` — client/server có thể lệch version | `skill/setups/playwright-chromium.sh` | TB |
-| 4 | Bảng exit code còn copy ở `docs/README.md` + `docs/RETRO.md` (SKILL.md là bản agent-facing duy nhất) | `docs/` | Thấp |
-| 5 | `references/` vẫn lặp lại sequence push→run→wait→pull của SKILL.md | `skill/references/*` | Thấp |
-| 6 | `docs/RETRO.md` mô tả `setups/node.sh` ở root (đã đổi layout) | `docs/RETRO.md` | Thấp |
+| 1 | Bước "Place" vẫn là prose dày (giờ có bảng symptom→meaning→do nhưng còn 1 đoạn dài) | `SKILL.md` bước 2 | TB |
+| 2 | `setups/playwright-chromium.sh` dùng `playwright@latest` — client/server có thể lệch version | `skill/setups/playwright-chromium.sh` | TB |
+| 3 | Bảng exit code còn copy ở `docs/README.md` + `docs/RETRO.md` (SKILL.md là bản agent-facing duy nhất) | `docs/` | Thấp |
+| 4 | `references/` vẫn lặp lại sequence push→run→wait→pull của SKILL.md | `skill/references/*` | Thấp |
+| 5 | Vài câu trong SKILL.md lặp lại thứ `--help` đã nói | `skill/SKILL.md` | Thấp |
 
 ---
 

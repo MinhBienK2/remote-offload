@@ -1,6 +1,6 @@
 ---
 name: remote-offload
-description: Offload compute-heavy work to the user's SSH hosts instead of the local machine. Use when the task is CPU/GPU-heavy or long (>~30s) — ffmpeg/transcode, builds, test suites, headless-browser e2e, screenshots, ML/render — or when the user says offload, remote host, "chạy remote", "đẩy sang máy khác", "chạy trên máy khác". Runs it through the `roff` CLI (JSON output, exit-code contract).
+description: Offload compute-heavy work to the user's SSH hosts instead of the local machine. Use when the task is CPU/GPU-heavy or long (>~30s) — ffmpeg/transcode, builds, test suites, headless-browser e2e, screenshots, ML/render — or when the user says offload, "chạy remote", "đẩy sang máy khác", asks to run something on another machine, or wants to reach a service running on a remote host (tunnel / port forward). Runs it through the `roff` CLI (JSON output, exit-code contract).
 ---
 
 # Remote offload — heavy work runs on the user's SSH hosts, not locally
@@ -48,7 +48,7 @@ The job ledger survives everything local: `roff jobs` lists past jobs with ids/h
 ## Workflow
 
 1. **Discover + probe** (once per session, or when a host misbehaves):
-   `roff probe <host>` probes one host. `roff hosts` probes every `~/.ssh/config` alias in parallel — only use it when your hosts tolerate parallel ssh (step 2).
+   `roff probe <host>` probes one host. `roff hosts` probes every `~/.ssh/config` alias **one at a time** — serial by default, because a single-session bridge cannot take two concurrent ssh sessions (step 2). Add `--parallel` only when every alias is known to tolerate concurrent ssh.
    The profile is a capability contract: `reachable` (false = host down), `tools` (ffmpeg/node/python3/…), `gpu` (**null = no GPU; never emit CUDA commands or GPU claims**; the key is *absent* on an unreachable host, which means "unknown", not "no GPU"), `cores`, `mem_available_mb`, `load`, `disk_free_mb`, `durable_mount` (null on most hosts), `boot_id`, `instance_token`, `home`.
    `wiped_since_last_probe` / `restarted_since_last_probe` mean: re-`ensure` toolchains and re-`push` projects before running.
    *Done when:* you hold a profile for the host you intend to use, and its `tools` list contains the binary the job needs (or you have a setup script for it).
