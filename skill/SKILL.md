@@ -28,10 +28,10 @@ says *why*. This table is the whole contract — read the field before acting.
 | 1 | `exit` | the job ran and failed | `roff logs <id>` → fix the cause → resubmit. Never retry blind |
 | 1 | `error`, no `job` | a pre-job step failed (push, ensure, launch) — no job exists | read `error`, fix that step, rerun it. There is no job id to log |
 | 2 | `error` | usage error | fix the command; argparse prints the usage on stderr and prints no JSON |
-| 97 | — | the workdir didn't exist on the host | the `--project` name was never pushed: `roff push` with the same name, then resubmit |
-| 124 | — | the wait timed out | not a failure: the job keeps running. `roff wait` again |
+| 97 | `exit` = 97 | the workdir didn't exist on the host | the `--project` name was never pushed: `roff push` with the same name, then resubmit |
+| 124 | `state` = running | the wait timed out | not a failure: the job keeps running. `roff wait` again |
 | 130 | `exit` = 130 | the job was cancelled on purpose | don't resubmit; tell the user and ask |
-| 255 | `error` | cannot talk to the host — unreachable, auth failure, or timeout | contact loss is not process death: the job may still be running. Re-probe or wait; report to the user, never run locally |
+| 255 | `error`, or `state` = unreachable | cannot talk to the host — unreachable, auth failure, or timeout | contact loss is not process death: the job may still be running. Re-probe or wait; report to the user, never run locally |
 | 69 | `reason` = host restarted | the job process died with the reboot | `$ROFF_OUT` may still hold partial output — `roff pull` first, then re-`ensure`, re-`push`, resubmit |
 | 69 | `reason` = job dir missing | the host was wiped | re-`probe`, re-`ensure`, re-`push`, resubmit |
 | 69 | `reason` = process vanished without an exit file | the job was OOM-killed or killed | `$ROFF_OUT` may still hold partial output — `roff pull` first, then use a host with more RAM or a smaller job. Do not resubmit the same job unchanged |
