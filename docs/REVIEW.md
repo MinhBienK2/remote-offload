@@ -17,6 +17,7 @@ Trạng thái: **đã áp 5 fix đầu + refactor layout**. File này là tài l
 - **Đã sửa:** ranh giới skill (`skill/` vs `docs/`), `description` thừa, lệnh thật + path binding, bảng recovery đọc `reason`, pointer có điều kiện.
 - **Đã sửa ở tầng code:** skill **hứa** một số thứ mà `roff.py` **không làm** — secrets trong remote argv, `roff status` trả 0 cho job fail, cancel báo thành "job failed", `~/.ssh/config` parse sai, `ensure` không re-run sau restart, `push` xong `run` báo 255, pull manifest lẫn file cũ.
 - **Còn mở:** `roff hosts` fan-out đụng luật single-session bridge; bảng decision cho bước "Place"; setup script Playwright còn dùng `@latest`; dedup bảng exit code giữa `README`/`RETRO`/`SKILL.md`.
+- **Đã đóng ở vòng 3–5:** fan-out của `roff hosts` (→ serial mặc định), dedup bảng exit code (vòng 4), dòng `0` của bảng exit key theo field + cảnh báo `--timeout` của `wait` (vòng 5).
 
 ---
 
@@ -122,6 +123,16 @@ và `reason` của OOM nói "output dở vẫn còn, pull trước".
 | `docs/README.md`: **xoá** danh sách exit code inline, chỉ trỏ về `skill/SKILL.md` | Bản rút gọn của bảng là **sai**, không chỉ trùng: code `1` mang hai nghĩa tùy có field `job` hay không (`1 job failed` vs `1` pre-job failure) — đúng cái bug vòng 2 đã sửa. Rút gọn hoá đọc sai thành hiện thường. Bảng đầy đủ chỉ ở SKILL.md |
 | `docs/README.md`: bullet secrets nói rõ `--cmd` được lưu **verbatim** trong audit log | Câu cũ ("never in the local audit log") chỉ đúng cho `--env`; dễ bị hiểu là "secret nào cũng không vào audit log" — sai, vì `--cmd` lưu nguyên văn |
 | `docs/RETRO.md`: thêm note đầu file trỏ bảng exit code hiện hành về `skill/SKILL.md` | RETRO là bản ghi lịch sử — không sửa body, chỉ chỉ đường cho người đọc |
+
+### Vòng 5 — synthesis của workflow (verdict viết trên `636fb28`, còn sống với HEAD hiện tại)
+
+9 verdict của một critic đã được đối chiếu lại với code hiện tại; **2 còn sống**, 7 đã được sửa ở vòng 2–3
+(verdict tự nói "đã sửa trong working tree"). Hai cái còn sống:
+
+| Sửa | Vì sao |
+|---|---|
+| Dòng `0` của bảng exit **key theo field** (`state`, `reachable`) thay vì `—`; thêm câu "**Exit 0 means the command ran, not that the work is done**" | `roff status` trả **exit 0** cho job *đang chạy* (`cmd_status` → `emit({..., "state": "running"}, 0)`), còn dòng bảng cũ nói "the job finished cleanly → pull the artifacts" với cột field là `—` (tức "không có gì để đọc"). Agent monitor bằng `roff status` → thấy 0 → pull `$ROFF_OUT` rỗng → báo thành công trong khi job còn chạy. Đã verify live: `status` job đang chạy → exit 0 + `state: running`; `wait --timeout 3` → 124; `cancel` → 130; `status` sau cancel → 130 + `state: exited, exit: 130` |
+| Bước 6: "Always pass `--timeout`: without it `wait` blocks forever and prints nothing if the host goes down" | `roff wait` mặc định `--timeout 0` = chờ vô hạn; nhánh `unreachable` chỉ emit khi đã hết deadline → treo im lặng, không 255, không 124. Agent không có `--timeout` là treo session |
 
 ---
 

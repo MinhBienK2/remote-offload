@@ -20,10 +20,11 @@ is the fallback).
 
 Every command prints one JSON object on stdout. The exit code says *what*; the JSON field
 says *why*. This table is the whole contract — read the field before acting.
+**Exit 0 means the command ran, not that the work is done.**
 
 | Exit | JSON field | Means | Do |
 |---|---|---|---|
-| 0 | — | the command succeeded | for `wait`/`status`: the job finished cleanly → pull the artifacts. For `probe`/`hosts` this says nothing about the host: read `reachable` per host |
+| 0 | `state`, `reachable` | the command succeeded | for `wait`: `state` = exited and `exit` = 0 → pull the artifacts. For `status`: `state` = running → the job is still going, wait again. For `probe`/`hosts`: read `reachable` per host — `false` = the host is down |
 | 1 | `exit` | the job ran and failed | `roff logs <id>` → fix the cause → resubmit. Never retry blind |
 | 1 | `error`, no `job` | a pre-job step failed (push, ensure, launch) — no job exists | read `error`, fix that step, rerun it. There is no job id to log |
 | 2 | `error` | usage error | fix the command; argparse prints the usage on stderr and prints no JSON |
@@ -73,7 +74,8 @@ The job ledger survives everything local: `roff jobs` lists past jobs with ids/h
    Returns a job id immediately; the job survives ssh disconnects and agent restarts (ledger in `~/.local/state/roff/jobs`). In commands, write artifacts to `"$ROFF_OUT"` (the job's out dir) — the workdir is the project, not the job dir.
    *Done when:* you have the job id and it is in `roff jobs`.
 6. **Monitor**: `roff wait <id> --timeout <s>` (exit mirrors outcome) or `roff status <id>` / `roff logs <id> --tail 50`.
-   *Done when:* `wait` returns 0 (finished) — or 124, which means it is still running: wait again. Any other code is in the table above.
+   Always pass `--timeout`: without it `wait` blocks forever and prints nothing if the host goes down.
+   *Done when:* `wait` returns 0 (the job finished cleanly) — or 124, which means it is still running: wait again. With `status`, exit 0 alone proves nothing: read `state`. Any other code is in the table above.
 7. **Fetch artifacts — mandatory**: `roff pull <id> --local <dir>` → sha256 manifest of the files this pull brought (stale files already in `<dir>` are not listed). A run whose artifacts were not fetched is not done. For non-job dirs: `roff pull --host h --remote '~/.roff/projects/p' --local dir`.
    Paths are resolved to absolute remote HOME automatically (colab bridges don't tilde-expand). If a host's profile is stale, `roff probe <host>` refreshes it (includes `home`).
 8. **Services / e2e** *(optional branch)*: start the server as a job (`setsid nohup … &` inside cmd), then `roff tunnel start <host> --lport <L> --rport <R>` → `http://127.0.0.1:<L>`. `roff tunnel list` / `tunnel stop <host> --lport <L>`. Always stop tunnels you opened when done.
