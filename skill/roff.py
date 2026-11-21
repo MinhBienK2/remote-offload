@@ -12,6 +12,8 @@ Payloads (job command, --env values, setup scripts) travel on stdin, never in
 remote argv — argv is visible to `ps` on the host.
 State: local ledger ~/.local/state/roff (jobs, host profiles, tunnels, audit).
 Remote layout: ~/.roff/{jobs/<id>,projects,setup,toolchain,env.sh,instance}.
+In a job command, $ROFF_OUT is the job's output dir (~/.roff/jobs/<id>/out) —
+write artifacts there, `roff pull <id>` fetches exactly that dir.
 """
 import argparse
 import base64
@@ -35,6 +37,7 @@ JOBS = STATE / "jobs"
 HOSTS = STATE / "hosts"
 TUNNELS = STATE / "tunnels"
 CM = STATE / "cm"
+SELF = Path(__file__).resolve()
 for _d in (STATE, JOBS, HOSTS, TUNNELS, CM):
     _d.mkdir(parents=True, exist_ok=True)
 
@@ -611,7 +614,10 @@ def cmd_run(a):
     host = a.host
     prof = usable_profile(host)
     if not prof.get("reachable"):
-        raise RoffError(255, f"run: host unreachable: {host} — fail loudly, do not run locally", host=host)
+        why = str(prof.get("error") or "no response from the host")
+        raise RoffError(255, f"run: cannot talk to {host}: {why} — "
+                             f"fail loudly, do not run locally",
+                        host=host, detail=why[:400])
     setup_info = None
     if a.ensure:
         setup_info = ensure_setup(host, a.ensure, a.ensure_name or Path(a.ensure).stem,
@@ -659,7 +665,9 @@ def cmd_run(a):
     save_job(job)
     emit({"ok": True, "job": jid, "host": host, "pid": pid, "remote": remote,
           "workdir": workdir, "ensure": setup_info,
-          "next": f"roff wait {jid} | roff logs {jid} | roff pull {jid} --local <dir>"})
+          "next": [f"{SELF} wait {jid} --timeout 3600",
+                   f"{SELF} logs {jid} --tail 50",
+                   f"{SELF} pull {jid} --local ./out"]})
 
 
 def remote_state(host, job, timeout=30):
@@ -690,11 +698,13 @@ def remote_state(host, job, timeout=30):
 
 
 def job_exit_code(rc):
-    """Remote exit code -> local exit code: 0 ok, 130 cancelled, else 1 failed."""
-    if rc == 0:
-        return 0
-    if rc == 130:
-        return 130
+    """Remote exit code -> local exit code.
+
+    0 ok | 97 workdir missing | 130 cancelled | everything else = 1 failed.
+    The special codes are passed through so the agent can act on them.
+    """
+    if rc in (0, 97, 130):
+        return rc
     return 1
 
 
@@ -907,7 +917,8 @@ def main():
 
     p = sub.add_parser("run", help="submit detached job; survives ssh disconnect; ledger survives agent restart")
     p.add_argument("host")
-    p.add_argument("--cmd", required=True)
+    p.add_argument("--cmd", required=True,
+                   help="shell command; write artifacts to $ROFF_OUT (the job's out dir)")
     p.add_argument("--project", help="workdir = ~/.roff/projects/<project>")
     p.add_argument("--workdir", help="explicit remote workdir (overrides --project)")
     p.add_argument("--ensure", help="setup script to ensure before launch")

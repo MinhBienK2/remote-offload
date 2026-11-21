@@ -92,6 +92,21 @@ và `reason` của OOM nói "output dở vẫn còn, pull trước".
 | `reason` của `69` viết lại đúng nghĩa (reboot: output còn; OOM: output còn) | đọc lại `remote_state` |
 | `roff hosts`/`probe all`: một host treo không còn giết cả sweep | `safe_probe` bọc lỗi |
 
+### Vòng 2 — sau khi 4 critique của workflow review đọc lại code đã sửa
+
+| Sửa | Vì sao |
+|---|---|
+| `job_exit_code` cho phép `97` đi xuyên ra (trước: mọi rc≠0 → `1`) | Bảng contract hứa exit `97` nhưng CLI **không bao giờ** phát ra mã đó → dòng recovery "project never pushed" là chết. Đây là lỗi do bản thân vòng 1 tạo ra |
+| `roff run` khi 255 giờ kèm nguyên nhân thật (`error` từ probe: auth failure / timeout), không còn gọi chung là "host unreachable" | ssh trả 255 cho cả auth failure lẫn unreachable; thông báo cũ nói dối và làm rơi stderr |
+| Gợi ý `next` của `roff run` giờ **chạy được**: đường dẫn thật của script, `wait --timeout 3600`, `pull --local ./out`; đổi từ chuỗi sang mảng | Trước: `roff wait <id>` (không timeout → treo vô hạn) và `--local <dir>` (placeholder không chạy được) |
+| `run --help` + docstring của CLI nói rõ `$ROFF_OUT` | Biến mà **mọi** job command phụ thuộc không có trong bất kỳ `--help` nào |
+| SKILL.md: **hai bảng exit → một bảng** (`exit | JSON field | Means | Do`) | Sự trùng lặp đó chính là nơi lệch: bảng trên cùng và bảng recovery không khớp nhau. Một nguồn sự thật duy nhất |
+| SKILL.md: thêm prerequisites (python3, ssh alias, key auth non-interactive, rsync tuỳ chọn) | Trước đây toàn bộ giả định ngầm |
+| SKILL.md: bước 6 có *Done when* | "job vẫn đang chạy" không có chỗ nào đứng |
+| SKILL.md: cảnh báo single-session bridge nói **một lần** (trước: ba lần) | Lặp lại làm loãng và dễ bị bỏ qua |
+| SKILL.md: bảng "Place" thêm các nhánh thực sự xảy ra (`reachable:false`, `gpu:null`, RAM thấp) và chuyển dòng "sibling alias" về đúng nơi có dữ liệu | Một dòng trước đây cần dữ liệu mà bước 1 không thu thập được |
+| SKILL.md: bỏ "never bare `out/`" (phủ định nằm cạnh mệnh đề dương của nó) | Không đổi hành vi, bớt load |
+
 ---
 
 ## 4. Còn mở (xếp theo payoff)
