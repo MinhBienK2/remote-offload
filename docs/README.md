@@ -22,7 +22,7 @@ something on another machine, reaching a service on a remote host).
 The CLI also works standalone:
 
 ```bash
-./skill/roff.py hosts                                  # probe every ssh-config alias in parallel
+./skill/roff.py hosts                                  # probe every ssh-config alias (serial by default)
 ./skill/roff.py probe myhost                           # capability profile: tools/gpu/ram/load/disk
 ./skill/roff.py ensure myhost --setup skill/setups/node.sh --name node   # idempotent toolchain bootstrap
 ./skill/roff.py push myhost ./media --name media       # rsync (or tar-over-ssh) inputs up
