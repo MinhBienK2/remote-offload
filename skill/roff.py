@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """roff — remote-offload helper. Plain ssh/rsync/tar, python3 stdlib only, no daemon.
 
-Contract: every command prints one JSON object; exit codes are machine truth:
-  0 ok | 1 job failed (remote exit in .exit) | 2 usage/contract error
-  69 job lost (host restarted/wiped/killed — read the JSON `reason`)
-  97 workdir missing on the host (project never pushed)
+Contract: every command prints one JSON object; the exit code says what, the JSON
+field says why (the full table lives in the skill's SKILL.md):
+  0 the command ran — NOT that the work is done: read `state` / `reachable`
+  1 the job failed (field `exit`) | a pre-job step failed (field `error`, no `job`)
+  2 input rejected (field `error`) | usage error (no JSON)
+  69 job lost (read the JSON `reason`) | 97 workdir missing on the host
   124 wait timeout (job keeps running) | 130 cancelled
-  255 cannot talk to the host (unreachable OR timed out)
+  255 cannot talk to the host (read the JSON `detail`)
       (fail loudly; NEVER silently fall back to local)
 Payloads (job command, --env values, setup scripts) travel on stdin, never in
 remote argv — argv is visible to `ps` on the host.
@@ -28,6 +30,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -109,8 +112,9 @@ def ssh(host, script, timeout=60):
         return subprocess.run(ssh_base(host) + ["bash -s"], input=script,
                               capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        raise RoffError(255, f"ssh {host} timed out after {timeout}s "
-                             f"(host unreachable OR slow — not a job failure)", host=host)
+        msg = (f"ssh {host} timed out after {timeout}s "
+               f"(host unreachable OR slow — not a job failure)")
+        raise RoffError(255, msg, host=host, detail=msg)
 
 
 def ssh_ok(host, script, timeout=60, what="ssh"):
@@ -350,7 +354,7 @@ def cmd_probe(a):
         if not prof:
             raise RoffError(2, f"no cached profile for {a.host}; run probe first")
         emit({"ok": True, **prof})
-    emit({"ok": True, **probe_host(a.host, a.timeout)})
+    emit({"ok": True, **safe_probe(a.host, a.timeout)})
 
 
 def remote_home(host):
@@ -737,7 +741,8 @@ def cmd_logs(a):
     d = rpath(job["remote"])
     p = ssh(job["host"], f'tail -n {int(a.tail)} "{d}/log" 2>/dev/null; echo; wc -l < "{d}/log" 2>/dev/null')
     if p.returncode == 255:
-        raise RoffError(255, f"logs: host unreachable: {job['host']}", host=job["host"])
+        raise RoffError(255, f"logs: host unreachable: {job['host']}",
+                        host=job["host"], detail=p.stderr.strip()[-400:])
     lines = p.stdout.splitlines()
     total = lines[-1].strip() if lines and lines[-1].strip().isdigit() else "0"
     emit({"ok": True, "job": a.job, "total_lines": int(total),
@@ -779,13 +784,34 @@ def cmd_cancel(a):
         'for i in $(seq 1 10); do [ -f "$d/exit" ] && break; kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done\n'
         'kill -KILL -- "-$pid" 2>/dev/null\n'
         '[ -f "$d/exit" ] || printf 130 > "$d/exit"\n'
-        'echo CANCELLED\n'
+        'echo "CANCELLED EXIT=$(cat "$d/exit" 2>/dev/null)"\n'
     )
     p = ssh(job["host"], script, 40)
     if p.returncode == 255:
         raise RoffError(255, f"cancel: host unreachable: {job['host']} — job may still run; retry when reachable",
-                        host=job["host"])
-    emit({"ok": True, "job": a.job, "host": job["host"], "state": "cancelled", "exit": 130}, 130)
+                        host=job["host"], detail=p.stderr.strip()[-400:])
+    out = p.stdout.strip()
+    if "NOPID" in out:
+        # No pid file: nothing was running, so nothing was cancelled. Report
+        # what actually happened instead of inventing a cancellation.
+        st = remote_state(job["host"], job)
+        if st.get("state") == "exited":
+            rc = st["exit"]
+            emit({"ok": rc == 0, "job": a.job, "host": job["host"], "state": "exited",
+                  "exit": rc, "note": "the job had already finished; nothing to cancel"},
+                 job_exit_code(rc))
+        emit({"ok": False, "job": a.job, "host": job["host"], "state": "lost",
+              "reason": "no pid and no exit file — the job is gone"}, 69)
+    m = re.search(r"EXIT=(\d+)", out)
+    rc = int(m.group(1)) if m else 130
+    if rc == 130:
+        emit({"ok": True, "job": a.job, "host": job["host"], "state": "cancelled", "exit": 130}, 130)
+    # The runner writes the exit file only when the job completes on its own.
+    # Any code other than 130 means the job had already finished and the kill
+    # was a no-op — reporting "cancelled" there would invent a cancellation.
+    emit({"ok": rc == 0, "job": a.job, "host": job["host"], "state": "exited", "exit": rc,
+          "note": "the job finished before the cancel landed; nothing was cancelled"},
+         job_exit_code(rc))
 
 
 def cmd_jobs(a):
@@ -843,9 +869,16 @@ def cmd_tunnel(a):
     cmd = ["ssh", *SSH_OPTS, "-o", "ExitOnForwardFailure=yes",
            "-o", "ControlMaster=no", "-o", "ControlPath=none", "-N",
            "-L", f"{a.lport}:127.0.0.1:{a.rport}", a.host]
-    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            start_new_session=True)
+    # ssh's stderr goes to a file, not /dev/null: when the tunnel fails to
+    # come up, the reason ("Permission denied (publickey)") is in there, and
+    # without it every failure reads as "is the remote service listening?".
+    errpath = None
+    with tempfile.NamedTemporaryFile(prefix="roff-tunnel-", suffix=".err",
+                                     delete=False) as ef:
+        errpath = ef.name
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=ef,
+                                start_new_session=True)
 
     deadline = time.time() + 15
     up = False
@@ -860,8 +893,22 @@ def cmd_tunnel(a):
             time.sleep(0.5)
     if not up:
         proc.terminate()
+        detail = ""
+        try:
+            detail = Path(errpath).read_text().strip()[-400:]
+        except OSError:
+            pass
+        try:
+            Path(errpath).unlink(missing_ok=True)
+        except OSError:
+            pass
         raise RoffError(255, f"tunnel failed to establish (ssh exit {proc.poll()}); is the remote service listening on {a.rport}?",
-                        host=a.host)
+                        host=a.host, detail=detail)
+    # The tunnel keeps running with the file open; the name can go.
+    try:
+        Path(errpath).unlink(missing_ok=True)
+    except OSError:
+        pass
     # If a live ControlMaster serves this host, it may have adopted the -L
     # request: the listener then lives in the master, and killing proc does
     # nothing. Detect ownership and tell the caller how to stop it.

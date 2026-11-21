@@ -17,7 +17,7 @@ Trạng thái: **đã áp 5 fix đầu + refactor layout**. File này là tài l
 - **Đã sửa:** ranh giới skill (`skill/` vs `docs/`), `description` thừa, lệnh thật + path binding, bảng recovery đọc `reason`, pointer có điều kiện.
 - **Đã sửa ở tầng code:** skill **hứa** một số thứ mà `roff.py` **không làm** — secrets trong remote argv, `roff status` trả 0 cho job fail, cancel báo thành "job failed", `~/.ssh/config` parse sai, `ensure` không re-run sau restart, `push` xong `run` báo 255, pull manifest lẫn file cũ.
 - **Còn mở:** `roff hosts` fan-out đụng luật single-session bridge; bảng decision cho bước "Place"; setup script Playwright còn dùng `@latest`; dedup bảng exit code giữa `README`/`RETRO`/`SKILL.md`.
-- **Đã đóng ở vòng 3–5:** fan-out của `roff hosts` (→ serial mặc định), dedup bảng exit code (vòng 4), dòng `0` của bảng exit key theo field + cảnh báo `--timeout` của `wait` (vòng 5).
+- **Đã đóng ở vòng 3–7:** fan-out của `roff hosts` (→ serial mặc định), dedup bảng exit code (vòng 4), dòng `0` của bảng exit key theo field + cảnh báo `--timeout` của `wait` (vòng 5), hai hình dạng của exit 2 + field `detail` của 255 (vòng 6), và 5 lỗi doc + B1–B5 của synthesis (vòng 7).
 
 ---
 
@@ -148,6 +148,63 @@ verify lại bằng code + host thật:
 Hai sửa nhỏ kèm theo sau khi đọc lại SKILL.md từ đầu: dòng `124` bỏ lại `—` (cột field chỉ lặp
 lại cột "Do" — exit code 124 đã đủ để biết), và `wiped_since_last_probe` /
 `restarted_since_last_probe` ghi rõ "chỉ có mặt khi đúng" (code chỉ set khi `True`).
+
+### Vòng 7 — bản tổng hợp cuối của workflow (12 agent, 1.07M token)
+
+Synthesis cuối cùng (chạy trên `c336177` = `main` lúc đó) ra **5 lỗi thật + 8 lỗi CLI**.
+Lần này mọi claim đều được tự kiểm lại bằng code và host thật trước khi sửa.
+
+**5 lỗi trong SKILL.md — đã sửa:**
+
+| # | Lỗi | Sửa | Verify |
+|---|---|---|---|
+| 1 | Profile không hề nhắc `error`; dòng `reachable: false` trong bảng step-2 nói "the host is down" → agent đọc "key bị từ chối" thành "cả fleet chết" | Bảng exit 0 + danh sách field của profile + bảng step-2 đều nêu `error`; tách dòng `reachable: false` thành 2 dòng (auth vs host chết) | Payload có `error` sẵn (probe_host trả về) — đây là lỗi **doc**, không phải code |
+| 2 | "*Done when:* của bước 6 tự nêu 124 (mà 124 = job **vẫn đang chạy**)" → agent đánh dấu xong rồi pull `$ROFF_OUT` rỗng | Done when giờ liệt kê đúng các code kết thúc (0/1/69/97/130) và nói rõ **"124 is not done"** | — |
+| 3 | Dòng 255 trỏ `detail`, nhưng `logs`, `cancel` và nhánh ssh-timeout **không hề có** `detail` | Sửa **cả code lẫn doc**: B1/B2/B3 dưới đây | `logs`/`cancel` trước đây trả 255 **không** có `detail` — "Permission denied (publickey)" biến mất; `status` thì có. Doc đúng một nửa |
+| 4 | Hợp đồng exit bị kể lại ở docstring của `roff.py` (in ra bởi `--help`, mà SKILL.md trỏ tới) và ở `references/e2e.md` — cả hai đã lệch | Docstring + e2e.md nói theo SKILL.md | `--help` nói "0 ok" (trong khi 0 ≠ xong) và "1 job failed" (bỏ nhánh pre-job) |
+| 5 | `description` kích hoạt quá: "asks to run something on another machine" bắt được cả "run this on my laptop" — thứ SKILL.md giữ ở local; và "ML/render" không tìm thấy được trong body ("training/render") | Bỏ nhánh đó, dùng "ML training/render" ở cả description lẫn body | — |
+
+**5 lỗi CLI — đã sửa, verify bằng harness `ssh` giả:**
+
+| # | Lỗi | Sửa |
+|---|---|---|
+| B1 | `cmd_logs` vứt mất stderr của ssh khi 255 → key bị từ chối không phân biệt được với host chết | `detail=p.stderr.strip()[-400:]` |
+| B2 | `cmd_cancel` mất stderr khi 255 | `detail=p.stderr.strip()[-400:]` |
+| B3 | `ssh()` timeout raise 255 không kèm `detail` | kèm `detail` |
+| B4 | `probe <host>` (một host) và `probe all` **trả về khác nhau** cho cùng một sự cố: một host → exit 255 không có key `reachable`; all → exit 0 với `reachable: false` | `probe <host>` đi qua `safe_probe` → hai đường giống nhau |
+| B5 | `cancel` một job **đã xong** vẫn báo `cancelled`/130 → agent tưởng job bị hủy, không biết kết quả thật | Script cancel giờ trả `EXIT=$(cat $d/exit)`; code 130 ⇒ thật sự bị hủy, code khác ⇒ job đã tự xong trước đó |
+
+Verify B5 (live, `muse-tampt`): cancel job **đã xong** → `{"state": "exited", "exit": 0, "note": "the job finished before the cancel landed; nothing was cancelled"}` exit 0; cancel job **đang chạy** → `{"state": "cancelled", "exit": 130}` exit 130 ✓.
+
+**Cố ý KHÔNG làm** (phần "Leave it alone" của synthesis): giữ bảng exit ở SKILL.md; giữ
+probe serial mặc định; giữ `$ROFF_OUT`; giữ cơ chế *Done when*; giữ mảng `next`; không
+chuyển bước 8 ra `references/` (P7) và không xoá dòng định nghĩa `roff` ở 3 file
+reference (P8) — hai cái này chỉ giảm context load, không có hậu quả hành vi, và P8 làm
+file reference phụ thuộc việc agent đã đọc SKILL.md.
+
+### Vòng 7b — nhánh `feat/durable-layout-root` (CỦA PHIÊN KHÁC, KHÔNG merge)
+
+Trong lúc workflow chạy, một session khác của người dùng làm việc **cùng thư mục** và tạo
+nhánh `feat/durable-layout-root` (commit `e8f162d`, 11:59). Reflog cho thấy
+`checkout -b` → `reset` → `commit`; transcript của agent synthesis của tôi chỉ chạy lệnh
+git chỉ-đọc (`status`/`log`/`diff`/`show`) ⇒ **không phải agent của tôi tạo nhánh**.
+
+Nội dung nhánh: đưa layout root sang `<durable mount>/.roff` (`$ROFF_ROOT`) khi host có
+mount bền (container Muse wipe `$HOME` mỗi lần refresh → `/home/hatch`), thêm
+`layout_root` + `durable_local` vào profile, và sửa B6 (`node.sh` cài vào
+`$HOME/.roff/toolchain` trong khi runner lấy PATH từ `$ROFF_ROOT` ⇒ `node: command not
+found` trên host durable-root).
+
+**Không merge, không sửa, không xoá.** Lý do:
+- Nó làm thay đổi **ngữ nghĩa** mà `main` đang dựa vào: `wiped_since_last_probe` không còn
+  đồng nghĩa với "phải re-push", và instance token cố ý nằm lại trong `$HOME` để wipe vẫn
+  bị phát hiện.
+- Nó ghi đè `SKILL.md` và `skill/roff.py` ở đúng những chỗ vòng 7 vừa sửa ⇒ merge sẽ phải
+  giải quyết thủ công đúng những hunk đó.
+- Nó **không** sửa 5 lỗi của vòng 7 (và không sửa B1–B5).
+
+Cách đúng: các sửa vòng 7 nằm trên `main`; nhánh kia **rebase** lên `main` rồi mới merge.
+Việc rebase/merge là của phiên đó, không phải của tôi — tôi không đụng vào nhánh của ai.
 
 ---
 

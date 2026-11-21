@@ -34,8 +34,10 @@ roff wait <id> --timeout 1800
 roff pull <id> --local ./e2e-results
 ```
 
-Screenshots in `test-results/` come back with the pull. Exit 1 = tests failed: read logs,
-pull the traces, fix, resubmit.
+Screenshots in `test-results/` come back with the pull. Exit 1 with an `exit` field = the
+tests failed: read logs, pull the traces, fix, resubmit. Exit 1 with an `error` field and
+no `job` = a pre-job step failed (push / ensure / launch): read `error`, fix that step and
+rerun it — there is no job id to log.
 
 ## B. Browser remote, driver local (quick screenshots / interactive checks)
 
