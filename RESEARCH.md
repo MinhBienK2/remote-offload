@@ -1,0 +1,83 @@
+# Research: skill/repo "remote offload" cho AI agent (2026-11-20)
+
+> Nhu cầu: agent chạy local, đẩy việc nặng (ffmpeg, dựng môi trường test, browser e2e, chụp màn hình, compute nặng) sang các máy SSH có sẵn của người dùng (`~/.ssh/config` — Colab bridge, reverse-tunnel boxes, Tailscale hosts).
+> Tiêu chí: ① host inventory/discovery ② capability probe (CPU/RAM/GPU/ffmpeg/docker/playwright) ③ sync 2 chiều ④ job lifecycle (detach/poll/timeout/cancel) ⑤ port forwarding ⑥ artifact mang về local ⑦ fail-safe rules.
+> Phương pháp: 9 scouts đọc nguồn gốc (raw SKILL.md/README/source + GitHub API), không dựa vào summary của directory sites. Kết luận Kanevry/session-orchestrator đã loại từ trước (tham chiếu nội bộ plugin, offload CLI không public).
+
+## TL;DR — không có drop-in hoàn chỉnh; có 5 mảnh ghép rất tốt
+
+| Hạng | Candidate | ★ / push | License | Bản chất | Điểm mạnh nhất | Lỗ hổng chính |
+|---|---|---|---|---|---|---|
+| 1 | [open-science `remote-compute`](https://github.com/ai4s-research/open-science/blob/master/runtime/skills/core/remote-compute/SKILL.md) | 2115 / 11-17 | MIT | Skill thuần ssh/scp, tách từ app | Probe GPU/RAM + detached job (setsid/pid/exit_code/group-kill) + bắt buộc fetch mọi artifact + Slurm | Coupling app (~10 dòng sửa); không tunnel; probe thiếu ffmpeg/docker |
+| 2 | [kellymears `remote-run`](https://agents.kellymears.me/plugins/remote-run/skills/remote-run) | 1 / 09-26 | không LICENSE | Skill thuần ssh/rsync | Config per-host (ssh_fallbacks, path_map, notes-as-instructions) + host memory + sync ladder git→rsync→scp + nohup/pid/poll + tunnel + cleanup + "fail loudly, not locally" | 1 host mặc định, không probe, không timeout/cancel chuẩn |
+| 3 | [bvisible/mcp-ssh-manager](https://github.com/bvisible/mcp-ssh-manager) | 546 / 11-20 (v4.3.0) | MIT | MCP server + CLI | Import `~/.ssh/config`, health check, rsync 2 chiều, bg jobs (pid/log/kill), tunnels, vault + audit + approval modes | Cần MCP client; 37 tools ≈ 43.5k tokens (minimal mode 5 tools ≈ 3.5k); tiền sử injection bug — phải ≥4.0.3 |
+| 4 | [agentbox `abox-remote`](https://github.com/devilcoolyue/agentbox) | 276 / 11-17 | Apache-2.0 | Single-file Python stdlib, tách từ platform | Job engine đủ nhất: run/status/log/cancel/wait --timeout + exit codes (124 timeout, 130 cancel, 69 lost) + push/pull resumable SHA-256 + audit.log + doctor | Skill tiếng Trung, mặc định topology ngược (server→laptop); không tunnel (key `restrict` cấm forwarding); không capability inventory |
+| 5 | [CarryChang/dsh-task2docker-studio](https://github.com/CarryChang/dsh-task2docker-studio) | 1 / 11-08 | MIT | **Skill standalone** (SKILL.md + `t2d.mjs` stdlib, copy folder là chạy) | Dispatch task bất kỳ tới SSH server tự có + Docker tùy chọn: run/status/logs/stop, ledger JSON, scp `copyto/copyfrom` 2 chiều, exit code thật (container), secret pointers 0600 | Mới sinh (11-2026); timeout SSH 60s mặc định (scp file lớn phải nâng); native mode không exit code; không probe/tunnel; thiếu `--gpus` flag |
+
+**Đúng use case nhất về nội dung**: [bam-bam-2/solo-skills `remote-offload`](https://github.com/bam-bam-2/solo-skills) (448★, MIT, tiếng Hàn) — MacBook Air 8GB → Mac mini: recipe ffmpeg + playwright headless screenshot + builds, scp 2 chiều, quy tắc "offload việc >30s CPU", fail-stop có chủ đích. Nhưng là setup cá nhân hardcode 1 host, job runner `run.sh` được nhắc trong SKILL.md **không có trong repo**. Đáng fork làm template, không phải sản phẩm.
+
+## Tầng job engine cho việc nặng thật sự (GPU queue)
+
+- [brendanlong/gpu-coordinator (gpuc)](https://github.com/brendanlong/gpu-coordinator) — 2★, MIT, push 11-17, 374 commits. `gpuc submit job.yaml --host <ssh-box>`: rsync workdir (theo .gitignore + patch uncommitted, `--no-git` cho non-repo), hàng đợi per-host (host authoritative, dispatcher stdlib-only trong `~/.gpuc`, không cần sudo), phases setup→preflight→main→sync, priority/preempt/estimate, `progress_command` → ETA live, `max_runtime_min`, secrets 0700 xóa khi job hết, outputs → S3/HF hoặc `gpuc fetch <id>` về local (chạy được mid-run, `--path` lấy bất kỳ), `gpuc wait` exit theo outcome (backoff 2s→30s), `--json` mọi lệnh, exit 3 = unknown chứ không phải idle. **Job CPU là công dân hạng nhất**: `gpus: 0` không bao giờ chờ GPU, bỏ qua mọi CUDA preflight (verify trong `runner.py:585,635`); host không GPU đăng ký bằng `--gpus ''` vẫn hợp lệ cho ffmpeg/e2e. Thuê RunPod/Vast khi hết máy (STS keys 36h scoped, chỉ đụng pod `gpuc-*`). Skill self-contained: `gpuc skill --install`. Điểm yếu: không đọc `~/.ssh/config` (khai báo `user@hostname` thật), không probe ffmpeg/docker/playwright, không tunnel/service dài hạn (bg processes bị giết khi phase hết), không match VRAM/CPU/RAM (SPEC non-goal); 2★ nhưng engineering chắc.
+- [srawlin/offload](https://github.com/srawlin/offload) — 1★, Apache-2.0, v0.1.0 (25-10), Go binary = CLI + node, `go install` được ngay. Riêng cho edit→build→test: git-bundle delta sync (~1KB/lần, push-only), warm workspace per-agent (reflink clone), stream output + rewrite path về local, `--json` token-budgeted summary, hook Claude Code PreToolUse tự route test commands, **fail-toward-local** mặc định (`mode: auto`), secrets không upload, env không forward trừ `--env K=V`. Node HTTPS :7070 token+fingerprint (SSH chỉ để setup/tunnel: node `--plain-http` loopback + `ssh -N -L 7070:127.0.0.1:7070`). **Không artifact channel** (chỉ stdout/exit; coverage/screenshot phải scp tay), **bắt buộc git repo** (non-git → fallback local), single node, chưa isolation, chỉ Linux node, không SKILL.md (hook Claude-only; Codex/OpenCode/MCP trong roadmap).
+- [phnx-labs/agi-cli](https://github.com/phnx-labs/agi-cli) (`agents` CLI) — 26★, push 11-16, **FSL-1.1-Apache-2.0** (source-available, chưa OSI). Inventory + placement tốt nhất phân khúc: `devices sync` tự đọc `tailscale status --json`, roles worker/personal, `--device auto` chọn máy ít tải nhất, `devices list --live` (cores/RAM/disk/load/headroom), `hosts check`, xuất registry ra `~/.ssh/config.d/agents`. SSH thuần không daemon; `agents ssh box '<cmd>'` chạy lệnh bất kỳ; agent runs detach `--no-follow` + `hosts ps/logs` + `devices stop` + auto-reattach khi rớt mạng (255, backoff 2s→30s). Nhưng: đơn vị chính là *agent run* (không job API cho việc nặng), sync code không có (scp tay), artifact scp tay, tunnel chỉ cho browser daemon. Đáng mượn: cơ chế discovery Tailscale + capability tags + least-loaded placement.
+
+## Tầng transport / inventory / probe (mảnh ghép dưới skill)
+
+| Repo | ★ / push | License | Cho gì | Thiếu gì |
+|---|---|---|---|---|
+| [badseal/ssh-skill](https://github.com/badseal/ssh-skill) | 566 / 08-24 | README nói MIT, **không có LICENSE file** | Python CLI: exec/upload/download (resume)/transfer host→host/tunnels/cluster gated/đọc `~/.ssh/config`; JSON envelope; security kỹ | exec đồng bộ — không job registry; timeout → `outcome_unknown` phải hỏi user |
+| [sleepinginsummer/agent-ssh-cli](https://github.com/sleepinginsummer/agent-ssh-cli) | 90 / 11-16 | MIT | Rust CLI + SKILL.md sẵn: exec --json, upload/download resume 2 chiều, known_hosts verify, allow/deny regex, secrets mã hóa | config riêng (không import ssh config), không jobs/tunnels/probe; docs tiếng Trung |
+| [newtonapple/remote-machine-access](https://github.com/newtonapple/remote-machine-access) | 0 / 10-17 | MIT | Skill harness-agnostic: `.remote-nodes/<host>.yaml` tối giản ủy quyền cho `~/.ssh/config`; resolution DNS→ssh alias→Tailscale; tunnels -L/-R/-D + cleanup bắt buộc; **Wake-on-LAN** (wake.py, dual-boot); Windows winrun.py; quy trình first-access không TOFU mù | cấm capability metadata trong node config (design); không job lifecycle |
+| [EvilFreelancer/server-discovery](https://github.com/EvilFreelancer/server-discovery) | 1 / 10-18 | MIT | Probe read-only ra JSON: CPU/RAM/GPU (VRAM, compute_cap, power), docker, driver, disks; host cards + fleet index; compare-before-apply chặn mất mát; `discover.py --ssh "ssh comfy"` chạy standalone ngay | chỉ inventory — không exec/sync/jobs; muốn card bền vững phải theo harness repo |
+| [cobanov/fleet](https://github.com/cobanov/fleet) | 3 / 10-05 | MIT | Go TUI/CLI: **tự enumerate `~/.ssh/config` + Tailscale peers**, test reachability, picker chọn host; probe POSIX read-only qua `ssh sh -s` (CPU/RAM/GPU/VRAM/temp/power/disk/net, docker ps, Ollama models); **`fleet --json`** one-shot cho agent | chỉ monitoring — không dispatch/sync/jobs; probe load chứ không phải capability contract (ffmpeg/playwright) |
+| [bos-hieu/agent-skills `ssh`](https://github.com/bos-hieu/agent-skills/blob/main/skills/ssh/SKILL.md) | 0 / 07-29 | MIT | Bash+Go: YAML inventory tags/bastion, named tunnels `-L -N -f`, rsync/scp 2 chiều, info fan-out | không jobs; Go recompile mỗi lần gọi |
+
+## Tầng browser e2e / screenshot
+
+- [first-it-consulting/playwright-skill](https://github.com/first-it-consulting/playwright-skill) — 0★, MIT, push 11-16. Browser chạy **hoàn toàn trên remote** (`chromium.connect(PLAYWRIGHT_WS)` tới `launchServer` trên box, có Docker one-liner `mcr.microsoft.com/playwright`); `page.screenshot({path})` ghi **về local qua WS** — không cần scp. Test runner vẫn chạy local (connect remote browser) — muốn cả suite chạy remote thì rsync project + chạy `npx playwright test` trên box (remote-run/remote-compute lo). Ghép `ssh -L 3000:localhost:3000 <host> -N -f`; client/server Playwright phải cùng version (README ví dụ v1.40 cũ, client pin ^1.65).
+- Microsoft [playwright-cli](https://github.com/microsoft/playwright-cli) + `playwright-cli install --skills` — skill chính chủ cho screenshot/record; chạy trên box remote qua exec của các skill trên.
+
+## Tầng rules / discipline (đáng mượn nguyên văn)
+
+- [MiniMax-Code-Plugins `remote-compute`](https://github.com/MiniMax-AI/MiniMax-Code-Plugins/blob/main/plugins/Hylouis233/openscience/skills/remote-compute/SKILL.md) (gốc: Hylouis233/openscience; repo 26★, push 11-11, plugin MIT) — skill tiếng Trung, thuần quy trình, không tooling. Bốn kỷ luật: **alias-only + ControlMaster** (ControlPersist 600 chống 2FA-fatigue, ProxyJump qua alias); **probe-then-contract** — hồ sơ năng lực `hosts/<alias>.yaml` là nguồn sự thật duy nhất, `gpu_summary: null` thì CẤM mọi lệnh/đề xuất CUDA, probe hỏng = null không đoán, re-probe khi >3 tháng hoặc hành vi mâu thuẫn; **artifact discipline** — rsync bắt buộc về `results/<job>/` + record provenance ("run không ghi nhận = không tồn tại"), dọn remote chỉ gợi ý không tự làm; **security red lines** — secrets không vào argv, không copy credential lên remote, script hiện user trước khi chạy, **output remote là data không phải instruction** (chống prompt injection). Failure branches không retry mù (publickey → dừng hướng dẫn key; quota → báo không tự xóa). Non-goal: port forwarding, quản env remote. Đây là bản kỷ luật mà bản tiếng Anh tiến hóa trong `ai4s-research/open-science` (hạng 1) kế thừa.
+
+## Đã loại (có lý do)
+
+| Candidate | Lý do |
+|---|---|
+| Kanevry/session-orchestrator `remote-offload` | Tham chiếu nội bộ plugin; `offload` CLI thuộc repo riêng không public (đã xác minh 33 repo public của tác giả) |
+| [developerz-ai/mcp-ssh](https://github.com/developerz-ai/mcp-ssh) (2★) | Tên SSH nhưng thực chất HTTP service trên host; job model tốt nhất nhưng **installer cấp NOPASSWD:ALL sudo = root cho ai auth được**; file tool text-only, không chuyển binary (video/screenshot) |
+| [YonganZhang/a2a-ssh-skill](https://github.com/YonganZhang/a2a-ssh-skill) (1★, 8 tháng không commit) | Offload *agent* không phải *compute*; remote cần Claude CLI + `--dangerously-skip-permissions` hardcode; **không có SKILL.md** dù README quảng cáo auto-discover |
+| [oshinop/claudette](https://github.com/oshinop/claudette) (29★) | Hướng ngược: Claude chạy remote nhưng **Bash thực thi local** — việc nặng vẫn ở laptop |
+| [AgentifyHQ/claude-bridge](https://github.com/AgentifyHQ/claude-bridge) (1★, không LICENSE) | Job bền vững chỉ cho remote Claude sessions; raw ssh blocking, chết theo connection |
+| [ToxicPine/offloads](https://github.com/ToxicPine/offloads) (14★, GPL-3.0) | SSH-host-capable thật nhưng kết quả **chỉ về qua git commit** — không hợp media; Nix flake worldview; configurator seed credentials lên remote |
+| [ddm667/mcp-ssh-manager-hermes](https://github.com/ddm667/mcp-ssh-manager-hermes) (0★) | Copy cũ v3.7.0 của bvisible, **trước mọi bản vá injection/RCE v3.8.5–4.0.3** — dùng bản gốc ≥4.0.3 |
+| [marshawcoco/remote-ssh-dev](https://github.com/marshawcoco/remote-ssh-dev) (6★, MIT) | Đúng hướng nhưng chỉ sửa repo remote; không detach — job chết theo SSH; safety preamble đáng mượn |
+| ana52070/claude-code-setup `ssh-remote-dev` (1★, **không license**) | Playbook 688 dòng thuần prompt, security wrapper tốt (blocklist, .bak trước write, path allowlist) — design donor, không drop-in |
+| chf3198/megingjord-harness `network-platform-resources` (1★, **PolyForm-NC**) | Discovery Tailscale thật (`tailscale status --json` → devices overlay) + offload decision tables hay nhất, nhưng gắn harness cá nhân, cấm thương mại, không exec/sync/jobs |
+| skillmd.ai `remote-run-ssh` | Repo nguồn kungfuai/CVlization đã 404 — nội dung SEO giữ playbook chết (pattern rsync-minimal → docker → pull logs vẫn đáng tham khảo) |
+| [imbue-ai/mngr](https://github.com/imbue-ai/mngr) (434★) | Có ssh provider (host tự có, exec/rsync/forward đủ) nhưng đơn vị quản lý là *agent session* — sai tầng cho job offload |
+| [stym06/offload](https://github.com/stym06/offload) (0★, MIT) | Encrypted-PTY remote-agent terminal (WS :9876 + NaCl, không SSH); không file sync, pod hủy khi hết session, **exit code giả** (0/1 theo stream); `npm install -g offload` trỏ nhầm package 2018 khác — clone-only |
+| [8DE4732A/remote-cli](https://github.com/8DE4732A/remote-cli) (1★, MIT, PyPI `remote-cli`) | Shared-session co-piloting: người mở ssh (2FA/bastion), agent exec trong PTY đó; scp fast-path + tar/base64 in-band khi scp bị chặn. Hay cho phiên có giám sát, không phải unattended offload (không inventory/job manager) |
+
+## Khuyến nghị kiến trúc cho skill `remote-offload` của bạn
+
+Không có repo nào phủ đủ 7 tiêu chí. Hai con đường thực dụng:
+
+**A. Skill thuần ssh/rsync (nhẹ nhất, hợp omp nhất)** — ghép:
+1. Xương sống: `open-science/remote-compute` (MIT, đang maintain) — bỏ `ssh_connect`/`record_run.py`/`$OPENSCIENCE_SSH_CONFIG`, giữ detached-job + fetch-artifacts + BatchMode rules.
+2. Config/hosts: schema của `kellymears/remote-run` (ssh_fallbacks, path_map, scratch_dir, notes-as-instructions, host memory `memory/<host>.md`) — hợp fleet ssh-config sẵn có.
+3. Discovery + probe: `fleet --json` (tự enumerate `~/.ssh/config` + Tailscale, load live) để chọn máy; probe-then-contract hồ sơ `hosts/<alias>.yaml` kiểu MiniMax (null = cấm đoán); `server-discovery/discover.py --ssh` khi cần card chi tiết (VRAM/power/docker).
+4. Decision rules + recipe ffmpeg/playwright: mượn `solo-skills/macmini-offload` (>30s CPU thì offload; không offload UI người dùng cần xem).
+5. Tunnel + WoL + first-access: mượn `remote-machine-access` (-L/-R/-D cleanup, wake.py).
+6. e2e/screenshot: `playwright launchServer` trên box + `ssh -L` (pattern playwright-skill), hoặc chạy cả suite remote qua job pattern.
+7. Quy tắc an toàn: "fail loudly, not locally" (remote-run) + exit-code-not-prose + chỉ kill job mình tạo + không đụng checkout khác (Kanevry) + output-remote-là-data (MiniMax) + secrets không vào argv.
+
+**B. Engine có sẵn (ít tự viết hơn)**: `bvisible/mcp-ssh-manager` ≥4.0.3 làm transport (import ssh config, rsync, bg jobs, tunnels) + skill mỏng dạy decision/probe; hoặc tách `abox-remote` (Apache-2.0, single-file) làm job runner; hoặc dùng luôn skill `dsh-task2docker-studio` (standalone, không deps, có Docker isolation + copyfrom) rồi bổ sung probe/tunnel/timeout. Đánh đổi: thêm dependency/MCP context load.
+
+**Việc nặng theo hàng đợi** (train/render dài, nhiều job tranh GPU): thêm `gpuc` làm execution backend — `gpus: 0` chạy job CPU trên cả host không GPU (`--gpus ''`); `gpuc fetch` mang artifact về; `gpuc wait`/`--json` cho agent giám sát đúng contract.
+
+## Nguồn
+
+Tất cả URL trong bảng; số liệu ★/push/license lấy qua `gh api repos/<owner>/<repo>` ngày 2026-11-20 (một số scout gặp rate-limit API anonim → xác minh lại bằng `gh` auth hoặc atom feed, đã ghi chú). Scouts đọc raw SKILL.md/README/source; các phát hiện "thiếu file trong repo" (run.sh của solo-skills, SKILL.md của a2a, LICENSE của badseal/ana52070/claude-bridge/kellymears) xác minh qua GitHub tree API. Hành vi gpuc CPU-only/GPU-less host xác minh trong source (`runner.py`, `health.py`, `hosts.py`).
