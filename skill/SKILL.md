@@ -37,6 +37,14 @@ says *why*. This table is the whole contract — read the field before acting.
 | 69 | `reason` = job dir missing | the host was wiped | re-`probe`, re-`ensure`, re-`push`, resubmit |
 | 69 | `reason` = process vanished without an exit file | the job was OOM-killed or killed | `$ROFF_OUT` may still hold partial output — `roff pull` first, then use a host with more RAM or a smaller job. Do not resubmit the same job unchanged |
 
+**Data that outlives a restart.** The remote layout lives under `$ROFF_ROOT`:
+`~/.roff` by default, or `<durable mount>/.roff` when the host has one (a Muse
+container wipes `$HOME` on every refresh — its durable mount is `/home/hatch`).
+`projects/`, `jobs/` (so `$ROFF_OUT`), `toolchain/` and `env.sh` are therefore
+**durable**; the instance token stays in `$HOME` on purpose, so a wipe is still
+detected. A restart still kills the *running* job (exit 69) — the fix is that
+the pushed inputs and the outputs survive, so a resubmit does not need a re-push.
+
 The job ledger survives everything local: `roff jobs` lists past jobs with ids/hosts/commands.
 
 ## Decision rules
@@ -51,10 +59,10 @@ The job ledger survives everything local: `roff jobs` lists past jobs with ids/h
 
 1. **Discover + probe** (once per session, or when a host misbehaves):
    `roff probe <host>` probes one host. `roff hosts` probes every `~/.ssh/config` alias **one at a time** — serial by default, because a single-session bridge cannot take two concurrent ssh sessions (step 2). Add `--parallel` only when every alias is known to tolerate concurrent ssh.
-   The profile is a capability contract: `reachable` (false = the host is unusable — read `error` for the cause), `error` (present only when `reachable` is false — the ssh error text), `tools` (ffmpeg/node/python3/…), `gpu` (**null = no GPU; never emit CUDA commands or GPU claims**; the key is *absent* on an unreachable host, which means "unknown", not "no GPU"), `cores`, `mem_available_mb`, `load`, `disk_free_mb`, `durable_mount` (null on most hosts), `boot_id`, `instance_token`, `home`.
-   `wiped_since_last_probe` / `restarted_since_last_probe` (each present only when true) mean: re-`ensure` toolchains and re-`push` projects before running.
+   The profile is a capability contract: `reachable` (false = the host is unusable — read `error` for the cause), `error` (present only when `reachable` is false — the ssh error text), `tools` (ffmpeg/node/python3/…), `gpu` (**null = no GPU; never emit CUDA commands or GPU claims**; the key is *absent* on an unreachable host, which means "unknown", not "no GPU"), `cores`, `mem_available_mb`, `load`, `disk_free_mb`, `durable_mount` (null on most hosts), `durable_local` (a **local** durable mount — the one the layout actually uses), `layout_root` (absolute path where `projects/`, `jobs/`, `toolchain/` live), `boot_id`, `instance_token`, `home`.
+   `wiped_since_last_probe` / `restarted_since_last_probe` (each present only when true) mean: re-`ensure` toolchains and re-`push` projects before running — unless `layout_root` is on a durable mount, in which case the pushed project survived and only the job needs resubmitting.
    *Done when:* you hold a profile for the host you intend to use, and its `tools` list contains the binary the job needs (or you have a setup script for it).
-2. **Place**: pick a reachable host that has the needed tool (or can `ensure` it), enough free RAM/disk, lowest load. Prefer hosts with a `durable_mount` for long-lived data.
+2. **Place**: pick a reachable host that has the needed tool (or can `ensure` it), enough free RAM/disk, lowest load. Prefer hosts with a `durable_mount` for long-lived data. A host that recycles (Muse containers restart on their own, often within hours) is only fit for **short** jobs unless its `layout_root` is durable: check `mem_available_mb` before sending anything heavy — a Muse container with ~600 MB free will OOM-kill a big transcode (exit 69, "process vanished").
    | Symptom | Means | Do |
    |---|---|---|
    | `reachable: false` and `error` says "Permission denied" | your key was refused on that host | tell the user — it is not a dead host |
@@ -67,9 +75,9 @@ The job ledger survives everything local: `roff jobs` lists past jobs with ids/h
    **Single-session bridges** (colab `ProxyCommand`, some reverse tunnels) allow only ONE active ssh session — concurrent jobs or agents get HTTP 429 / connection closed. Don't fan out parallel jobs onto one.
    *Done when:* one alias is chosen, it is reachable, and it has the tool.
 3. **Setup once** (only when a needed tool is missing): `roff ensure <host> --setup <skill-dir>/setups/node.sh --name node`.
-   Idempotent: stamped by script-hash + the host's **current** `boot_id` + `instance_token`; skips when already done, **re-runs automatically after a host restart/wipe**. Setup scripts install into `~/.roff/toolchain/bin` (on PATH for every job) and must be idempotent. Never apt-install per job.
+   Idempotent: stamped by script-hash + the host's **current** `boot_id` + `instance_token`; skips when already done, **re-runs automatically after a host restart/wipe**. Setup scripts install into `$ROFF_ROOT/toolchain/bin` (`ROFF_ROOT` is exported to them; on PATH for every job) and must be idempotent. Never apt-install per job.
    *Done when:* the response says `skipped: true`, or it ran to completion (`ensured: true, skipped: false`).
-4. **Push inputs**: `roff push <host> <local-dir> --name <project>` → `~/.roff/projects/<project>`. Transport auto: rsync if present, tar-over-ssh otherwise.
+4. **Push inputs**: `roff push <host> <local-dir> --name <project>` → `$ROFF_ROOT/projects/<project>`. Transport auto: rsync if present, tar-over-ssh otherwise.
    Default excludes: `.git`, `node_modules`, `.venv`, `venv`, `__pycache__`, `.next`, `dist`, `build`, `.cache`, `*.pyc` — pass `--exclude` to add, `--no-default-excludes` to disable. The `--name` you push must equal the `--project` you run.
    *Done when:* the response reports `ok: true` and the remote path.
 5. **Run detached**: `roff run <host> --project <project> --cmd '<bash>' [--ensure <skill-dir>/setups/x.sh --ensure-name x] [--env K=V]`.

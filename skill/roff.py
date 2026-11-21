@@ -13,9 +13,13 @@ field says why (the full table lives in the skill's SKILL.md):
 Payloads (job command, --env values, setup scripts) travel on stdin, never in
 remote argv — argv is visible to `ps` on the host.
 State: local ledger ~/.local/state/roff (jobs, host profiles, tunnels, audit).
-Remote layout: ~/.roff/{jobs/<id>,projects,setup,toolchain,env.sh,instance}.
-In a job command, $ROFF_OUT is the job's output dir (~/.roff/jobs/<id>/out) —
-write artifacts there, `roff pull <id>` fetches exactly that dir.
+Remote layout: $ROFF_ROOT/{jobs/<id>,projects,setup,toolchain,env.sh}.
+  $ROFF_ROOT = ~/.roff, or <durable mount>/.roff when the host has one (a
+  Muse container wipes $HOME on every refresh; its durable mount is
+  /home/hatch). The instance token stays in $HOME on purpose — it must die
+  with the instance so a wipe is still detected.
+In a job command, $ROFF_OUT is the job's output dir ($ROFF_ROOT/jobs/<id>/out)
+— write artifacts there, `roff pull <id>` fetches exactly that dir.
 """
 import argparse
 import base64
@@ -178,8 +182,19 @@ def sha256_file(p):
 
 PROBE_SCRIPT = r'''
 set -u
-export PATH="$HOME/.roff/toolchain/bin:$HOME/.local/bin:$PATH"
+# Thu BEN VUNG local (khong phai mount dong bo dam may): layout root cho
+# projects/jobs/toolchain. Host nao $HOME bi wipe moi lan refresh (container
+# Muse: home=/root tren overlay tam) se mat het project da push + output cua
+# job neu khong dung thu ben vung nay.
+dlocal=""
+for d in /home/hatch "$HOME/persistent" /persistent /data; do
+  if [ -d "$d" ] && touch "$d/.roff-w" 2>/dev/null; then rm -f "$d/.roff-w"; dlocal="$d"; break; fi
+done
+if [ -n "$dlocal" ]; then ROOT="$dlocal/.roff"; else ROOT="$HOME/.roff"; fi
+export PATH="$ROOT/toolchain/bin:$HOME/.roff/toolchain/bin:$HOME/.local/bin:$PATH"
 boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
+# Token instance van nam trong $HOME: no phai bien mat cung instance de con
+# phat hien "host bi wipe" (refresh xoa moi $HOME).
 if [ ! -f "$HOME/.roff/instance" ]; then
   mkdir -p "$HOME/.roff"
   (uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid) > "$HOME/.roff/instance"
@@ -189,7 +204,8 @@ cores=$(nproc 2>/dev/null || echo 0)
 mem=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
 memav=$(awk '/MemAvailable/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
 load=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo "")
-disk=$(df -Pm "$HOME" 2>/dev/null | awk 'NR==2{print $4}')
+diskbase="$HOME"; [ -n "$dlocal" ] && diskbase="$dlocal"
+disk=$(df -Pm "$diskbase" 2>/dev/null | awk 'NR==2{print $4}')
 up=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)
 tools=""
 for c in ffmpeg ffprobe node npm npx python3 pip3 git rsync docker chromium chromium-browser google-chrome Xvfb uv; do
@@ -204,12 +220,14 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   [ -n "$g" ] && gpu="\"$g\""
 fi
 durable=null
-for d in /content/drive/MyDrive "$HOME/persistent" /persistent /data; do
+for d in /content/drive/MyDrive "$HOME/persistent" /persistent /data /home/hatch; do
   if [ -d "$d" ] && touch "$d/.roff-w" 2>/dev/null; then rm -f "$d/.roff-w"; durable="\"$d\""; break; fi
 done
+dlocal_json=null
+[ -n "$dlocal" ] && dlocal_json="\"$dlocal\""
 os=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" || uname -s)
-printf '{"boot_id":"%s","instance_token":"%s","home":"%s","os":"%s","arch":"%s","cores":%s,"mem_mb":%s,"mem_available_mb":%s,"load":"%s","disk_free_mb":%s,"uptime_s":%s,"tools":%s,"gpu":%s,"durable_mount":%s}\n' \
-  "$boot" "$inst" "$HOME" "$os" "$(uname -m)" "$cores" "$mem" "$memav" "$load" "${disk:-0}" "$up" "$tools" "$gpu" "$durable"
+printf '{"boot_id":"%s","instance_token":"%s","home":"%s","os":"%s","arch":"%s","cores":%s,"mem_mb":%s,"mem_available_mb":%s,"load":"%s","disk_free_mb":%s,"uptime_s":%s,"tools":%s,"gpu":%s,"durable_mount":%s,"durable_local":%s,"layout_root":"%s"}\n' \
+  "$boot" "$inst" "$HOME" "$os" "$(uname -m)" "$cores" "$mem" "$memav" "$load" "${disk:-0}" "$up" "$tools" "$gpu" "$durable" "$dlocal_json" "$ROOT"
 '''
 
 
@@ -379,6 +397,35 @@ def abs_remote(host, remote):
     return remote_home(host) + "/" + remote.removeprefix("~/")
 
 
+def layout_root(host):
+    """Remote layout root: noi roff giu projects/jobs/toolchain/env.sh.
+
+    Host nao $HOME bi wipe moi lan refresh (container Muse: home=/root tren
+    overlay tam) se mat het project da push va output cua job neu giu o
+    $HOME/.roff. Khi host co thu BEN VUNG local (vd /home/hatch cua container
+    Muse) thi layout chuyen sang <durable>/.roff de song qua lan refresh.
+
+    Token instance van nam trong $HOME (xem PROBE_SCRIPT): no phai bien mat
+    cung instance de con phat hien host bi wipe.
+    """
+    prof = load_profile(host) or {}
+    root = prof.get("layout_root")
+    if root:
+        return root
+    durable = prof.get("durable_local") or ""
+    if not durable:
+        p = ssh(host, 'for d in /home/hatch "$HOME/persistent" /persistent /data; do '
+                       'if [ -d "$d" ] && touch "$d/.roff-w" 2>/dev/null; then '
+                       'rm -f "$d/.roff-w"; printf "%s" "$d"; break; fi; done')
+        durable = p.stdout.strip() if p.returncode == 0 else ""
+    home = remote_home(host)
+    root = (durable.rstrip("/") + "/.roff") if durable else (home.rstrip("/") + "/.roff")
+    prof["layout_root"] = root
+    prof["durable_local"] = durable
+    save_profile(host, prof)
+    return root
+
+
 def rpath(remote):
     """~ -> $HOME for remote shell contexts (bash expands it)."""
     return remote if remote.startswith("/") else '$HOME/' + remote.removeprefix("~/")
@@ -473,7 +520,7 @@ def cmd_push(a):
     local = Path(a.local).expanduser().resolve()
     if not local.is_dir():
         raise RoffError(2, f"local dir not found: {local}")
-    remote = a.remote or f"{remote_home(a.host)}/.roff/projects/{a.name or local.name}"
+    remote = a.remote or f"{layout_root(a.host)}/projects/{a.name or local.name}"
     excludes = [] if a.no_default_excludes else list(DEFAULT_EXCLUDES)
     excludes += a.exclude or []
     mode = transfer_up(a.host, local, remote, excludes, a.timeout)
@@ -495,7 +542,9 @@ def cmd_pull(a):
           "transport": mode, "files": files})
 
 
-ENSURE_HEADER = 'mkdir -p "$HOME/.roff/toolchain/bin"\nexport PATH="$HOME/.roff/toolchain/bin:$HOME/.local/bin:$PATH"\n'
+ENSURE_HEADER = ('export ROFF_ROOT="{root}"\n'
+                 'mkdir -p "$ROFF_ROOT/toolchain/bin"\n'
+                 'export PATH="$ROFF_ROOT/toolchain/bin:$HOME/.roff/toolchain/bin:$HOME/.local/bin:$PATH"\n')
 
 
 def ensure_setup(host, setup_path, name, force=False, timeout=1800):
@@ -539,7 +588,7 @@ def ensure_setup(host, setup_path, name, force=False, timeout=1800):
     stamp = f"{h}:{fields.get('BOOT', '')}:{fields.get('INST', '')}"
     if not force and fields.get("STAMP", "") == stamp:
         return {"ensured": True, "skipped": True, "stamp": stamp}
-    body = ENSURE_HEADER + setup_path.read_text()
+    body = ENSURE_HEADER.format(root=layout_root(host)) + setup_path.read_text()
     b64 = base64.b64encode(body.encode()).decode()
     # The payload rides on stdin (inside the script), never in argv.
     script = (
@@ -568,13 +617,14 @@ def cmd_ensure(a):
 
 
 RUNNER = r'''#!/usr/bin/env bash
+export ROFF_ROOT="${ROFF_ROOT:-$HOME/.roff}"
 export ROFF_OUT="$ROFF_JOB/out"
-export PATH="$HOME/.roff/toolchain/bin:$HOME/.local/bin:$PATH"
+export PATH="$ROFF_ROOT/toolchain/bin:$HOME/.local/bin:$PATH"
 if ! cd "$ROFF_WORKDIR"; then
   echo "roff: workdir does not exist: $ROFF_WORKDIR (push the project first?)" > "$ROFF_JOB/log"
   echo 97 > "$ROFF_JOB/exit"; exit 97
 fi
-[ -f "$HOME/.roff/env.sh" ] && . "$HOME/.roff/env.sh"
+[ -f "$ROFF_ROOT/env.sh" ] && . "$ROFF_ROOT/env.sh"
 [ -f "$ROFF_JOB/env.sh" ] && . "$ROFF_JOB/env.sh"
 bash "$ROFF_JOB/cmd.sh" > "$ROFF_JOB/log" 2>&1
 rc=$?
@@ -589,7 +639,8 @@ CMD_B64=__CMD__
 RUNNER_B64=__RUNNER__
 ENV_B64=__ENV__
 WD=__WD__
-d="$HOME/.roff/jobs/$JID"
+export ROFF_ROOT="__ROOT__"
+d="$ROFF_ROOT/jobs/$JID"
 mkdir -p "$d/out"
 printf '%s' "$CMD_B64" | base64 -d > "$d/cmd.sh"
 printf '%s' "$RUNNER_B64" | base64 -d > "$d/run.sh"
@@ -638,11 +689,12 @@ def cmd_run(a):
         prof = load_profile(host) or prof  # ensure may have refreshed
     jid = time.strftime("%y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
     home = remote_home(host)
-    remote = f"{home}/.roff/jobs/{jid}"
+    root = layout_root(host)
+    remote = f"{root}/jobs/{jid}"
     if a.workdir:
         workdir = abs_remote(host, a.workdir)
     elif a.project:
-        workdir = f"{home}/.roff/projects/{a.project}"
+        workdir = f"{root}/projects/{a.project}"
     else:
         workdir = home
     env_lines = []
@@ -661,7 +713,8 @@ def cmd_run(a):
               .replace("__CMD__", shlex.quote(b64(a.cmd)))
               .replace("__RUNNER__", shlex.quote(b64(RUNNER)))
               .replace("__ENV__", shlex.quote(b64(env_block)))
-              .replace("__WD__", shlex.quote(workdir)))
+              .replace("__WD__", shlex.quote(workdir))
+              .replace("__ROOT__", shlex.quote(root)))
     p = ssh(host, script, a.submit_timeout)
     if p.returncode == 255:
         raise RoffError(255, f"run: host unreachable: {host}", host=host,

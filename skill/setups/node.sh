@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Idempotent node bootstrap for ephemeral hosts (Colab/muse cells).
-# Installs node+npm into ~/.roff/toolchain ONLY if missing; safe to re-run.
+# Installs node+npm into $ROFF_ROOT/toolchain ONLY if missing; safe to re-run.
 # After a host wipe, roff ensure re-runs this automatically (stamp is gone).
+# ROFF_ROOT is the layout root (durable mount when the host has one), so the
+# toolchain survives a refresh of a host that wipes $HOME.
 set -euo pipefail
-TC="$HOME/.roff/toolchain"
+TC="${ROFF_ROOT:-$HOME/.roff}/toolchain"
 mkdir -p "$TC/bin"
 if command -v npm >/dev/null 2>&1 && command -v node >/dev/null 2>&1; then
   echo "node already present: $(node --version), npm $(npm --version)"

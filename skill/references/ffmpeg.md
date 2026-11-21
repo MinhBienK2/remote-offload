@@ -2,7 +2,7 @@
 
 Commands below use `roff` = `python3 <skill-dir>/roff.py` (see SKILL.md).
 
-Probe first: `roff probe <host>` — `tools.ffmpeg` must be present (Colab/muse images usually ship it). If missing, write an idempotent setup (static ffmpeg build into `~/.roff/toolchain/bin`) and `roff ensure`.
+Probe first: `roff probe <host>` — `tools.ffmpeg` must be present (Colab/muse images usually ship it). If missing, write an idempotent setup (static ffmpeg build into `$ROFF_ROOT/toolchain/bin`) and `roff ensure`.
 
 ## Transcode a local file
 
@@ -34,3 +34,4 @@ roff run <host> --cmd '
 - GPU encoding (`h264_nvenc`) only when `probe.gpu` is non-null AND `ffmpeg -encoders | grep nvenc` succeeds on that host; otherwise CPU libx264.
 - Many files: one job looping over inputs beats one job per file (ssh round-trips dominate).
 - Host restarted mid-render → `wait` returns 69. A reboot keeps the job directory, so partial output in `$ROFF_OUT` is usually still there: `roff pull` it before re-probing and resubmitting. Only a *wiped* host loses everything.
+- **Host that recycles on its own** (Muse containers restart within hours): check `mem_available_mb` before sending a render — a container with ~600 MB free OOM-kills a big transcode. The inputs and the outputs live under `$ROFF_ROOT` (durable mount when the host has one), so a restart costs you the render, not the data: resubmit, don't re-push.
