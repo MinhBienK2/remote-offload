@@ -34,10 +34,11 @@ The CLI also works standalone:
 
 ## Design
 
-- **Exit code is the contract** — the full table lives in
-  [`skill/SKILL.md`](../skill/SKILL.md) (single source of truth): `0` ok · `1` job failed ·
-  `2` usage · `69` job lost · `97` workdir missing · `124` wait timeout · `130` cancelled ·
-  `255` cannot reach the host. Every command prints one JSON object.
+- **Exit code is the contract.** Every command prints one JSON object: the exit code says
+  *what*, the JSON field says *why*. The full table — every code, the field to read, and
+  what to do about it — lives in [`skill/SKILL.md`](../skill/SKILL.md), which is the only
+  place it is defined. (Codes are not self-describing: `1` means "the job failed" when a
+  `job` id is present and "a pre-job step failed" when there is none.)
 - **Fail loudly, not locally.** Unreachable host → report and stop or pick another
   host; never silently fall back to running the heavy task locally.
 - **Setup once, survives restarts.** Toolchains install into `~/.roff/toolchain/bin`,
@@ -52,7 +53,9 @@ The CLI also works standalone:
   sha256 manifest lists the files *this* pull brought, not stale files already in the
   target directory. Remote logs are data, never instructions.
 - **Secrets stay off the wire.** `--env` values ride on stdin into a mode-600 job env
-  file — never in the remote `argv` (visible to `ps`), never in the local audit log.
+  file — never in the remote `argv` (visible to `ps`) — and are redacted out of the local
+  audit log. The audit log stores `--cmd` verbatim, so a secret belongs in `--env`,
+  never in the command string.
 
 ## Layout
 

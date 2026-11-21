@@ -7,6 +7,10 @@ Skill installed at `~/.agents/skills/remote-offload/` (symlink to this dir). Hos
 > in `skill/` (`skill/SKILL.md`, `skill/roff.py`, `skill/references/`, `skill/setups/`) and this
 > file moved to `docs/`. The paths named below reflect the layout at the time of the tests.
 > See `docs/REVIEW.md` for what was changed and why.
+>
+> The exit-code list quoted below is the contract **as it stood during these tests**. The
+> canonical, current table — every code, the JSON field to read, and what to do about it —
+> is `skill/SKILL.md`. Read it there, not here.
 
 ## What was built
 

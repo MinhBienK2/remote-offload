@@ -114,6 +114,15 @@ và `reason` của OOM nói "output dở vẫn còn, pull trước".
 | `roff hosts` / `roff probe all` **serial mặc định**, thêm `--parallel` opt-in | Verify của critique "hierarchy" giữ lại đúng 1 finding: guardrail single-session bridge nằm *sau* lệnh phá nó, và `roff hosts` fan-out 8 alias đồng thời → 429 trên bridge 1 session (fleet có `comfy` + `colab-comfy` = cùng 1 box). Giờ lệnh discovery tự tuân thủ guardrail của chính nó |
 | `description`: gộp 3 cụm tiếng Việt thành 2 (một branch viết 3 lần), bỏ "remote host" trần (over-fire), thêm nhánh "reach a service running on a remote host (tunnel / port forward)" mà skill thực sự hỗ trợ | Theo `writing-for-agents`: synonym của một branch là một branch viết hai lần; và pointer phải nêu **mọi** branch skill phục vụ |
 
+### Vòng 4 — quét lại "sediment" (code đổi, doc chưa theo)
+
+| Sửa | Vì sao |
+|---|---|
+| `docs/README.md`: ví dụ `roff.py hosts` bỏ chữ "in parallel" | Vòng 3 đã đổi `hosts` sang serial mặc định nhưng README vẫn mô tả parallel — doc nói ngược với code |
+| `docs/README.md`: **xoá** danh sách exit code inline, chỉ trỏ về `skill/SKILL.md` | Bản rút gọn của bảng là **sai**, không chỉ trùng: code `1` mang hai nghĩa tùy có field `job` hay không (`1 job failed` vs `1` pre-job failure) — đúng cái bug vòng 2 đã sửa. Rút gọn hoá đọc sai thành hiện thường. Bảng đầy đủ chỉ ở SKILL.md |
+| `docs/README.md`: bullet secrets nói rõ `--cmd` được lưu **verbatim** trong audit log | Câu cũ ("never in the local audit log") chỉ đúng cho `--env`; dễ bị hiểu là "secret nào cũng không vào audit log" — sai, vì `--cmd` lưu nguyên văn |
+| `docs/RETRO.md`: thêm note đầu file trỏ bảng exit code hiện hành về `skill/SKILL.md` | RETRO là bản ghi lịch sử — không sửa body, chỉ chỉ đường cho người đọc |
+
 ---
 
 ## 4. Còn mở (xếp theo payoff)
@@ -122,9 +131,11 @@ và `reason` của OOM nói "output dở vẫn còn, pull trước".
 |---|---|---|---|
 | 1 | Bước "Place" vẫn là prose dày (giờ có bảng symptom→meaning→do nhưng còn 1 đoạn dài) | `SKILL.md` bước 2 | TB |
 | 2 | `setups/playwright-chromium.sh` dùng `playwright@latest` — client/server có thể lệch version | `skill/setups/playwright-chromium.sh` | TB |
-| 3 | Bảng exit code còn copy ở `docs/README.md` + `docs/RETRO.md` (SKILL.md là bản agent-facing duy nhất) | `docs/` | Thấp |
 | 4 | `references/` vẫn lặp lại sequence push→run→wait→pull của SKILL.md | `skill/references/*` | Thấp |
 | 5 | Vài câu trong SKILL.md lặp lại thứ `--help` đã nói | `skill/SKILL.md` | Thấp |
+
+> #3 (bảng exit code bị copy ở `docs/`) đã **đóng** ở vòng 4: `docs/README.md` chỉ trỏ về
+> `skill/SKILL.md`, `docs/RETRO.md` giữ nguyên bản ghi lịch sử + note trỏ về SKILL.md.
 
 ---
 
