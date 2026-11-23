@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field, fields
@@ -42,6 +41,12 @@ try:  # phần A (config.py) có thể chưa sẵn sàng -> fallback tối thi�
     from roffkit.config import Config  # type: ignore
 except ImportError:  # pragma: no cover - chỉ xảy ra khi chạy lẻ module này
     Config = Any  # type: ignore[assignment,misc]
+
+
+try:  # B34: chính sách nice/ionice — MỘT nguồn sự thật (dùng chung 5 module)
+    from roffkit.config import local_nice_prefix  # type: ignore
+except ImportError:  # pragma: no cover - chỉ xảy ra khi chạy lẻ module này
+    from .config import local_nice_prefix  # type: ignore
 
 
 try:
@@ -98,10 +103,6 @@ DURABLE_CANDIDATES: tuple[str, ...] = (
 
 #: URL dùng để đo internet (hợp đồng API §6).
 INTERNET_URL = "https://github.com"
-
-#: Biểu tức chỉnh của `nice`/`ionice` cho tiến trình con (hợp đồng §1).
-NICE_LEVEL = 19
-IONICE_CLASS = "3"
 
 
 def default_state_dir() -> str:
@@ -361,13 +362,12 @@ def build_script() -> str:
 # chạy ssh
 # --------------------------------------------------------------------------
 def _prefix_nice() -> list[str]:
-    """Tiền tố ``nice``/``ionice`` cho tiến trình con (hợp đồng §1)."""
-    parts: list[str] = []
-    if shutil.which("nice"):
-        parts += ["nice", "-n", str(NICE_LEVEL)]
-    if shutil.which("ionice"):
-        parts += ["ionice", "-c" + IONICE_CLASS]
-    return parts
+    """Tiền tố ``nice``/``ionice`` cho tiến trình con (hợp đồng §1).
+
+    **MỘT nguồn sự thật** (B34): gọi :func:`roffkit.config.local_nice_prefix`
+    ⇒ probe cho ra **cùng** tiền tố với sshx/tunnel/job/transfer.
+    """
+    return local_nice_prefix()
 
 
 def _config_args() -> list[str]:

@@ -56,7 +56,6 @@ from . import fleet as fleet_mod
 from . import infer as infer_mod
 from . import inputs as inputs_mod
 from . import job as job_mod
-from . import layout as layout_mod
 from . import perm
 from . import policy as policy_mod
 from . import probe as probe_mod
@@ -823,32 +822,6 @@ def _job_specs(args: argparse.Namespace) -> list[dict]:
     return specs
 
 
-def _remote_item_path(
-    host: str,
-    item: str,
-    inputs: Sequence[_Input],
-    pushed: set[tuple[str, str]],
-    layout_root: str,
-) -> tuple[str, str, str, bool]:
-    """Đường dẫn **remote** của 1 item của ``--each`` (trong kho dùng chung).
-
-    Trả ``(đường dẫn remote, shared key, rel trong {key}/, item nằm trong input)``.
-
-    * Item nằm trong 1 input thư mục ⇒ dùng đường dẫn tương đối trong bản copy
-      của input đó (input đã nằm trong kho ⇒ **không đẩy lại**).
-    * Item không nằm trong input nào ⇒ tự trở thành **1 nguồn riêng** trong kho
-      (đẩy đúng 1 lần, các job sau dùng lại bản copy đó).
-    """
-    source_locals = [
-        os.path.abspath(os.path.expanduser(source.value))
-        for source in inputs
-        if source.kind == "path"
-    ]
-    return inputs_mod.resolve_item_path(
-        host, item, layout_root, source_locals, pushed
-    )
-
-
 # --------------------------------------------------------------------------
 # `--sync-back` — ánh xạ path local ⇄ remote (B26)
 # --------------------------------------------------------------------------
@@ -1054,7 +1027,6 @@ def _cmd_do(args: argparse.Namespace) -> tuple[dict, int]:
 
     ledger = slots_mod.SlotLedger()
     used_hosts: set[str] = set()
-    pushed: set[tuple[str, str]] = set()
 
     job_ids: list[str] = []
     created_jobs: list[dict] = []
@@ -1175,12 +1147,19 @@ def _cmd_do(args: argparse.Namespace) -> tuple[dict, int]:
     # helper: 1 job của lô
     # ------------------------------------------------------------------
     def _prepare_spec(index: int, spec: dict) -> dict:
-        """Tạo job → xin slot → chuẩn bị input → launch.
+        """Tạo job → xin slot → **giao việc đẩy input + launch cho watcher**.
 
-        Chuẩn bị input (hoặc setup toolchain) thất bại vì **host chết** ⇒ thử
-        host khác (tối đa N lần, N = số host trong fleet). Lỗi do **sai cấu
-        hình** (URL hỏng, thiếu tool) ⇒ **không** retry — báo lỗi luôn
-        (W3c + W3m: exit 1/2, không phải 255).
+        (B36/C10) ``do`` **không** đẩy input và **không** launch nữa ⇒ vòng
+        lặp ``--each`` chỉ làm việc **cục bộ** (rẻ) cho từng item ⇒ lô được
+        gửi **song song**, các job **chạy chồng nhau**.
+
+        Setup toolchain (``--need``) thất bại vì **host chết** ⇒ thử host khác
+        (tối đa N lần, N = số host trong fleet). Lỗi do **sai cấu hình** (URL
+        hỏng, thiếu tool) ⇒ **không** retry — báo lỗi luôn (W3c + W3m: exit
+        1/2, không phải 255).
+
+        Lỗi **đẩy input** (host chết lúc rsync, URL hỏng, file local biến mất)
+        **không** còn lộ ra ở đây mà lộ ra ở **watcher** (xem báo cáo C10).
         """
         nonlocal job_ids, created_jobs, used_hosts
         tried: set[str] = set()
@@ -1308,6 +1287,12 @@ def _cmd_do(args: argparse.Namespace) -> tuple[dict, int]:
                 # failover (git:/http:/job: không "đẩy lại" được).
                 "input_specs": [dict(spec) for spec in input_specs],
                 "input_sources": [dict(source) for source in path_sources],
+                # (B36/C10) Job được khởi động bởi **watcher**, không phải bởi
+                # ``do``: ``do`` chỉ tạo job + xin slot, còn **đẩy input** và
+                # **launch** do watcher lo (đúng đường dẫn của nhánh "job xếp
+                # hàng"). Nhờ vậy vòng lặp ``--each`` **không** làm việc từ xa
+                # tuần tự nữa ⇒ các job của một lô **chạy chồng nhau**.
+                "deferred_start": True,
             }
             if path_sources:
                 first_path = path_sources[0]
@@ -1326,63 +1311,32 @@ def _cmd_do(args: argparse.Namespace) -> tuple[dict, int]:
                 # suy ra là rủi ro (S38).
                 ensured = _ensure_tools(host, choice.profile, needs)
 
-                # --- chuẩn bị input -------------------------------------------
+                # --- chuẩn bị input: HOÃN cho watcher (B36/C10) --------------
+                # ``do`` **không** đẩy input và **không** launch: watcher tự
+                # làm (đúng đường dẫn của nhánh "job xếp hàng"). Lý do (B36 —
+                # đo thật 23/11/2026, `docs/evidence/final-20261123/s18-submit-latency.txt`):
+                # mỗi vòng lặp ``--each`` làm ~7 round-trip ssh (đọc marker +
+                # rsync + chmod + ghi marker + mkdir ×2 + launch) ⇒ **~21–26 s
+                # mỗi item** ⇒ các job của lô **không bao giờ chạy chồng nhau**
+                # ⇒ fleet không tính toán song song. Hoãn việc đẩy input cho
+                # watcher ⇒ mỗi watcher tự đẩy + launch **song song** ⇒ lô
+                # chạy chồng nhau, và ``do`` trả JSON **ngay**.
+                #
+                # Hệ quả (đánh đổi, nói rõ): lỗi **đẩy input** (host chết,
+                # URL hỏng, file local biến mất) **không** còn lộ ra ở ``do``
+                # mà lộ ra ở **watcher** ⇒ ``do`` trả exit 0, còn ``roff wait``
+                # mới báo lỗi (reason rõ ràng trong ledger). Việc **failover**
+                # sang host khác vẫn còn nguyên (watcher tự failover).
                 job_env: dict[str, str] = {}
-                has_internet = bool(getattr(choice.profile, "internet", False))
-                if queued:
-                    # Host đang bận ⇒ job CHỜ trong hàng đợi: watcher sẽ chuẩn bị
-                    # input + launch khi được cấp slot. Không clone/tải sớm (tốn
-                    # băng thông + tạo dữ liệu ở chỗ chưa ai chạy).
-                    options["input_kind"] = (
-                        input_specs[0]["kind"] if input_specs else "path"
-                    )
-                else:
-                    try:
-                        prepared, primary_remote, primary_kind, env_extra = (
-                            inputs_mod.prepare_inputs(
-                                input_specs,
-                                host,
-                                workdir,
-                                layout_root,
-                                has_internet=has_internet,
-                                source_job=source_job,
-                            )
-                        )
-                    except RoffError as exc:
-                        # Chuẩn bị input thất bại vì **host chết** ⇒ thử host
-                        # khác (W3c). Lỗi **sai cấu hình** (exit 1/2) ⇒ không
-                        # retry, báo lỗi luôn (W3m).
-                        if exc.code == EXIT_UNREACHABLE and attempt + 1 < attempts:
-                            retry_host = True
-                            raise
-                        raise
-                    job_env.update(env_extra)
-                    options["input_sources"] = [
-                        {key: value for key, value in entry.items() if key != "value"}
-                        for entry in prepared
-                        if entry.get("kind") == "path"
-                    ]
-                    options["input_remote"] = primary_remote
-                    options["input_kind"] = primary_kind
-                    if primary_remote:
-                        job_env["ROFF_IN"] = primary_remote
+                options["input_kind"] = (
+                    input_specs[0]["kind"] if input_specs else "path"
+                )
 
                 # item của --each: đường dẫn trong kho dùng chung (ROFF_ITEM)
+                # ⇒ watcher tự tính lại (và tự đẩy) lúc launch.
                 if spec.get("item"):
                     options["item_local"] = os.path.abspath(str(spec["item"]))
-                    if queued:
-                        # watcher sẽ tính lại khi được cấp slot
-                        options["item_inside_input"] = False
-                    else:
-                        item_remote, item_key, item_rel, item_inside = (
-                            _remote_item_path(
-                                host, str(spec["item"]), inputs, pushed, layout_root
-                            )
-                        )
-                        job.item = item_remote
-                        options["item_shared_key"] = item_key
-                        options["item_shared_rel"] = item_rel
-                        options["item_inside_input"] = item_inside
+                    options["item_inside_input"] = False
 
                 job_env["ROFF_IN_DIR"] = workdir
                 if checkpoint_remote:
@@ -1402,34 +1356,47 @@ def _cmd_do(args: argparse.Namespace) -> tuple[dict, int]:
                 job_mod.save_job_env(job_id, local_env)
 
                 if not queued:
-                    # tạo thư mục trên host (launch cần workdir có sẵn ⇒ exit 97 nếu thiếu)
-                    layout_mod.remote_mkdirs(host, workdir, run=_shell_runner)
-                    layout_mod.remote_mkdirs(
-                        host, os.path.dirname(str(job.out_remote)), run=_shell_runner
-                    )
-                    if checkpoint_remote:
-                        # Thư mục checkpoint phải có sẵn trên host (W3n).
-                        layout_mod.remote_mkdirs(
-                            host, checkpoint_remote, run=_shell_runner
-                        )
+                    # Đã **chiếm slot** ⇒ job được coi là ``launched`` (hợp
+                    # đồng §1.2 của `docs/SPEC-CLI.md`). Việc launch **thật**
+                    # do watcher lo (xem ``deferred_start`` ở trên) — state này
+                    # có nghĩa "đã nhận slot, watcher sẽ khởi chạy", chưa phải
+                    # "process trên host đã chạy".
+                    job.state = "launched"
+                    job_mod.save_job(job)
 
-                    # --- launch job ---------------------------------------------
-                    job_mod.launch(
-                        host,
-                        job,
-                        env={**job_env, **env},
-                        cpus=cpus,
-                        mem_mb=mem_mb,
-                    )
-                    if getattr(args, "checkpoint", None):
-                        # Failover sau nay ⇒ $ROFF_RESUME=1
-                        job_mod.set_job_options(job_id, resume=True)
-
-                # --- spawn watcher --------------------------------------------
-                # Job ở state ``queued`` cũng cần watcher: watcher sẽ xin slot,
-                # chuẩn bị input rồi launch.
-                _spawn_watcher(job_id)
-                watcher_spawned = True
+                if _watcher_will_run():
+                    # --- spawn watcher ----------------------------------------
+                    # Job ở state ``queued`` cũng cần watcher: watcher sẽ xin
+                    # slot, chuẩn bị input rồi launch.
+                    watcher_spawned = _spawn_watcher(job_id)
+                if not watcher_spawned and not queued:
+                    # --- đường dẫn NỘI TUYẾN ------------------------------------
+                    # Không có watcher nào sẽ khởi chạy job (chế độ
+                    # ``ROFF_NO_WATCHER=1`` — chỉ dùng cho test) ⇒ **không ai**
+                    # đẩy input + launch ⇒ `do` phải tự làm, và phải **báo lỗi
+                    # ngay** (đúng như trước B36). Đường dẫn mặc định (có
+                    # watcher) là đường dẫn **hoãn** ở trên.
+                    #
+                    # Job **xếp hàng** (chưa có slot) thì KHÔNG launch ở đây —
+                    # watcher sẽ tự xin slot rồi launch (như trước).
+                    try:
+                        watcher_mod.start_now(job_id)
+                    except RoffError as exc:
+                        if (
+                            exc.code == EXIT_UNREACHABLE
+                            and attempt + 1 < attempts
+                            and _is_retryable_start(exc)
+                        ):
+                            # Host chết lúc **chuẩn bị input** ⇒ thử host khác
+                            # (W3c). Lỗi **launch** thì không retry (host còn
+                            # sống — chỉ job hỏng).
+                            retry_host = True
+                            raise
+                        reason = str(
+                            job_mod.job_options(job_id).get("start_error") or ""
+                        ) or "launch_failed"
+                        _mark_job_lost(job_id, reason)
+                        raise
 
                 _audit_do(cmd, env, job_id, host, project)
 
@@ -1458,7 +1425,7 @@ def _cmd_do(args: argparse.Namespace) -> tuple[dict, int]:
                 _drop_ticket(ticket, lease)
                 if job_id:
                     _release_slot(job_id)
-                # Chuẩn bị input thất bại vì **host chết** ⇒ thử host khác (W3c).
+                # Host chết lúc chuẩn bị input ⇒ thử host khác (W3c).
                 if retry_host:
                     tried.add(host)
                     continue
@@ -1501,11 +1468,47 @@ def _cmd_do(args: argparse.Namespace) -> tuple[dict, int]:
     return payload, EXIT_OK
 
 
-def _spawn_watcher(job_id: str) -> None:
-    """Spawn watcher nền (trừ khi ``ROFF_NO_WATCHER=1`` — chỉ dùng cho test)."""
+def _spawn_watcher(job_id: str) -> bool:
+    """Spawn watcher nền (trừ khi ``ROFF_NO_WATCHER=1`` — chỉ dùng cho test).
+
+    Trả ``True`` nếu watcher **đã** được spawn. ``False`` ⇒ **không có ai**
+    sẽ khởi chạy job ⇒ ``roff do`` phải tự làm (đường dẫn nội tuyến) — nếu
+    không, job sẽ được tạo mà **không bao giờ chạy** (B36/C10).
+    """
     if os.environ.get("ROFF_NO_WATCHER") == "1":
-        return
-    watcher_mod.spawn_watcher(job_id)
+        return False
+    try:
+        watcher_mod.spawn_watcher(job_id)
+    except Exception as exc:  # pragma: no cover - fork/exec hỏng
+        # Không có watcher ⇒ không ai đẩy input + launch ⇒ `do` tự làm.
+        try:
+            watcher_mod.record_event(
+                job_id, "watcher_spawn_failed", detail=str(exc)
+            )
+        except Exception:  # pragma: no cover - ledger hỏng
+            pass
+        return False
+    return True
+
+
+def _is_retryable_start(exc: RoffError) -> bool:
+    """Lỗi khởi chạy job này có **đáng thử host khác** không?
+
+    Chỉ lỗi **chuẩn bị input** (host chết lúc rsync/clone) mới đáng thử
+    host khác (W3c). Lỗi **launch** (host còn sống, chỉ job hỏng) thì không.
+    """
+    reason = str(exc.reason or "")
+    return reason in ("input_push_failed", "host_unreachable", "shared_push_failed")
+
+
+def _watcher_will_run() -> bool:
+    """Có watcher nào sẽ khởi chạy job không?
+
+    Chế độ ``ROFF_NO_WATCHER=1`` (chỉ dùng cho test) ⇒ **không có watcher**
+    ⇒ không ai đẩy input + launch ⇒ ``roff do`` phải tự làm (đường dẫn
+    **nội tuyến**), nếu không job sẽ được tạo mà **không bao giờ chạy**.
+    """
+    return os.environ.get("ROFF_NO_WATCHER") != "1"
 
 
 def _prepare_job_input(

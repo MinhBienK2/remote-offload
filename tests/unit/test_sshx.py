@@ -28,10 +28,18 @@ def test_batchmode_always_present():
 
 
 def test_nice_and_ionice_prefix():
+    """Tiền tố phải có **cả hai** và đúng giá trị.
+
+    **Không** chốt thứ tự: sau B34 cả 5 module dùng chung **một** hàm
+    (``roffkit.config.local_nice_prefix``) ⇒ thứ tự `nice`/`ionice` là chi
+    tiết cài đặt, không phải hợp đồng (`nice` và `ionice` đặt hai thuộc
+    tính độc lập, cả hai đều được kế thừa qua fork+exec).
+    """
     prefix = sshx._prefix()
     assert "nice" in prefix
     assert "ionice" in prefix
-    assert prefix.index("ionice") < prefix.index("nice")
+    assert prefix[prefix.index("nice") + 1] == "-n"
+    assert prefix[prefix.index("ionice") + 1].startswith("-c")
 
 
 def test_control_path_is_per_alias_and_safe():

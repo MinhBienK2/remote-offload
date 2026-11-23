@@ -31,6 +31,11 @@ try:  # B25: nguồn sự thật duy nhất cho đường dẫn ssh-config
 except ImportError:  # pragma: no cover - chạy module lẻ
     from . import fleet  # type: ignore
 
+try:  # B34: chính sách nice/ionice — MỘT nguồn sự thật (dùng chung 5 module)
+    from roffkit.config import local_nice_prefix  # type: ignore
+except ImportError:  # pragma: no cover - chạy module lẻ
+    from .config import local_nice_prefix  # type: ignore
+
 DEFAULT_TIMEOUT = 60.0
 CONNECT_TIMEOUT = 15
 SERVER_ALIVE_INTERVAL = 30
@@ -365,15 +370,13 @@ def ssh_base(alias: str, timeout: float = DEFAULT_TIMEOUT) -> list[str]:
 
 
 def _prefix() -> list[str]:
-    """Tiền tố nice/ionice — mọi tiến trình local của roff chạy nhẹ."""
-    nice = os.environ.get("ROFF_NICE", "19")
-    ionice = os.environ.get("ROFF_IONICE", "idle")
-    prefix: list[str] = []
-    if ionice:
-        prefix += ["ionice", "-c", ionice]
-    if nice:
-        prefix += ["nice", "-n", nice]
-    return prefix
+    """Tiền tố nice/ionice — mọi tiến trình local của roff chạy nhẹ.
+
+    **MỘT nguồn sự thật** (B34): gọi :func:`roffkit.config.local_nice_prefix`
+    ⇒ cùng tiền tố với probe/tunnel/job/transfer, và ``ROFF_NICE`` /
+    ``ROFF_IONICE`` có tác dụng với **mọi** đường (kể cả rsync/tar).
+    """
+    return local_nice_prefix()
 
 
 def run_shell(host: str, script: str, timeout: float = DEFAULT_TIMEOUT,

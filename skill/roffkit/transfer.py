@@ -22,7 +22,6 @@ import hashlib
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import time
 import zlib
@@ -32,7 +31,7 @@ from typing import Any, Iterator, Sequence
 
 try:  # phần A (errors/config) và phần B (slots) — fallback tối thiểu
     from .errors import EXIT_INPUT, EXIT_NO_HOST, RoffError
-except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi A/B merge
+except ImportError:  # pragma: no cover - module chạy đứng riêng (không có package)
     from typing import Any as _Any
 
     EXIT_INPUT = 2
@@ -58,8 +57,8 @@ except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi A/B
 
 
 try:
-    from .config import Config
-except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi A/B merge
+    from .config import Config, load_config, local_nice_prefix
+except ImportError:  # pragma: no cover - module chạy đứng riêng (không có package)
     from dataclasses import dataclass as _dataclass
 
     @_dataclass
@@ -71,10 +70,23 @@ except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi A/B
         nice: int = 19
         ionice: str = "idle"
 
+    def load_config() -> Any | None:  # type: ignore[no-redef]
+        """Fallback tối thiểu — không có ``config.py`` ⇒ không đọc được config."""
+        return Config()
+
+    def local_nice_prefix() -> list[str]:  # type: ignore[no-redef]
+        """Fallback tối thiểu — xem :func:`roffkit.config.local_nice_prefix`.
+
+        Module chạy **đứng riêng** ⇒ không có ``config.py`` ⇒ **không có**
+        chính sách nice/ionice ⇒ không bọc. Chỉ là chế độ dự phòng; đường
+        chính của ``roff`` luôn import được ``config.py``.
+        """
+        return []
+
 
 try:
     from .slots import Lease, SlotLedger
-except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi A/B merge
+except ImportError:  # pragma: no cover - module chạy đứng riêng (không có package)
     import threading
     import time as _time
     import uuid as _uuid
@@ -130,12 +142,12 @@ except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi A/B
 
 try:  # lớp ssh trung tâm (ControlMaster) — không định nghĩa lại option ssh ở đây
     from . import sshx
-except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi sshx merge
+except ImportError:  # pragma: no cover - module chạy đứng riêng (không có package)
     sshx = None  # type: ignore[assignment]
 
 try:  # B25: nguồn sự thật cho tham số ``-F`` (dùng khi rơi vào fallback)
     from . import fleet
-except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi sshx merge
+except ImportError:  # pragma: no cover - module chạy đứng riêng (không có package)
     fleet = None  # type: ignore[assignment]
 
 
@@ -211,15 +223,6 @@ TRANSFER_BUCKET = "__transfer__"
 #: Timeout mặc định cho các hàm không có tham số timeout.
 DEFAULT_TIMEOUT = 3600
 
-#: Bảng tra ionice class → số.
-_IONICE_CLASSES = {
-    "idle": "3",
-    "best-effort": "2",
-    "be": "2",
-    "none": "0",
-    "realtime": "1",
-}
-
 
 @dataclass
 class TransferResult:
@@ -245,38 +248,22 @@ def _config() -> Any | None:
     thì watcher/transfer **chết** ⇒ job mất **im lặng** — tệ hơn hẳn việc
     dùng cấu hình mặc định. ``roff do`` (điểm vào của người dùng) mới là
     chỗ phải **fail to** khi ``ROFF_CONFIG`` trỏ tới file không tồn tại.
+
+    Việc đọc config nằm ở :func:`roffkit.config.load_config` — **một** chỗ,
+    dùng chung với chính sách nice/ionice (B34).
     """
-    try:
-        return Config.load(os.environ.get("ROFF_CONFIG") or None, strict=False)
-    except Exception:
-        return None
-
-
-def _nice_level() -> int:
-    """Mức ``nice`` (mặc định 19 — thấp nhất, không làm phiền máy local)."""
-    cfg = _config()
-    value = getattr(cfg, "nice", 19) if cfg is not None else 19
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 19
-
-
-def _ionice_class() -> str:
-    """Lớp I/O (``3`` = idle)."""
-    cfg = _config()
-    value = getattr(cfg, "ionice", "idle") if cfg is not None else "idle"
-    return _IONICE_CLASSES.get(str(value).strip().lower(), "3")
+    return load_config()
 
 
 def _prefix_nice() -> list[str]:
-    """Tiền tố ``nice -n 19 ionice -c3`` cho tiến trình con (Q18)."""
-    parts: list[str] = []
-    if shutil.which("nice"):
-        parts += ["nice", "-n", str(_nice_level())]
-    if shutil.which("ionice"):
-        parts += ["ionice", "-c" + _ionice_class()]
-    return parts
+    """Tiền tố ``ionice``/``nice`` cho tiến trình con (Q18).
+
+    **MỘT nguồn sự thật** (B34): gọi :func:`roffkit.config.local_nice_prefix`
+    ⇒ cùng tiền tố với probe/sshx/tunnel/job, và ``ROFF_NICE`` /
+    ``ROFF_IONICE`` có tác dụng với **rsync/tar** (trước đây chỉ đọc config
+    ⇒ biến môi trường bị bỏ qua im lặng).
+    """
+    return local_nice_prefix()
 
 
 def _max_parallel_transfers() -> int:

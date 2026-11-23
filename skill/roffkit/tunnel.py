@@ -23,7 +23,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import socket
 import subprocess
 import time
@@ -50,6 +49,11 @@ try:  # pragma: no cover
     from roffkit.sshx import ssh_config_args
 except ImportError:  # pragma: no cover
     from .sshx import ssh_config_args
+
+try:  # B34: chính sách nice/ionice — MỘT nguồn sự thật (dùng chung 5 module)
+    from roffkit.config import local_nice_prefix  # type: ignore
+except ImportError:  # pragma: no cover
+    from .config import local_nice_prefix  # type: ignore
 
 log = logging.getLogger("roff.tunnel")
 
@@ -157,15 +161,11 @@ def _save_state(records: list[dict]) -> None:
 # Chạy lệnh local
 # --------------------------------------------------------------------------------------
 def _prefix() -> list[str]:
-    """Tiền tố nice/ionice — tiến trình local của roff phải nhẹ (Q18/Q28)."""
-    nice = os.environ.get("ROFF_NICE", "19")
-    ionice = os.environ.get("ROFF_IONICE", "idle")
-    prefix: list[str] = []
-    if ionice and shutil.which("ionice"):
-        prefix += ["ionice", "-c", ionice]
-    if nice and shutil.which("nice"):
-        prefix += ["nice", "-n", nice]
-    return prefix
+    """Tiền tố nice/ionice — tiến trình local của roff phải nhẹ (Q18/Q28).
+
+    **MỘT nguồn sự thật** (B34): gọi :func:`roffkit.config.local_nice_prefix`.
+    """
+    return local_nice_prefix()
 
 
 def _run(argv: list[str], timeout: float = DEFAULT_TIMEOUT) -> tuple[int, str, str]:

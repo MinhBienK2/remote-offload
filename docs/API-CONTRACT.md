@@ -131,6 +131,8 @@ class HostConfig:
     weight: float = 1.0
     slots: int = 1
     mem_budget_mb: int = 0        # 0 = dùng mem_available thật
+    nice: int | None = None       # ghi đè [remote] nice cho riêng host này (C9)
+    ionice: str | None = None     # ghi đè [remote] ionice cho riêng host này (C9)
 
 @dataclass
 class Config:
@@ -139,8 +141,10 @@ class Config:
     fleet_exclude: list[str]      # glob, default []
     probe_cache_s: int = 60
     max_parallel_transfers: int = 2
-    nice: int = 19
+    nice: int = 19                # tiến trình LOCAL của roff (ssh/rsync/watcher)
     ionice: str = "idle"
+    remote_nice: int = 19         # lệnh job chạy TRÊN máy remote (C9)
+    remote_ionice: str = "idle"
     cache_max_mb: int = 5120
     cache_min_free_mb: int = 3072
     heavy_add: list[str]         # lệnh thêm vào danh sách nặng
@@ -151,11 +155,59 @@ class Config:
     def load(path: str | None = None) -> "Config":
         """path=None → ~/.config/roff/config.ini nếu tồn tại, nếu không thì Config mặc định.
         File sai cú pháp → raise RoffError(EXIT_CONFIG).
-        Section host.<alias>: labels (csv), weight (float), slots (int), mem_budget_mb (int)."""
+        Section host.<alias>: labels (csv), weight (float), slots (int), mem_budget_mb (int),
+          nice (int), ionice (str)."""
 
     def host(self, name: str) -> HostConfig:
         """Trả về HostConfig của alias, hoặc mặc định nếu không có trong config."""
 ```
+
+**Chính sách `nice`/`ionice` — MỘT nguồn sự thật (B34, 23/11/2026).** Trước
+B34 chính sách này bị **copy 5 lần** ở `probe`/`sshx`/`tunnel`/`job`/`transfer`
+với **3 nguồn sự thật** (hằng / env / config) ⇒ `ROFF_NICE` không có tác dụng
+với rsync/tar, còn `[local] nice` trong config chỉ có tác dụng với đường
+truyền ⇒ **nút cấu hình chết**. Nay **mọi** module gọi chung:
+
+```python
+DEFAULT_NICE = 19
+DEFAULT_IONICE = "idle"
+IONICE_CLASSES = {"idle": "3", "best-effort": "2", "be": "2", "realtime": "1"}
+
+@dataclass(frozen=True)
+class NicePolicy:
+    nice: int = DEFAULT_NICE       # 0 ⇒ KHÔNG bọc nice
+    ionice: str | None = None      # None ⇒ KHÔNG bọc ionice
+    def prefix(self) -> list[str]: ...   # ["nice","-n",N,"ionice","-c",C]
+
+def local_nice_prefix() -> list[str]: ...        # tiến trình local
+def remote_nice_policy(host=None, config=None) -> NicePolicy: ...  # lệnh job trên host
+def remote_nice_args(host=None, config=None) -> tuple[str, str]: ... # ("19","3") | ("","")
+```
+
+Thứ tự ưu tiên: **biến môi trường > config > mặc định**.
+* phía **local**: `ROFF_NICE`/`ROFF_IONICE` > `[local] nice`/`ionice` > mặc định;
+* phía **remote** (C9): `ROFF_REMOTE_NICE`/`ROFF_REMOTE_IONICE` > `[host.<alias>]`
+  > `[remote]` > mặc định.
+`nice = 0` ⇒ **không** bọc `nice`; `ionice = none` (hoặc rỗng) ⇒ **không** bọc
+`ionice`. Đọc config **hỏng** ⇒ **không** làm chết tiến trình (dùng mặc định —
+nguyên tắc B27).
+
+**Lệnh job trên host** (`job.py`, hằng `_RUN_SH`) được bọc:
+
+```sh
+if [ -n "__NICE__" ] && command -v nice >/dev/null 2>&1; then
+  if [ -n "__IONICE__" ] && command -v ionice >/dev/null 2>&1; then
+    nice -n __NICE__ ionice -c__IONICE__ -- sh -c "$(cat "$JOBDIR/cmd")"
+  else
+    nice -n __NICE__ -- sh -c "$(cat "$JOBDIR/cmd")"
+  fi
+elif ...
+```
+
+`nice`/`ionice` được kiểm tra **trên host** (`command -v`) ⇒ host không có thì
+job **vẫn chạy**. **KHÔNG** dùng `exec`: `run.sh` phải còn sống để ghi
+`$JOBDIR/exit` (`rc=$?` sau `exec` không bao giờ chạy ⇒ job không có exit code).
+Lệnh của người dùng vẫn **nguyên văn** trong file `cmd`.
 
 **Mặc định khi không có file config**: `fleet_include=["*"]`, `fleet_exclude=[]`,
 `heavy_add=[]`, `heavy_allow=[]`, `hosts={}`.
@@ -368,7 +420,8 @@ def transfer_slot(timeout: float) -> ContextManager:
     dùng chung qua SlotLedger (state_dir riêng 'transfers')."""
 ```
 
-**Quy tắc**: mọi lệnh ssh/rsync chạy `nice -n 19 ionice -c3` (lấy từ config).
+**Quy tắc**: mọi lệnh ssh/rsync chạy `nice -n 19 ionice -c3` — **lấy từ MỘT
+chính sách chung** (xem §3: env > config > mặc định).
 `--no-owner --no-group` **luôn** (R4).
 
 ## 10. `job.py`
@@ -413,7 +466,12 @@ def launch(host: str, job: Job, env: dict[str,str] | None = None,
 
 def remote_state(host: str, job: Job, timeout: int = 30) -> dict:
     """Trả {"state": "running"|"exited"|"lost"|..., "exit": int|None,
-            "boot_id": str|None, "instance_token": str|None, "workdir_exists": bool}."""
+            "boot_id": str|None, "instance_token": str|None, "workdir_exists": bool}.
+
+    **"lost" là nghi ngờ, chưa phải kết luận** (B42): verdict dựa trên
+    ``kill -0 $PID`` trên host ⇒ đọc trúng lúc process vừa chết mà file
+    ``exit`` chưa kịp ghi thì **sai** ⇒ người gọi phải **xác nhận lại**
+    (xem §11: P1 hỏi lại host, P2 khoảng miễn sau launch)."""
 
 def cancel(host: str, job: Job) -> dict:
     """Kill process group của job (pid đã ghi trong meta.json). Không pkill theo pattern."""
@@ -453,11 +511,22 @@ def watch(job_id: str) -> None:
     """Vòng lặp giám sát. Đây là tiến trình NỀN, tách phiên.
     Mỗi vòng:
       1. đọc job từ ledger
-      2. remote_state()
+      2. nếu job **chưa** được launch (``deferred_start`` còn bật **và** chưa
+         có attempt) ⇒ **đẩy input + launch** (B36/C10: ``roff do`` chỉ tạo
+         job + xin slot, việc từ xa do watcher lo ⇒ lô ``--each`` gửi song
+         song, các job chạy chồng nhau)
+      3. remote_state()
       3. phân nhánh:
          - exited & exit==0 → pull artifact → state=exited, exit=0 → kết thúc
          - exited & exit!=0 → state=exited, exit=code → kết thúc (KHÔNG retry)
-         - lost & needs_retry & attempts < retry → failover
+         - lost & reason=vanished & **trong khoảng miễn sau launch** → chờ,
+           thử lại, KHÔNG failover  (B42/P2)
+         - lost & reason=vanished & **ngoài** khoảng miễn → **hỏi lại host lần
+           2** sau 4 s: lần 2 thấy exited → kết thúc bình thường (kéo artifact);
+           lần 2 vẫn vanished → mất thật; lần 2 không với được host → chờ, thử
+           lại  (B42/P1)
+         - lost & reason mạnh (host_restarted/host_wiped/oom_killed)
+           & needs_retry & attempts < retry → failover (**không** bị chậm thêm)
          - lost & không retry → state=lost → kết thúc
          - host unreachable nhưng chưa xác minh restart → chờ, thử lại, KHÔNG failover
          - còn chạy → sleep 5s, ghi heartbeat
@@ -475,8 +544,34 @@ def failover_decision(profile_before: dict, profile_now: dict) -> str | None:
     Quy tắc:
       boot_id khác        → 'host_restarted'
       instance_token khác → 'host_wiped'
-      giống cả hai        → None  (chỉ mất tunnel → KHÔNG failover)"""
+      giống cả hai nhưng không còn process → 'vanished'
+      không kết nối được  → None  (chỉ mất tunnel → KHÔNG failover)"""
 ```
+
+**`vanished` là verdict MẠNH nhưng KHÔNG phải bằng chứng tuyệt đối** (B42):
+`remote_state()` đọc `kill -0 $PID` trên host ⇒ đọc trúng lúc process **vừa
+chết** mà file `exit` **chưa kịp** ghi thì verdict **sai** ⇒ failover một job
+**còn sống** (đo thật 24/11/2026 trên fleet Muse: job chạy thành công,
+`exit=0`, nice 19 — nhưng poll báo `vanished`). ⇒ hành động theo `vanished`
+phải qua **2 lớp bảo vệ**:
+
+| Lớp | Hằng số | Việc |
+|---|---|---|
+| **P1** — xác nhận lần 2 | `VANISH_CONFIRM_DELAY_S = 4` | hỏi lại host một lần nữa; lần 2 thấy `exited` ⇒ kết thúc bình thường (**không** failover); lần 2 vẫn `vanished` ⇒ mất thật; lần 2 không với được ⇒ coi là **chưa chắc** ⇒ chờ thử lại |
+| **P2** — khoảng miễn sau launch | `VANISH_GRACE_S = 30` | tính từ `attempt["started"]` của attempt **hiện tại** (⇒ mỗi lần failover lại có khoảng miễn mới); trong khoảng này thấy process không còn ⇒ **chưa chắc chắn** ⇒ ghi event `unverified` rồi chờ |
+
+Verdict `host_restarted` / `host_wiped` / `oom_killed` là bằng chứng **mạnh
+hơn** ⇒ failover **ngay**, **không** đi qua P1 ⇒ S20/S24 không bị chậm thêm.
+
+> **Hệ quả (đánh đổi, nói rõ):** failover thật (verdict `vanished` đúng) chậm
+> thêm ~4 s + 1 round-trip ssh; job vừa launch mà launch **thất bại** bị chờ
+> tới hết khoảng miễn (30 s) rồi mới kết luận mất. Đổi lại: **không còn**
+> chạy lại một job vẫn đang chạy.
+>
+> **Nguyên nhân gốc CHƯA khép** — đã loại trừ "khác PID namespace" (đo thật:
+> `kill -0` **thành công** từ phiên ssh khác); chưa loại trừ được "file `exit`
+> bị ghi trễ" hay "tiến trình bị giết giữa chừng" ⇒ bản sửa chặn **hậu quả**,
+> chưa đóng nguyên nhân.
 
 **Quy tắc vàng**: mất kết nối **không** đồng nghĩa job chết. Chỉ failover khi chắc chắn.
 
@@ -538,6 +633,15 @@ Danh sách lệnh: `do`, `status`, `wait`, `result`, `logs`, `cancel`, `jobs`, `
 {"ok": true, "job": "<id>", "state": "queued", "host": "<alias>",
  "host_reasons": ["..."], "ledger": "<path>", "next": ["roff wait <id>"]}
 ```
+
+**Ý nghĩa của `state` sau B36/C10 (23/11/2026):** `roff do` **không** đẩy
+input và **không** launch — nó tạo job + xin slot, rồi **hoãn** việc đẩy input
++ launch cho **watcher** (mỗi job một watcher ⇒ lô `--each` chạy **song song**).
+⇒ `state: "launched"` nghĩa là **"đã nhận slot, watcher đang khởi chạy"**,
+**không** phải "tiến trình trên host đã chạy". Hệ quả đã nói rõ:
+lỗi **đẩy input** (host chết lúc rsync, URL hỏng, file local biến mất) **lộ ra
+ở `roff wait`**, không phải ở `roff do`; lỗi input **local** vẫn bị `roff do`
+từ chối **ngay** (exit 2, trước cả khi probe fleet).
 
 **`roff wait`** khi hết giờ ⇒ exit **124**, JSON `{"ok": true, "state": "running", ...}`.
 

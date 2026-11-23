@@ -66,7 +66,7 @@ roff do --cmd 'npm test' --in ./src --out ./out --need node
 | `--out` | local directory for the artifacts |
 | `--need` | a tool the host must have (`--need ffmpeg`) — **hard**: a host without it is dropped |
 | `--cpus` / `--mem` / `--disk` | resource budget; `--cpus` becomes `$ROFF_CPUS` |
-| `--each '<glob>'` | a batch of items, spread across the fleet |
+| `--each '<glob>'` | a batch of items, spread across the fleet — the whole batch is submitted in parallel, so the items run **at the same time** |
 | `--shards N` | split one big item across N hosts |
 | `--env K=V` | a secret — see *Secrets* below |
 | `--retry N` | failover attempts (default 1) |
@@ -98,10 +98,18 @@ the agent dies.
   for the first one and let the rest report themselves.
 - `host` — where it started. `host_reasons` says why that host was chosen.
 - `ensured` — tools that had to be installed first.
-- `state` — `launched` means the job is running on the host. `queued` means the host
-  had **no free slot**, so the job is **waiting its turn**: the watcher will grab a
-  slot and start it by itself. `queued` is **not** an error and **not** a reason to run
-  the command locally — keep waiting with `roff wait <job-id>`.
+- `state` — `launched` means the job has a **slot** and the watcher is starting it now:
+  it pushes the input to the host and launches the job. `roff do` itself does not push
+  or launch, so a batch of `--each` items is submitted **in parallel** — the jobs run
+  **at the same time** instead of one after another. `queued` means the host had **no
+  free slot**, so the job is **waiting its turn**: the watcher will grab a slot and
+  start it by itself. `queued` is **not** an error and **not** a reason to run the
+  command locally — keep waiting with `roff wait <job-id>`.
+
+Because the input is pushed by the watcher, an input that fails **on the host** (the
+host dies during the copy, a bad URL, a local file that vanished) is reported by
+`roff wait`, not by `roff do` — `roff do` has already returned. A **local** input that
+does not exist is still rejected up front by `roff do` with exit 2.
 
 If `roff do` exits 10 (`no_host`), the JSON lists `rejected` (why each host was
 dropped) and `jobs` — the jobs that were already created before the fleet ran out.
@@ -292,9 +300,16 @@ Reach for these only when the branch applies:
 
 `roff` runs its **local** `ssh`/`rsync` clients under `nice -n 19 ionice -c3` and keeps at
 most **2** transfers in flight (`max_parallel_transfers`), so shipping inputs and
-pulling artifacts never competes with the user's own work **on this machine**. The
-job itself runs at the host's normal priority. To keep the machine quiet while a
-remote job runs, check with:
+pulling artifacts never competes with the user's own work **on this machine**.
+
+The **remote** side is protected too: the command the user asked for runs on the
+host under `nice -n 19 ionice -c3` as well, so an offloaded job does **not**
+compete with the services the user already runs there (postgres, telegram-bot,
+cloudflared…). Change it per host with `[remote] nice`/`ionice` in
+`~/.config/roff/config.ini` (or `[host.<alias>]`), or turn it off with
+`[remote] nice = 0` / `ionice = none`.
+
+To keep the machine quiet while a remote job runs, check with:
 
 ```bash
 roff status <job-id>

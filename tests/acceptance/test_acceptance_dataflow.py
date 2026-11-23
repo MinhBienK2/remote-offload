@@ -12,6 +12,7 @@ khi lỗi là do host chết (không phải do logic của roff).
 import hashlib
 import json
 import subprocess
+import uuid
 import sys
 import time
 from pathlib import Path
@@ -203,12 +204,21 @@ def test_s23_input_pushed_once_per_host(fleet, cfg, tmp_path):
 
     out = tmp_path / "out"
 
+    # Tên project **riêng cho lần chạy này**: thư mục làm việc trên host
+    # (`projects/<project>/part-N`) **được giữ lại giữa các lần chạy** ⇒ nếu
+    # dùng tên cố định, phép đo "workdir không chứa bản copy input" sẽ thấy
+    # **rác của lần chạy cũ** (đo thật 24/11/2026: một file 5,6 MB từ 12:08
+    # làm S23 **đỏ oan** — sản phẩm không hề copy input vào workdir: kiểm
+    # chứng lại bằng project name riêng ⇒ workdir **rỗng**).
+    project = "s23-" + uuid.uuid4().hex[:8]
+
     def build(_alive):
         return [
             "do",
             "--each", str(src / "*.bin"),
             "--in", str(src),
             "--out", str(out),
+            "--name", project,
             "--cmd", 'cp "$ROFF_ITEM" "$ROFF_OUT/$(basename "$ROFF_ITEM")"',
         ]
 
@@ -344,21 +354,32 @@ def test_s24_failover_keeps_item_and_workdir(fleet, cfg, tmp_path):
     job_ids = [j for j in (obj.get("jobs") or [obj.get("job")]) if j]
     assert len(job_ids) == 2, f"phải tạo 2 job: {job_ids}"
 
-    # Chờ job thực sự chạy (có pid trong ledger)
-    pids: list[int] = []
-    deadline = time.time() + 180
-    while time.time() < deadline and not pids:
+    # Chờ **TẤT CẢ** job thực sự chạy (có pid trong ledger) — không được dừng
+    # vòng lờ khi thấy pid đầu tiên.
+    #
+    # Đo thật 24/11/2026 (đợt `final/`): kịch bản này **đỏ oan** vì lý do
+    # này. Sau B36/C10, các job của lô được **watcher khởi chạy lệch nhau
+    # vài giây** ⇒ lúc vòng chờ thấy pid của job thứ nhất, job thứ hai
+    # **chưa** có pid ⇒ chỉ **1** job bị giết ⇒ job còn lại chạy tới hết
+    # (exit 0, không có event `failover`) ⇒ assert "không failover" đỏ.
+    # Bằng chứng: ledger `261124-023327-94aa` có event `pulled`+`finished`
+    # (không `failover`), còn `261124-023327-c343` có `failover` (`vanished`)
+    # ⇒ **đúng 1 job bị giết**.
+    pids: dict[str, int] = {}
+    deadline = time.time() + 240
+    while time.time() < deadline and len(pids) < len(job_ids):
         for jid in job_ids:
             led = _ledger(cfg["state"], jid)
             for att in led.get("attempts") or []:
                 if att.get("pid"):
-                    pids.append(int(att["pid"]))
-        if not pids:
+                    pids[jid] = int(att["pid"])
+        if len(pids) < len(job_ids):
             time.sleep(3)
-    assert pids, "job chưa ghi nhận pid ⇒ không giết được để thử failover"
+    assert len(pids) == len(job_ids), (
+        f"chưa phải job nào có pid ⇒ không giết được để thử failover: {pids}")
 
     # Giết process group của chính job (không đụng tiến trình khác của user)
-    for pid in set(pids):
+    for pid in pids.values():
         ssh_out(alias, f"kill -TERM -{pid} 2>/dev/null || true")
     time.sleep(10)
 

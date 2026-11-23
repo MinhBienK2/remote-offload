@@ -1,0 +1,31 @@
+============================= test session starts ==============================
+platform linux -- Python 3.10.12, pytest-8.2.0, pluggy-1.6.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+rootdir: /home/minhbien/Documents/remote-offload
+configfile: pytest.ini
+plugins: anyio-4.14.0, langsmith-0.3.45, asyncio-0.23.6
+asyncio: mode=strict
+collecting ... collected 4 items
+
+tests/acceptance/test_acceptance_dataflow.py::test_s23_input_pushed_once_per_host SKIPPED [ 25%]
+tests/acceptance/test_acceptance_dataflow.py::test_s24_failover_keeps_item_and_workdir PASSED [ 50%]
+tests/acceptance/test_acceptance_w3_resilience.py::test_s28_gc_cleans_host_input_store_but_not_running_jobs SKIPPED [ 75%]
+tests/acceptance/test_acceptance_nice_policy.py::test_s49c_remote_job_runs_when_host_has_no_nice PASSED [100%]
+
+=========================== short test summary info ============================
+SKIPPED [1] tests/acceptance/_common.py:192: job 261124-045439-0876 chạy xong nhưng artifact không về vì máy chết (ssh: connect to host 127.0.0.1 port 2222: Connection refused) — sự cố hạ tầng
+SKIPPED [1] tests/acceptance/test_acceptance_w3_resilience.py:523: host muse-pmb333 không với được lúc đo — sự cố hạ tầng
+=================== 2 passed, 2 skipped in 566.85s (0:09:26) ===================
+============================= test session starts ==============================
+platform linux -- Python 3.10.12, pytest-8.2.0, pluggy-1.6.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+rootdir: /home/minhbien/Documents/remote-offload
+configfile: pytest.ini
+plugins: anyio-4.14.0, langsmith-0.3.45, asyncio-0.23.6
+asyncio: mode=strict
+collecting ... collected 2 items
+
+tests/acceptance/test_acceptance_w3_resilience.py::test_s28_gc_cleans_host_input_store_but_not_running_jobs PASSED [ 50%]
+tests/acceptance/test_acceptance_dataflow.py::test_s23_input_pushed_once_per_host PASSED [100%]
+
+======================== 2 passed in 466.72s (0:07:46) =========================

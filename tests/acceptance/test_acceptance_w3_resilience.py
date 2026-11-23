@@ -104,6 +104,29 @@ def live_muses():
     return [a for a in MUSE if ssh_ok(a)]
 
 
+def wait_dir_state(alias: str, path: str, timeout: int = 240, interval: float = 3.0):
+    """Trạng thái thư mục trên host, **chờ** nó xuất hiện.
+
+    B36/C10: ``roff do`` chỉ tạo job + xin slot, **watcher** mới đẩy input
+    ⇒ lúc ``do`` trả về kho input **chưa chắc** đã có trên host ⇒ phải chờ
+    thay vì đoán.
+
+    Trả ``True`` (có), ``False`` (hết giờ mà vẫn không có), ``None`` (host
+    không với được ⇒ hạ tầng).
+    """
+    deadline = time.monotonic() + timeout
+    last: bool | None = False
+    while True:
+        last = dir_state(alias, path)
+        if last is None:
+            return None
+        if last is True:
+            return True
+        if time.monotonic() >= deadline:
+            return last
+        time.sleep(interval)
+
+
 def ledger(state_dir: Path, job_id: str) -> dict:
     return json.loads((state_dir / "jobs" / f"{job_id}.json").read_text())
 
@@ -480,12 +503,17 @@ def test_s28_gc_cleans_host_input_store_but_not_running_jobs(fleet, cfg, tmp_pat
     assert key, f"job không ghi input_shared_key: {led.get('_roff')}"
     store = f"{root}/inputs/{key}"
 
-    # kho input phải tồn tại trên host
-    state = dir_state(alias, store)
+    # kho input phải tồn tại trên host — nhưng **phải CHỜ** (B36/C10):
+    # `roff do` **không** đẩy input nữa ⇒ **watcher** đẩy ⇒ lúc `do` trả về,
+    # kho input **có thể chưa** có trên host. Đo thật 24/11/2026: kịch bản
+    # này đỏ **oàn** ở cả 2 lần chạy (muse-tampt rồi muse-pmb333) vì đo
+    # kho input **ngay** lúc `do` vừa trả về ⇒ phải chờ watcher đẩy xong.
+    state = wait_dir_state(alias, store, timeout=240)
     if state is None:
         pytest.skip(f"host {alias} không với được lúc đo — sự cố hạ tầng")
     assert state is True, (
-        f"không thấy kho input {store} trên {alias} (ssh hỏng: {state})")
+        f"không thấy kho input {store} trên {alias} sau 240 s — watcher phải "
+        f"đẩy input lên host (ssh hỏng: {state})")
 
     # gc KHI job đang chạy ⇒ không được xoá
     rc3, _, err3 = roff_json(["gc"], timeout=600, env=cfg["env"])

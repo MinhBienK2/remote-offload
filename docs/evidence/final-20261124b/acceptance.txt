@@ -1,0 +1,178 @@
+============================= test session starts ==============================
+platform linux -- Python 3.10.12, pytest-8.2.0, pluggy-1.6.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+rootdir: /home/minhbien/Documents/remote-offload
+configfile: pytest.ini
+plugins: anyio-4.14.0, langsmith-0.3.45, asyncio-0.23.6
+asyncio: mode=strict
+collecting ... collected 56 items
+
+tests/acceptance/test_acceptance_b22.py::test_s43_gc_removes_orphan_lock_but_keeps_live_lock PASSED [  1%]
+tests/acceptance/test_acceptance_config_safety.py::test_s47_missing_config_fails_loud_and_creates_no_job PASSED [  3%]
+tests/acceptance/test_acceptance_config_safety.py::test_s47_config_present_keeps_fleet_restricted PASSED [  5%]
+tests/acceptance/test_acceptance_dataflow.py::test_s23_input_pushed_once_per_host PASSED [  7%]
+tests/acceptance/test_acceptance_dataflow.py::test_s24_failover_keeps_item_and_workdir FAILED [  8%]
+tests/acceptance/test_acceptance_fleet.py::test_s03_ffmpeg_transcode_artifacts PASSED [ 10%]
+tests/acceptance/test_acceptance_fleet.py::test_s04_url_input_prefers_internet_host PASSED [ 12%]
+tests/acceptance/test_acceptance_fleet.py::test_s05_insufficient_ram_never_runs_local PASSED [ 14%]
+tests/acceptance/test_acceptance_fleet.py::test_s13_all_hosts_dead_never_runs_local PASSED [ 16%]
+tests/acceptance/test_acceptance_fleet.py::test_s14_secret_not_in_remote_argv PASSED [ 17%]
+tests/acceptance/test_acceptance_fleet.py::test_s15_stale_master_does_not_kill_foreign_pid PASSED [ 19%]
+tests/acceptance/test_acceptance_nice_policy.py::test_s48_nice_policy_has_one_source_of_truth PASSED [ 21%]
+tests/acceptance/test_acceptance_nice_policy.py::test_s49_remote_job_runs_at_nice_19 PASSED [ 23%]
+tests/acceptance/test_acceptance_nice_policy.py::test_s49b_remote_job_nice_zero_is_not_wrapped PASSED [ 25%]
+tests/acceptance/test_acceptance_nice_policy.py::test_s49c_remote_job_runs_when_host_has_no_nice PASSED [ 26%]
+tests/acceptance/test_acceptance_pull_failed.py::test_s45_pull_failure_is_reported_not_swallowed PASSED [ 28%]
+tests/acceptance/test_acceptance_resilience.py::test_s07_tunnel_drop_does_not_failover SKIPPED [ 30%]
+tests/acceptance/test_acceptance_resilience.py::test_s09_side_effects_never_retried PASSED [ 32%]
+tests/acceptance/test_acceptance_resilience.py::test_s10_job_survives_agent_death PASSED [ 33%]
+tests/acceptance/test_acceptance_resilience.py::test_s11_shards_spread_over_hosts PASSED [ 35%]
+tests/acceptance/test_acceptance_resilience.py::test_s18_parallel_speedup SKIPPED [ 37%]
+tests/acceptance/test_acceptance_review.py::test_s31_ssh_actually_uses_replacement_ssh_config PASSED [ 39%]
+tests/acceptance/test_acceptance_review.py::test_s31b_without_replacement_config_alias_is_unknown PASSED [ 41%]
+tests/acceptance/test_acceptance_review.py::test_s32_broken_ledger_does_not_wipe_the_slot_queue PASSED [ 42%]
+tests/acceptance/test_acceptance_safety.py::test_s14_secret_never_leaks PASSED [ 44%]
+tests/acceptance/test_acceptance_safety.py::test_s13_all_hosts_dead PASSED [ 46%]
+tests/acceptance/test_acceptance_safety.py::test_s12_tunnel_serves_and_stops_cleanly SKIPPED [ 48%]
+tests/acceptance/test_acceptance_safety.py::test_s19_three_sessions_share_the_fleet PASSED [ 50%]
+tests/acceptance/test_acceptance_sync_back.py::test_s46_sync_back_pulls_file_into_project PASSED [ 51%]
+tests/acceptance/test_acceptance_w3_resilience.py::test_s25_leaked_slot_does_not_block_host_forever SKIPPED [ 53%]
+tests/acceptance/test_acceptance_w3_resilience.py::test_s26_queued_job_auto_launches_when_slot_frees PASSED [ 55%]
+tests/acceptance/test_acceptance_w3_resilience.py::test_s27_state_files_are_private PASSED [ 57%]
+tests/acceptance/test_acceptance_w3_resilience.py::test_s28_gc_cleans_host_input_store_but_not_running_jobs SKIPPED [ 58%]
+tests/acceptance/test_acceptance_w3_resilience.py::test_s29_error_exit_codes_are_not_confused PASSED [ 60%]
+tests/acceptance/test_acceptance_w3_resilience.py::test_s30_job_routed_to_host_that_has_the_tool PASSED [ 62%]
+tests/acceptance/test_acceptance_w4_w5.py::test_s33_tunnel_link_end_to_end_on_real_fleet PASSED [ 64%]
+tests/acceptance/test_acceptance_w4_w5.py::test_s33b_tunnel_link_reports_remote_not_listening PASSED [ 66%]
+tests/acceptance/test_acceptance_w4_w5.py::test_s33c_tunnel_list_shows_then_hides_the_link PASSED [ 67%]
+tests/acceptance/test_acceptance_w4_w5.py::test_s34_doctor_reports_json_and_exit_code PASSED [ 69%]
+tests/acceptance/test_acceptance_w4_w5.py::test_s34b_doctor_does_not_write_anything PASSED [ 71%]
+tests/acceptance/test_acceptance_w4_w5.py::test_s34c_doctor_default_does_not_probe_network PASSED [ 73%]
+tests/acceptance/test_acceptance_w4_w5.py::test_s35_gc_removes_legacy_and_old_terminal_jobs PASSED [ 75%]
+tests/acceptance/test_acceptance_w4_w5.py::test_s35b_legacy_job_is_not_held_as_running PASSED [ 76%]
+tests/acceptance/test_acceptance_w4_w5.py::test_s35c_wait_on_legacy_job_returns_immediately PASSED [ 78%]
+tests/acceptance/test_acceptance_w4_w5.py::test_s36_changing_ssh_config_does_not_reuse_the_old_master PASSED [ 80%]
+tests/acceptance/test_acceptance_w6.py::test_s37_infers_tool_from_command PASSED [ 82%]
+tests/acceptance/test_acceptance_w6.py::test_s37_explicit_need_is_not_guessed_away PASSED [ 83%]
+tests/acceptance/test_acceptance_w6.py::test_s38_inferred_tool_never_rejects_or_installs PASSED [ 85%]
+tests/acceptance/test_acceptance_w6.py::test_s39_builtin_command_infers_nothing PASSED [ 87%]
+tests/acceptance/test_acceptance_w6.py::test_s39_waits_for_inferred_job_to_finish PASSED [ 89%]
+tests/acceptance/test_acceptance_w7.py::test_s40_orphan_shared_lock_is_cleaned_and_job_runs SKIPPED [ 91%]
+tests/acceptance/test_acceptance_w7.py::test_s41_missing_local_input_ends_with_clear_reason SKIPPED [ 92%]
+tests/acceptance/test_acceptance_w7.py::test_s42_pinned_host_unreachable_fails_loud_without_failover PASSED [ 94%]
+tests/acceptance/test_lifecycle_real.py::test_s02_job_lifecycle_on_real_host PASSED [ 96%]
+tests/acceptance/test_lifecycle_real.py::test_s02b_job_failure_exit_code_on_real_host PASSED [ 98%]
+tests/acceptance/test_lifecycle_real.py::test_s06_resume_partial_transfer_on_real_host PASSED [100%]
+
+=================================== FAILURES ===================================
+___________________ test_s24_failover_keeps_item_and_workdir ___________________
+
+fleet = ['muse-pmb333', 'muse-tampt', 'muse-bienpm333', 'muse-phamminhbien3333']
+cfg = {'env': {'ROFF_CONFIG': '/tmp/pytest-roff-acceptance-final/test_s24_failover_keeps_item_a0/config.ini', 'ROFF_SLOT_WAI...ps_item_a0/config.ini'), 'state': PosixPath('/tmp/pytest-roff-acceptance-final/test_s24_failover_keeps_item_a0/state')}
+tmp_path = PosixPath('/tmp/pytest-roff-acceptance-final/test_s24_failover_keeps_item_a0')
+
+    def test_s24_failover_keeps_item_and_workdir(fleet, cfg, tmp_path):
+        """S24: job chết trên host A ⇒ chạy lại trên host B, item và thư mục đúng.
+    
+        Cách chạy: job ``--each`` (2 item) ghim host A; giết **process group của
+        chính job đó** trên A (dùng pid đã ghi trong ledger) ⇒ watcher phải
+        failover sang host B.
+    
+        Đạt khi:
+          * ledger có event ``failover``;
+          * host cuối cùng khác host đầu;
+          * exit 0 và **mọi** output về đúng nội dung;
+          * trên host mới, mỗi job có **thư mục làm việc riêng** (giữ hậu tố
+            ``part-N``) — không được gộp các item của lô vào chung 1 thư mục;
+          * ``$ROFF_ITEM`` trên host mới tồn tại (job không chạy với path của host cũ).
+        """
+        alive = live_muses()
+        if len(alive) < 2:
+            pytest.skip("cần ≥ 2 máy để thử failover")
+    
+        src = tmp_path / "data"
+        src.mkdir()
+        payloads = {}
+        for i in range(2):
+            data = bytes([9 - i]) * (512 * 1024)
+            (src / f"item{i}.bin").write_bytes(data)
+            payloads[f"item{i}.bin"] = hashlib.sha256(data).hexdigest()
+    
+        out = tmp_path / "out"
+        used_hosts: list[str] = []
+        rc = obj = err = None
+    
+        # Thử từng máy sống làm "host A" cho tới khi `roff do` thành công.
+        for alias in alive:
+            # 2 job trên **cùng** 1 host ⇒ cần ≥ 2 slot cho host đó, nếu không
+            # job thứ 2 phải xếp hàng (vẫn đúng, nhưng chậm và dễ đụng flap).
+            cfg["path"].write_text(
+                "[fleet]\n"
+                "include = muse-*\n"
+                "probe_cache_s = 0\n"
+                f"[host.{alias}]\n"
+                "slots = 4\n"
+            )
+            used_hosts.append(alias)
+            rc, obj, err = roff_json([
+                "do",
+                "--each", str(src / "*.bin"),
+                "--in", str(src),
+                "--host", alias,
+                "--out", str(out),
+                "--cmd", 'sleep 40; cp "$ROFF_ITEM" "$ROFF_OUT/$(basename "$ROFF_ITEM")"',
+            ], timeout=600, env=cfg["env"])
+            if rc == 0:
+                break
+            reason = str(obj.get("reason") or "")
+            if reason not in HOST_DEATH_REASONS:
+                break
+            time.sleep(5)
+    
+        if common.is_host_down(rc, obj, err):
+            pytest.skip(f"máy remote chết lúc gửi job — sự cố hạ tầng: {err[-200:]}")
+        assert rc == 0, f"roff do thất bại: rc={rc} obj={obj} err={err[-400:] if err else ''}"
+        alias = used_hosts[-1]
+        job_ids = [j for j in (obj.get("jobs") or [obj.get("job")]) if j]
+        assert len(job_ids) == 2, f"phải tạo 2 job: {job_ids}"
+    
+        # Chờ job thực sự chạy (có pid trong ledger)
+        pids: list[int] = []
+        deadline = time.time() + 180
+        while time.time() < deadline and not pids:
+            for jid in job_ids:
+                led = _ledger(cfg["state"], jid)
+                for att in led.get("attempts") or []:
+                    if att.get("pid"):
+                        pids.append(int(att["pid"]))
+            if not pids:
+                time.sleep(3)
+        assert pids, "job chưa ghi nhận pid ⇒ không giết được để thử failover"
+    
+        # Giết process group của chính job (không đụng tiến trình khác của user)
+        for pid in set(pids):
+            ssh_out(alias, f"kill -TERM -{pid} 2>/dev/null || true")
+        time.sleep(10)
+    
+        results = _wait_all(cfg["state"], job_ids, timeout=900, env=cfg["env"])
+    
+        failover_hosts: dict[str, str] = {}
+        for jid in job_ids:
+            led = _ledger(cfg["state"], jid)
+            events = [e.get("event") for e in ((led.get("_roff") or {}).get("events") or [])]
+>           assert "failover" in events, f"job {jid} không failover: {events}"
+E           AssertionError: job 261124-023327-94aa không failover: ['pulled', 'finished']
+E           assert 'failover' in ['pulled', 'finished']
+
+tests/acceptance/test_acceptance_dataflow.py:381: AssertionError
+=========================== short test summary info ============================
+FAILED tests/acceptance/test_acceptance_dataflow.py::test_s24_failover_keeps_item_and_workdir
+SKIPPED [1] tests/acceptance/_common.py:184: job 261124-024502-70a2 mất vì host chết (reason=workdir_missing) — sự cố hạ tầng, không phải lỗi roff
+SKIPPED [1] tests/acceptance/_common.py:184: job 261124-024953-3aea mất vì host chết (reason=host_restarted) — sự cố hạ tầng, không phải lỗi roff
+SKIPPED [1] tests/acceptance/test_acceptance_safety.py:260: host muse-pmb333 chết lúc dựng HTTP server — sự cố hạ tầng: ex.html"; cd "$d" && nohup python3 -m http.server 8731 --bind 127.0.0.1 </dev/null >/dev/null 2>&1 & echo $! > /tmp/roff-s12-http.pid; sleep 2; cat /tmp/roff-s12-http.pid']' timed out after 60 seconds
+SKIPPED [1] tests/acceptance/test_acceptance_w3_resilience.py:0: sự cố hạ tầng (rc=255) — máy remote chết / đường truyền đứt; KHÔNG phải lỗi của roff (docs/REPORT.md §2)
+SKIPPED [1] tests/acceptance/test_acceptance_w3_resilience.py:540: host muse-pmb333 không với được lúc đo — sự cố hạ tầng
+SKIPPED [2] tests/acceptance/test_acceptance_w7.py:0: sự cố hạ tầng (connection timed out) — máy remote chết / đường truyền đứt; KHÔNG phải lỗi của roff (docs/REPORT.md §2)
+============= 1 failed, 48 passed, 7 skipped in 3276.22s (0:54:36) =============
+
+----- stderr -----

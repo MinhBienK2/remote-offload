@@ -410,8 +410,11 @@ def test_s18_parallel_speedup(fleet, cfg, tmp_path):
     **Đạt khi**:
       * phía **song song** chạy trên **≥ 2 máy khác nhau**;
       * các job **chạy chồng nhau** (cửa sổ chạy remote có giao nhau);
-      * tăng tốc **tính toán** ≥ 0,6 × N (tổng thời gian chạy remote ÷ thời
-        gian của đoạn chạy chồng nhau);
+      * tăng tốc **tính toán** ≥ 0,6 × (số máy đã dùng) — đo bằng
+        **tổng thời gian chạy remote ÷ trục thời gian của cả lô**: 1,0× ⇒
+        lô chạy **tuần tự** (lỗi sản phẩm); ~k× ⇒ k job chạy đồng thời trên
+        k máy. (Đo bằng "đoạn mọi job cùng chạy" sẽ **vỡ** khi fleet hẹp hơn
+        số item ⇒ báo đỏ oan.)
       * mọi output có sha256 đúng, không trùng lặp.
 
     **"Không chạy chồng nhau" là lỗi SẢN PHẨM hay HẠ TẦNG?** (B37 — xem
@@ -504,45 +507,85 @@ def test_s18_parallel_speedup(fleet, cfg, tmp_path):
             "thiếu mốc thời gian của %d/%d job — không đo được cửa sổ chạy remote"
             % (len(windows), n))
 
-    # Đoạn mà **mọi** job cùng chạy: [max(start), min(end)].
+    # Đoạn mà **mọi** job cùng chạy: [max(start), min(end)] — chỉ để **in ra**.
     lo = max(w[0] for w in windows)
     hi = min(w[1] for w in windows)
-    if lo >= hi:
-        # **Không** chạy chồng nhau. Có **hai** nguyên nhân rất khác nhau và
-        # phải phân biệt được (B37 — lý do skip sai sẽ giấu lỗi sản phẩm):
-        #   (a) `roff do --each` gửi các item **tuần tự** ⇒ lỗi **sản phẩm**;
-        #   (b) các job đã gửi **cùng lúc** nhưng host không chạy nổi cùng lúc
-        #       ⇒ **hạ tầng** (fleet hẹp / host chết giữa lô).
-        # Mốc quyết định: độ trễ giữa lần gửi.
-        real_submits = [s for s in submits if s]
-        stagger = (max(real_submits) - min(real_submits)) if len(real_submits) >= 2 else 0.0
-        detail = "; ".join(
-            "%s %.1f→%.1f" % (h, s, e) for s, e, h in sorted(windows))
+    real_submits = [s for s in submits if s]
+    stagger = (max(real_submits) - min(real_submits)) if len(real_submits) >= 2 else 0.0
+    detail = "; ".join(
+        ["%s %.1f→%.1f" % (h, s, e) for s, e, h in sorted(windows)]
+    )
+
+    # **Tăng tốc tính toán** = (tổng thời gian chạy remote) ÷ (trục thời gian
+    # của **cả lô**). Cách này đo được **mức song song thật**:
+    #   * 1 job chạy tuần tự ⇒ 1,0×;
+    #   * k job chạy đồng thời trên k máy ⇒ ~k×.
+    # (Đo bằng "đoạn mọi job cùng chạy" như trước thì **vỡ** khi fleet hẹp:
+    # 3 job trên 2 máy không bao giờ có đoạn chung, dù 2 job **có** chạy
+    # chồng nhau ⇒ báo tăng tốc 0 ⇒ **báo đỏ oan** cho sản phẩm đúng.)
+    span_start = min(w[0] for w in windows)
+    span_end = max(w[1] for w in windows)
+    compute_wall = span_end - span_start
+    compute_total = sum(end - start for start, end, _ in windows)
+    compute_speedup = compute_total / compute_wall if compute_wall else 0.0
+    # Số job chạy **đồng thời tối đa** (độ sâu chồng nhau) — đo trực tiếp.
+    edges = []
+    for start, end, _h in windows:
+        edges.append((start, 1))
+        edges.append((end, -1))
+    edges.sort()
+    depth = best = 0
+    for _ts, delta in edges:
+        depth += delta
+        best = max(best, depth)
+    max_parallel = best
+    # Trần vật lý: 1 máy chạy **1 job** một lúc (slot mặc định) ⇒ tăng tốc
+    # tối đa = số máy đã dùng. Dùng trần đó, không dùng `n` — nếu fleet hẹp hơn
+    # số item thì `n` là ngưỡng **không với tới** ⇒ báo đỏ oan.
+    expect = max(1, min(k, len(windows)))
+    global_speedup = seq_wall / par_wall if par_wall > 0 else 0
+
+    # **Không job nào chạy chồng nhau** ⇒ lô chạy **tuần tự**. Có hai nguyên
+    # nhân rất khác nhau, phải phân biệt được (B37 — lý do skip sai sẽ giấu
+    # lỗi sản phẩm):
+    #   (a) `roff do --each` gửi các item **tuần tự** ⇒ lỗi **sản phẩm** (B36);
+    #   (b) các job đã gửi **cùng lúc** mà vẫn xếp hàng ⇒ máy **đang bận**
+    #       ⇒ **hạ tầng**.
+    # Mốc quyết định: **độ trễ giữa các lần gửi**.
+    if max_parallel < 2:
         if stagger > SUBMIT_STAGGER_S:
             pytest.fail(
                 "các job KHÔNG chạy chồng nhau mà `do --each` đã gửi TUẦN TỰ "
                 "(lệch %.1f s > %.1f s) ⇒ lỗi **sản phẩm**: đường gửi job "
                 "tuần tự, fleet không tính toán song song (B36). Cửa sổ chạy: %s"
                 % (stagger, SUBMIT_STAGGER_S, detail))
+        # **Nêu đúng nguyên nhân** (nguyên tắc §2): máy **chết/sập** giữa lô
+        # (watcher ghi `disconnected` rồi `failover`) khác với máy **đang bận**
+        # (job phải xếp hàng chờ slot).
+        downed = []
+        for jid in job_ids:
+            evs = ((_ledger_of(_DEFAULT_STATE, jid).get("_roff") or {}).get("events") or [])
+            names = {str(e.get("event") or "") for e in evs}
+            if names & {"disconnected", "failover", "input_push_failed"}:
+                downed.append(jid)
+        why = ("máy **chết/sập** giữa lô (job phải chờ rồi failover)"
+               if downed else "máy đang **bận** (job phải xếp hàng chờ slot)")
         pytest.skip(
-            "các job đã gửi cùng lúc (lệch %.1f s) nhưng không chạy chồng nhau — "
-            "fleet hẹp lúc đo (%d máy cho %d job) ⇒ **hạ tầng**, không phải lỗi "
-            "sản phẩm. Cửa sổ chạy: %s"
-            % (stagger, k, len(windows), detail))
-
-    compute_wall = hi - lo
-    compute_total = sum(end - start for start, end, _ in windows)
-    compute_speedup = compute_total / compute_wall if compute_wall else 0.0
-    global_speedup = seq_wall / par_wall if par_wall > 0 else 0
+            "các job đã gửi cùng lúc (lệch %.1f s) nhưng không job nào chạy "
+            "chồng nhau — %s ⇒ **hạ tầng**, không phải lỗi sản phẩm. "
+            "Cửa sổ chạy: %s" % (stagger, why, detail))
     print(f"\n[S18] n={n} máy dùng={k} ({', '.join(used)}) | "
           f"tính toán: {compute_total:.1f}s chạy remote trong {compute_wall:.1f}s "
-          f"chồng nhau => tăng tốc tính toán {compute_speedup:.2f}x "
-          f"(cần >= {0.6 * n:.2f}x) | wall-clock: tuần tự {seq_wall:.1f}s vs "
-          f"song song {par_wall:.1f}s => {global_speedup:.2f}x (đường lên chi phối)")
-    assert compute_speedup >= 0.6 * n, (
-        f"tăng tốc tính toán {compute_speedup:.2f}x < {0.6 * n:.2f}x "
-        f"(tổng {compute_total:.1f}s chạy remote / {compute_wall:.1f}s chồng nhau, "
-        f"{k} máy: {', '.join(used)})")
+          f"trục lô => tăng tốc tính toán {compute_speedup:.2f}x "
+          f"(cần >= {0.6 * expect:.2f}x; chạy đồng thời tối đa {max_parallel} job) "
+          f"| đoạn chạy chồng nhau của MỌI job: "
+          f"{'có' if lo < hi else 'không'} ({hi - lo:.1f}s) | wall-clock: tuần tự "
+          f"{seq_wall:.1f}s vs song song {par_wall:.1f}s => {global_speedup:.2f}x "
+          f"(đường lên chi phối)")
+    assert compute_speedup >= 0.6 * expect, (
+        f"tăng tốc tính toán {compute_speedup:.2f}x < {0.6 * expect:.2f}x "
+        f"(tổng {compute_total:.1f}s chạy remote / {compute_wall:.1f}s trục lô; "
+        f"chạy đồng thời tối đa {max_parallel} job; {k} máy: {', '.join(used)})")
 
     # --- Output đủ, không trùng lặp ---
     produced = sorted(p.name for p in out2.glob("*.mp4"))

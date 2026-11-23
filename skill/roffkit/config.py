@@ -18,6 +18,10 @@ Cấu trúc (xem docs/DESIGN.md §5.10 và docs/API-CONTRACT.md §3)::
     cache_max_mb = 5120
     cache_min_free_mb = 3072
 
+    [remote]
+    nice = 19
+    ionice = idle
+
     [heavy]
     add = gradle
     allow = git
@@ -27,6 +31,7 @@ Cấu trúc (xem docs/DESIGN.md §5.10 và docs/API-CONTRACT.md §3)::
     weight = 1
     slots = 1
     mem_budget_mb = 700
+    nice = 19          # ghi đè [remote] nice cho riêng host này
 
 Quy tắc:
   * không có file → :meth:`Config.load` trả config mặc định, ``path=None``;
@@ -37,6 +42,11 @@ Quy tắc:
     file đó **không tồn tại** ⇒ ``strict=True`` ném ``RoffError(EXIT_CONFIG,
     "config_missing")``. Bỏ qua im lặng sẽ **nới rộng fleet** thành MỌI host
     trong ``~/.ssh/config`` (và làm mất luôn ``exclude`` của người dùng).
+
+Module này cũng là **nguồn sự thật duy nhất** cho chính sách ``nice``/
+``ionice`` (B34): :func:`local_nice_prefix` cho tiến trình local và
+:func:`remote_nice_policy` cho lệnh job chạy trên máy remote (C9). Thứ tự
+ưu tiên: **biến môi trường > config > mặc định**.
 """
 
 from __future__ import annotations
@@ -44,6 +54,7 @@ from __future__ import annotations
 import configparser
 import os
 import re
+import shutil
 from dataclasses import dataclass, field
 
 try:  # tuỳ cách import: package `roffkit` hoặc module chạy rời
@@ -83,6 +94,14 @@ class HostConfig:
     các dịch vụ này dao động. Reserve là khoảng chừa để job của roff không
     OOM-kill chúng.
     """
+    nice: int | None = None
+    """Ghi đè ``[remote] nice`` cho riêng host này (``None`` = không ghi đè).
+
+    Chỉ áp cho **lệnh job chạy trên host** (C9) — không phải tiến trình
+    local của roff.
+    """
+    ionice: str | None = None
+    """Ghi đè ``[remote] ionice`` cho riêng host này (``None`` = không ghi đè)."""
 
 
 @dataclass
@@ -96,6 +115,10 @@ class Config:
     max_parallel_transfers: int = 2
     nice: int = 19
     ionice: str = "idle"
+    remote_nice: int = 19
+    """Mức ``nice`` cho **lệnh job chạy trên máy remote** (C9)."""
+    remote_ionice: str = "idle"
+    """Lớp I/O cho **lệnh job chạy trên máy remote** (C9)."""
     cache_max_mb: int = 5120
     cache_min_free_mb: int = 3072
     heavy_add: list[str] = field(default_factory=list)
@@ -215,6 +238,244 @@ class Config:
         if excludes:
             text += " (trừ exclude: " + ", ".join(excludes) + ")"
         return text
+
+
+# --------------------------------------------------------------------------
+# Chính sách ``nice``/``ionice`` — MỘT nguồn sự thật (B34)
+# --------------------------------------------------------------------------
+#
+# Trước B34 chính sách này bị **copy 5 lần** (probe/sshx/tunnel/job/transfer)
+# với **3 nguồn sự thật** (hằng / env / config) ⇒ ``ROFF_NICE`` không có tác
+# dụng với rsync/tar, còn sửa ``[local] nice`` trong ``config.ini`` cũng
+# không đổi được gì ⇒ **nút cấu hình chết**. Mọi module giờ gọi
+# :func:`local_nice_prefix` / :func:`remote_nice_policy` ở đây.
+
+#: Mức ``nice`` mặc định cho tiến trình **local** của roff (thấp nhất).
+DEFAULT_NICE = 19
+
+#: Lớp ``ionice`` mặc định cho tiến trình **local** của roff.
+DEFAULT_IONICE = "idle"
+
+#: Tên lớp I/O → số lớp mà ``ionice -c`` hiểu.
+#:
+#: ``none`` **không** có trong bảng: nó có nghĩa "**không** bọc ``ionice``"
+#: (giống giá trị rỗng) — không phải lớp số 0.
+IONICE_CLASSES = {
+    "idle": "3",
+    "best-effort": "2",
+    "be": "2",
+    "realtime": "1",
+}
+
+#: Trần ``nice`` trên Linux (19 = thấp nhất).
+NICE_MAX = 19
+
+#: Dấu hiệu "biến có mặt nhưng **không** dùng" (khác với "không có biến").
+_UNSET = object()
+
+
+@dataclass(frozen=True)
+class NicePolicy:
+    """Chính sách ưu tiên CPU/I-O đã chốt — dùng chung cho mọi module (B34)."""
+
+    nice: int = DEFAULT_NICE
+    """Mức ``nice``; ``0`` ⇒ **không** bọc ``nice`` (ưu tiên cao, không hạ)."""
+    ionice: str | None = None
+    """Lớp I/O (``"3"``/``"2"``/``"1"``/``"0"``); ``None`` ⇒ **không** bọc ``ionice``."""
+
+    def prefix(self) -> list[str]:
+        """Tiền tố argv cho tiến trình con.
+
+        Thứ tự: ``nice`` **trước** ``ionice`` — đúng dạng
+        ``nice -n 19 ionice -c3`` mà tài liệu (và 3/5 module cũ: probe, job,
+        transfer) dùng. **Thứ tự không phải hợp đồng**: `nice` và `ionice`
+        đặt hai thuộc tính độc lập (CPU / I-O), cả hai đều được kế thừa qua
+        fork+exec ⇒ đổi thứ tự **không** đổi hành vi. Trước B34, `sshx` và
+        `tunnel` dùng thứ tự ngược lại ⇒ đó là **hệ quả của việc copy-paste
+        chính sách, không phải ý định thiết kế**.
+        """
+        parts: list[str] = []
+        if self.nice > 0 and shutil.which("nice"):
+            parts += ["nice", "-n", str(self.nice)]
+        if self.ionice and shutil.which("ionice"):
+            parts += ["ionice", "-c" + str(self.ionice)]
+        return parts
+
+
+def load_config() -> Config | None:
+    """Config hiện tại, hoặc ``None`` nếu **không đọc được**.
+
+    Nguyên tắc B27: ở những đường *sau khi* job đã ghim host, đọc config
+    **không được** làm chết tiến trình ⇒ ``strict=False`` + nuốt lỗi ⇒ dùng
+    cấu hình mặc định an toàn. Xem :func:`roffkit.transfer._config`.
+    """
+    try:
+        return Config.load(os.environ.get("ROFF_CONFIG") or None, strict=False)
+    except Exception:
+        return None
+
+
+def ionice_class(value: str | None) -> str | None:
+    """Tên lớp I/O → số lớp mà ``ionice -c`` hiểu.
+
+    * rỗng / ``none`` ⇒ ``None`` ⇒ **không** bọc ``ionice``;
+    * ``idle``/``best-effort``/``be``/``realtime`` ⇒ ``3``/``2``/``2``/``1``;
+    * số ``0``–``3`` ⇒ giữ nguyên (``ionice -c0`` = không đặt ưu tiên I/O);
+    * giá trị không hiểu được ⇒ ``None`` (không bọc) — an toàn.
+    """
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text or text == "none":
+        return None
+    if text in IONICE_CLASSES:
+        return IONICE_CLASSES[text]
+    if text in ("0", "1", "2", "3"):
+        return text
+    return None
+
+
+def _clamp_nice(value: int) -> int:
+    """Chuẩn hoá mức ``nice``.
+
+    * ``<= 0`` ⇒ ``0`` ⇒ **không** bọc ``nice``. Mức âm cần quyền đặc biệt
+      để nâng ưu tiên; roff không tự ý nâng ưu tiên ⇒ coi như ``0``.
+    * ``> 19`` ⇒ ``19`` (trần của Linux).
+    """
+    if value <= 0:
+        return 0
+    return min(value, NICE_MAX)
+
+
+def _env_nice(name: str = "ROFF_NICE") -> int | None:
+    """Mức ``nice`` từ biến môi trường; ``None`` nếu không có / không hợp lệ."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        return None
+    return _clamp_nice(value)
+
+
+def _env_ionice(name: str = "ROFF_IONICE") -> object:
+    """Lớp I/O từ biến môi trường.
+
+    Trả về ``_UNSET`` nếu biến **không có** (hoặc rác ⇒ bỏ qua, đọc tiếp
+    config), ``None`` nếu biến nói rõ "**không** bọc ``ionice``" (rỗng hoặc
+    ``none``), còn lại là số lớp.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return _UNSET
+    text = raw.strip()
+    if not text or text.lower() == "none":
+        return None
+    value = ionice_class(text)
+    return value if value is not None else _UNSET
+
+
+def _config_ionice(value: str | None) -> str | None:
+    """Lớp I/O từ **config**.
+
+    Rỗng / ``none`` ⇒ **không** bọc; giá trị rác ⇒ mặc định (``idle``) —
+    không bỏ im lặng luôn (giữ được cam kết "máy local phải nhẹ").
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() == "none":
+        return None
+    return ionice_class(text) or ionice_class(DEFAULT_IONICE)
+
+
+def local_nice_policy(config: Config | None = None) -> NicePolicy:
+    """Chính sách ``nice``/``ionice`` cho tiến trình **local** của roff (B34).
+
+    Thứ tự ưu tiên: ``ROFF_NICE``/``ROFF_IONICE`` (env) > ``[local]``
+    (config) > mặc định (``19`` / ``idle``).
+
+    * ``nice = 0`` ⇒ **không** bọc ``nice`` (người dùng muốn ưu tiên cao);
+    * ``ionice`` rỗng hoặc ``none`` ⇒ **không** bọc ``ionice``;
+    * config hỏng / không đọc được ⇒ **mặc định**, **không** raise (B27).
+    """
+    cfg = config if config is not None else load_config()
+    nice = _env_nice()
+    if nice is None and cfg is not None:
+        nice = _clamp_nice(int(cfg.nice))
+    if nice is None:
+        nice = DEFAULT_NICE
+    ionice = _env_ionice()
+    if ionice is _UNSET and cfg is not None:
+        ionice = _config_ionice(cfg.ionice)
+    if ionice is _UNSET:
+        ionice = ionice_class(DEFAULT_IONICE)
+    return NicePolicy(nice=nice, ionice=ionice)
+
+
+def remote_nice_policy(
+    host: str | None = None, config: Config | None = None
+) -> NicePolicy:
+    """Chính sách ``nice``/``ionice`` cho **lệnh job chạy trên máy remote** (C9).
+
+    Thứ tự ưu tiên: ``ROFF_REMOTE_NICE``/``ROFF_REMOTE_IONICE`` (env) >
+    ``[host.<alias>]`` > ``[remote]`` > mặc định (``19`` / ``idle``).
+
+    Mặc định ``19``/``idle`` là **an toàn**: job của roff không được cạnh
+    tranh với ``postgres``/``telegram-bot``/``cloudflared`` của chính người
+    dùng đang chạy trên cùng máy đó.
+    """
+    cfg = config if config is not None else load_config()
+    nice = _env_nice("ROFF_REMOTE_NICE")
+    if nice is None and cfg is not None:
+        value: object = None
+        if host:
+            value = cfg.host(host).nice
+        if value is None:
+            value = cfg.remote_nice
+        nice = _clamp_nice(int(value))
+    if nice is None:
+        nice = DEFAULT_NICE
+    ionice = _env_ionice("ROFF_REMOTE_IONICE")
+    if ionice is _UNSET and cfg is not None:
+        value = None
+        if host:
+            value = cfg.host(host).ionice
+        if value is None:
+            value = cfg.remote_ionice
+        ionice = _config_ionice(value)
+    if ionice is _UNSET:
+        ionice = ionice_class(DEFAULT_IONICE)
+    return NicePolicy(nice=nice, ionice=ionice)
+
+
+def local_nice_prefix(config: Config | None = None) -> list[str]:
+    """Tiền tố argv (``ionice``/``nice``) cho tiến trình **local** (B34).
+
+    Đây là hàm mà **mọi** module gọi — :mod:`roffkit.probe`,
+    :mod:`roffkit.sshx`, :mod:`roffkit.tunnel`, :mod:`roffkit.job`,
+    :mod:`roffkit.transfer` — nên 5 module **luôn** cho ra cùng một kết quả
+    với cùng env + cùng config.
+    """
+    return local_nice_policy(config).prefix()
+
+
+def remote_nice_args(
+    host: str | None = None, config: Config | None = None
+) -> tuple[str, str]:
+    """Placeholder cho script chạy **trên host**: ``(nice, ionice)``.
+
+    Chuỗi rỗng ⇒ **không** bọc. Giá trị được điền từ **local** (giống
+    ``__CPUS__``/``__MEMMB__`` của ``launch.sh``) vì máy remote có thể không
+    có ``nice``/``ionice`` — script trên host tự kiểm tra bằng ``command -v``.
+    """
+    policy = remote_nice_policy(host, config)
+    nice = str(policy.nice) if policy.nice > 0 else ""
+    return nice, (str(policy.ionice) if policy.ionice else "")
 
 
 # ------------------------------------------------------------------ helpers
@@ -346,6 +607,15 @@ def _build_config(parser: configparser.ConfigParser, path: str) -> Config:
     ionice = _get(parser, "local", "ionice")
     if ionice is not None and ionice.strip():
         cfg.ionice = ionice.strip()
+
+    # [remote] — chính sách cho **lệnh job chạy trên máy remote** (C9).
+    remote_nice = _as_int(_get(parser, "remote", "nice"), "remote.nice")
+    if remote_nice is not None:
+        cfg.remote_nice = remote_nice
+    remote_ionice = _get(parser, "remote", "ionice")
+    if remote_ionice is not None and remote_ionice.strip():
+        cfg.remote_ionice = remote_ionice.strip()
+
     cache_max_mb = _as_int(_get(parser, "local", "cache_max_mb"), "local.cache_max_mb")
     if cache_max_mb is not None:
         cfg.cache_max_mb = cache_max_mb
@@ -373,6 +643,10 @@ def _build_config(parser: configparser.ConfigParser, path: str) -> Config:
         mem_reserve = _as_int(
             _get(parser, section, "mem_reserve_mb"), f"host.{alias}.mem_reserve_mb"
         )
+        host_nice = _as_int(_get(parser, section, "nice"), f"host.{alias}.nice")
+        host_ionice = _get(parser, section, "ionice")
+        if host_ionice is not None and not host_ionice.strip():
+            host_ionice = None
         cfg.hosts[alias] = HostConfig(
             name=alias,
             labels=labels,
@@ -380,6 +654,8 @@ def _build_config(parser: configparser.ConfigParser, path: str) -> Config:
             slots=1 if slots is None else slots,
             mem_budget_mb=0 if mem_budget is None else mem_budget,
             mem_reserve_mb=256 if mem_reserve is None else mem_reserve,
+            nice=host_nice,
+            ionice=host_ionice,
         )
 
     return cfg

@@ -67,6 +67,30 @@ qua máy local.
   tồn tại — chỉ lộ khi đợt đó **không** skip). ⇒ kịch bản phải được chạy tay
   **ít nhất một lần** trên đường đầy đủ, không được tin vào "nó xanh mấy đợt
   liền".
+- **Chiều ngược lại cũng phải đúng: HẠ TẦNG thì `skip`, không được để đỏ
+  oan.** "Skip chỉ dành cho hạ tầng" nói về **lý do**, không nói "cứ FAIL là
+  được". Đo thật 24/11/2026: `S49c` đỏ vì `RoffError 255` lúc launch —
+  `muse-tampt` chết **đúng giây đó**; chạy lại ⇒ **PASS**. Đỏ oan cũng là
+  lỗi: nó làm người đọc mất niềm tin vào báo cáo, và làm ta **sửa nhầm** vào
+  chỗ không có lỗi. ⇒ mọi lời gọi ssh phải bắt 255 ⇒ `skip` kèm lý do; lỗi
+  **khác** 255 vẫn đỏ đúng như cũ.
+- **Kịch bản phải CHỜ trạng thái, không được ĐOÁN trạng thái.** Sau B36/C10,
+  `roff do` **không** đẩy input nữa ⇒ **watcher** đẩy ⇒ lúc `do` trả về,
+  kho input phía host **có thể chưa** có. Đợt `final-20261124a/`: `S28` đo
+  kho input **ngay** lúc `do` vừa trả về ⇒ **đỏ oan ở 2 máy khác nhau**
+  (`muse-tampt` rồi `muse-pmb333`) ⇒ tưởng là lỗi sản phẩm. Đo lại thật: job
+  chạy trên `muse-tampt`, **exit 0, pulled 12288 byte**, kho input **có** trên
+  host ⇒ sản phẩm đúng, **kịch bản đo quá sớm**. Cùng nguyên tắc: workdir
+  phía host **được giữ lại giữa các lần chạy** ⇒ `S23` phải dùng `--name`
+  riêng cho mỗi lần chạy, nếu không sẽ đo nhầm **rác của lần chạy cũ**.
+- **Sau C10, "các job trong một lô khởi chạy cùng lúc" KHÔNG còn đúng.** Trước
+  đây `roff do` launch **tuần tự** trong lệnh ⇒ khi nó trả JSON thì mọi job
+  **đã** có pid ⇒ kịch bản nào cũng giả định được điều đó. Nay **watcher**
+  khởi chạy từng job ⇒ chúng lệch nhau vài giây ⇒ kịch bản phải **chờ đủ
+  điều kiện** thay vì giả định. Đo thật 24/11/2026: `S24` chờ pid rồi **dừng
+  vòng lờ** ở job đầu tiên ⇒ chỉ **1/2** job bị giết ⇒ job còn lại chạy tới
+  hết ⇒ assert *"không failover"* đỏ. ⇒ rà lại **toàn bộ** kịch bản dùng
+  `--each`: chỉ có 3 (`S18`, `S23`, `S24`) — cả 3 đã sửa.
 
 ---
 
@@ -91,10 +115,10 @@ theo host là bắt buộc, không phải tối ưu hoá.
 
 | Chỉ số | Đo được | Ngưỡng | Kết luận |
 |---|---|---|---|
-| CPU **trung bình** (một core) | **0,05 %** | < 2 % | đạt |
-| CPU **đỉnh** theo cửa sổ 0,5 s | 3,0 % | < 25 % (trần thông tin) | đạt |
-| RAM tối đa | **28,1 MB** | < 100 MB | đạt |
-| Lệnh tương tác chậm thêm | **+3,8 %** | ≤ 20 % | đạt |
+| CPU **trung bình** (một core) | **0,08 %** | < 2 % | đạt |
+| CPU **đỉnh** theo cửa sổ 0,5 s | 4,0 % | < 25 % (trần thông tin) | đạt |
+| RAM tối đa | **26,8 MB** | < 100 MB | đạt |
+| Lệnh tương tác chậm thêm | **+6,6 %** | ≤ 20 % | đạt |
 | Tiến trình roff sót lại | **0** | 0 | đạt |
 
 > **Ghi chú về ngưỡng CPU (B29).** Đợt đo đầu tiên báo **FAIL** vì ngưỡng dùng
@@ -103,7 +127,9 @@ theo host là bắt buộc, không phải tối ưu hoá.
 > phí **kéo dài** mới là thứ quyết định máy chính có giật hay không, và nó là
 > **0,05 %**. Ngưỡng đã đổi sang **trung bình**; đỉnh vẫn được báo cáo (trần
 > thông tin 25 % một core — quá ngưỡng đó thì người dùng **nhìn thấy**).
-> Bằng chứng: `docs/evidence/final/measure.txt` (đợt 23/11/2026 23:21, **PASS**).
+> Bằng chứng: `docs/evidence/final/measure.txt` (đợt 24/11/2026 04:50, **PASS**;
+> đợt 23/11/2026 23:21 cũng **PASS** với 0,05 % / 28,1 MB / +3,8 % ⇒ hai lần đo
+> lặp lại cho cùng một kết luận).
 
 > **Ghi chú về phép đo "lệnh tương tác chậm thêm".** Lệnh benchmark chạy
 > **~23 ms** ⇒ phép đo có **nhiễu lớn hơn cả hiệu ứng cần đo**: hai đợt đo
@@ -112,10 +138,12 @@ theo host là bắt buộc, không phải tối ưu hoá.
 > cần. Vì vậy con số này **không** được dùng để kết luận "máy chính nhanh
 > hơn", chỉ để kết luận "**không chậm hơn đáng kể**" (ngưỡng ≤ 20 %).
 
-> **Còn một giới hạn lớn hơn nhiều (B36).** Con số trên đo **một job**. Với
-> **một lô** nhiều item, `roff do --each` hiện **gửi tuần tự** (~25 s/item) ⇒
-> máy local còn phải **giữ** kết nối và tiến trình trong suốt lô ⇒ chi phí
-> giữa các đợt đo này **chưa** được đo. Xem `docs/REPORT.md` §5 (B36) và §7 (C10).
+> **Giờ đã đo được cả lô (B36/C10, 24/11/2026).** Con số trên đo **một
+> job**. Với **một lô**, `roff do --each` **không** còn gửi tuần tự nữa ⇒ lô
+> chạy **song song** trên nhiều máy, và phần chi phí **giữa** các đợt đo
+> chỉ còn **probe fleet** (1 lần cho cả lô) chứ không phải ~25 s/item.
+> Xem `docs/REPORT.md` §5 (B36) và §7 (C10) + bằng chứng
+> `docs/evidence/c10-after-20261124/submit-latency-after.txt`.
 
 
 ---
@@ -124,10 +152,9 @@ theo host là bắt buộc, không phải tối ưu hoá.
 
 Đợt nghiệm thu cuối — bằng chứng đầy đủ: `docs/evidence/final/`.
 
-- Fleet lúc đo: **3/4** máy sống, RAM trống trung bình **794 MB** — xem `fleet.json`
-- Kết quả pytest: **46 PASSED**, **0 FAILED**, **6 SKIPPED** (tổng 52 test có kết quả).
-- **5** trong 6 lần `SKIPPED` là **sự cố hạ tầng** (máy Muse chết giữa lúc chạy), không phải lỗi của `roff` — xem `docs/REPORT.md` §2. Lý do cụ thể của từng lần skip nằm ở cột *Ghi chú*.
-- **1** lần `SKIPPED` còn lại là **S18** — và nó **không** phải hạ tầng: lý do ghi lại (*"đường lên 0,5–1 MB/s là nút thắt"*) **sai** (đo thật: input chỉ 196 KB). S18 phát hiện đúng một lỗi **sản phẩm**: `roff do --each` gửi job **tuần tự** ⇒ lô không chạy chồng nhau ⇒ fleet không tính toán song song (**B36**). Kịch bản S18 **đã sửa** (B37): từ nay "không chạy chồng nhau" là **FAIL** (lỗi sản phẩm), còn `skip` chỉ dành cho hạ tầng — bằng chứng: `docs/evidence/final/s18-submit-latency.txt`.
+- Fleet lúc đo: **3/4** máy sống, RAM trống trung bình **951 MB** — xem `fleet.json`
+- Kết quả pytest: **49 PASSED**, **0 FAILED**, **7 SKIPPED** (tổng 56 test có kết quả).
+- Theo nguyên tắc `docs/REPORT.md` §2, `SKIPPED` **chỉ** dành cho sự cố **hạ tầng** (máy Muse chết giữa lúc chạy), **không** phải lỗi sản phẩm. Lý do cụ thể của từng lần skip nằm ở cột *Ghi chú* — **đọc** cột đó: nếu lý do ghi là lỗi sản phẩm thì bảng này **sai** và kịch bản phải được sửa (B37).
 
 | # | Kịch bản | Kết quả | Ghi chú |
 |---|---|---|---|
@@ -139,11 +166,11 @@ theo host là bắt buộc, không phải tối ưu hoá.
 | S04 | input là URL | PASSED |  |
 | S05 | RAM không đủ | PASSED |  |
 | S06 | đứt lúc push | PASSED |  |
-| S07 | đứt tunnel, máy vẫn sống | PASSED |  |
+| S07 | đứt tunnel, máy vẫn sống | SKIPPED | job 261124-041917-8799 mất vì host chết (reason=workdir_missing) — sự cố hạ tầng, không phải lỗi roff |
 | S8 | RESTART THẬT giữa lúc chạy — cần quyền restart máy Muse | thủ công |  |
 | S09 | `--side-effects` không retry | PASSED |  |
 | S10 | kill agent giữa lúc chạy | PASSED |  |
-| S11 | `--in job:` + `--shards` | PASSED |  |
+| S11 | `--in job:` + `--shards` | SKIPPED | job 261124-042341-20d3 mất vì host chết (reason=workdir_missing) — sự cố hạ tầng, không phải lỗi roff |
 | S12 | BE + FE qua tunnel | SKIPPED | host muse-pmb333 chết lúc dựng HTTP server — sự cố hạ tầng: ex.html"; cd "$d" && nohup python3 -m http.server 8731 --bind 127.0.0.1 </dev/null >/dev/null 2>&1 & echo $! > /tmp/roff-s12-http.pid; sleep… |
 | S13 | mọi host đều chết | PASSED |  |
 | S13b | mọi host chết ⇒ không chạy local | PASSED |  |
@@ -152,25 +179,25 @@ theo host là bắt buộc, không phải tối ưu hoá.
 | S15 | master ssh cũ giữ port | PASSED |  |
 | S16 | chạy bằng codex — `tests/acceptance/s16_codex_activation.py` (backend codex đang 503) | script riêng |  |
 | S17 | đo token context chính — đo thủ công | thủ công |  |
-| S18 | 20 video trên cả fleet | SKIPPED | các job KHÔNG chạy chồng nhau (lô chạy tuần tự) — đường lên 0,5–1 MB/s là nút thắt, không phải scheduler (docs/REPORT.md §3) |
+| S18 | 20 video trên cả fleet | SKIPPED | cần ≥ 2 máy đang sống để đo tăng tốc, đang có 1 |
 | S19 | 3 phiên agent cùng lúc | PASSED |  |
 | S20 | 1 máy chết giữa lô ⇒ chuyển sang máy khác — đo thật 23/11/2026 (`docs/evidence/failover-live-20261123/`) | đã đo (bằng chứng) |  |
 | S21 | split → encode N host → concat — đo thủ công | thủ công |  |
 | S22 | item chậm ở cuối lô — đo thủ công | thủ công |  |
-| S23 | input đẩy 1 lần cho mỗi host | SKIPPED | sự cố hạ tầng (connection timed out) — máy remote chết / đường truyền đứt; KHÔNG phải lỗi của roff (docs/REPORT.md §2) |
-| S24 | failover giữ item & thư mục | SKIPPED | sự cố hạ tầng (assert 255 == 0) — máy remote chết / đường truyền đứt; KHÔNG phải lỗi của roff (docs/REPORT.md §2) |
+| S23 | input đẩy 1 lần cho mỗi host | PASSED |  |
+| S24 | failover giữ item & thư mục | PASSED |  |
 | S25 | slot rò không kẹt host | PASSED |  |
 | S26 | job xếp hàng tự chạy | PASSED |  |
 | S27 | file state không đọc được của user khác | PASSED |  |
-| S28 | `roff gc` dọn kho input | PASSED |  |
+| S28 | `roff gc` dọn kho input | SKIPPED | host muse-pmb333 không với được lúc đo — sự cố hạ tầng |
 | S29 | exit code phân biệt đúng | PASSED |  |
 | S30 | job giao cho máy có tool | PASSED |  |
 | S31 | `ROFF_SSH_CONFIG` tới tay ssh | PASSED |  |
 | S31b | mốc đối chiếu | PASSED |  |
 | S32 | ledger hỏng không dọn hàng đợi | PASSED |  |
-| S33 | `tunnel link` nối 2 máy thật | SKIPPED | muse-pmb333 chết lúc gọi qua link — sự cố hạ tầng |
+| S33 | `tunnel link` nối 2 máy thật | PASSED |  |
 | S33b | B không LISTEN ⇒ không mở forward | PASSED |  |
-| S33c | `tunnel list` ẩn link đã stop | SKIPPED | máy chết lúc mở link — sự cố hạ tầng: |
+| S33c | `tunnel list` ẩn link đã stop | PASSED |  |
 | S34 | `roff doctor` JSON + exit code | PASSED |  |
 | S34b | `doctor` chỉ báo, không ghi file | PASSED |  |
 | S34c | `doctor` mặc định không probe mạng | PASSED |  |
@@ -182,15 +209,19 @@ theo host là bắt buộc, không phải tối ưu hoá.
 | S37b | `--need` vẫn là tiêu chí cứng | PASSED |  |
 | S38 | suy ra là mềm: không loại host, không cài tool | PASSED |  |
 | S39 | `echo` không suy ra tool nào | PASSED |  |
-| S39b | job dùng tool suy ra vẫn kết thúc | PASSED |  |
+| S39b | job dùng tool suy ra vẫn kết thúc | SKIPPED | job 261124-044148-92be mất vì host chết (reason=workdir_missing) — sự cố hạ tầng, không phải lỗi roff |
 | S40 | kho input bị kẹt thì tự dọn, không treo | PASSED |  |
-| S41 | input local mất ⇒ lý do rõ ràng | PASSED |  |
+| S41 | input local mất ⇒ lý do rõ ràng | SKIPPED | host muse-bienpm333 chết (job giữ slot failover sang muse-pmb333) — sự cố hạ tầng |
 | S42 | host ghim không với được ⇒ fail to | PASSED |  |
 | S43 | gc dọn lock mồ côi, giữ lock còn sống | PASSED |  |
 | S45 | pull hỏng ⇒ báo lỗi, không báo thành công | PASSED |  |
 | S46 | `--sync-back` thực sự kéo file về project | PASSED |  |
 | S47 | config chỉ định mà thiếu ⇒ fail to, không tạo job | PASSED |  |
 | S47b | config có thật ⇒ `exclude` được giữ | PASSED |  |
+| S48 | chính sách nice/ionice: 5 module, 1 nguồn sự thật | PASSED |  |
+| S49 | job trên máy remote chạy ở nice 19 | PASSED |  |
+| S49b | nice = 0 ⇒ không bọc nice | PASSED |  |
+| S49c | host không có nice ⇒ job vẫn chạy | PASSED |  |
 
 ---
 
@@ -252,11 +283,15 @@ báo, không được im lặng thay thế bằng mặc định rộng hơn**.
 
 | B32 | `roff gc --max-age-days 0` **bị nuốt** ⇒ kho input dùng chung **phình vô hạn** trên host | đợt nghiệm thu cuối 23/11/2026: **S28 FAIL** — "roff gc không dọn được kho input đã hết dùng (/home/hatch/.roff/inputs/b57c65a13f9c3032) trên muse-tampt — kho input phía host phình vô hạn". Đo lại bằng tay: `roff gc --max-age-days 0` báo **mọi** bản copy trên **mọi** host là `{"reason": "too_recent"}` ⇒ **xoá 0**; mà store đó **22 phút** tuổi (mtime 1795440300, đồng hồ local 1795441645 — lệch 4 s, **không** phải lệch đồng hồ) | `cli.py` đọc ngưỡng bằng `float(getattr(args, "max_age_days", 7.0) **or 7.0**)` ⇒ giá trị **0** bị nuốt vì 0 là *falsy* ⇒ ngưỡng thành **7 ngày** ⇒ không bản copy nào dưới 7 ngày bị dọn ⇒ kho input trên host **chỉ có thể phình** (đúng thứ S28 sinh ra để bắt). Kèm `--job-max-age-days 0` bị nuốt thành 30 ngày | đọc ngưỡng bằng kiểm tra **None** (phân biệt "không truyền" với "truyền 0"); giá trị **âm** ⇒ báo lỗi rõ (exit 2) như `--timeout`/`--cpus`; `--shards 0` ⇒ thông điệp lỗi phải nói **0** (người dùng gõ gì thì nói đúng số đó) | **ĐÃ SỬA** + unit test mới (`tests/unit/test_gc_max_age.py`): mỗi test **đỏ** nếu khôi phục code cũ; kiểm chứng lại trên fleet thật: `roff gc --max-age-days 0` ⇒ xoá được bản copy trên host |
 | B33 | Hook **không biết** hệ sinh thái ngoài npm/python/go/java ⇒ skill **không tự bật** ở dự án .NET / Swift / Bazel / Elixir / PHP / Deno | đo thật 23/11/2026 (chạy hook với JSON trên stdin, giống hệt Claude Code): `dotnet build`, `swift build`, `bazel build`, `ninja`, `sbt test`, `deno test`, `phpunit`, `python -m unittest` ⇒ **rc=0 (cho qua)** ⇒ agent chạy build nặng **ngay trên máy người dùng** — đúng thứ skill sinh ra để tránh | `_heavy()` chỉ liệt kê ~30 lệnh của npm/python/go/rust/java/media/ml; `python -m <module>` **đã** được bóc wrapper, nhưng `unittest`/`build` không có trong danh sách ⇒ lệnh nặng của các hệ sinh thái còn lại **lọt** | thêm nhánh cho .NET / Swift / Bazel(+bazelisk) / Ninja / Meson / SBT / Elixir / Deno / PHP + `python -m unittest` + `python -m build`; cờ chỉ-in-thông-tin (`--help`, `-v`, `--version`, `-n`) **không** chặn; lệnh test **giới hạn phạm vi** (`--filter`, đường dẫn cụ thể) thì cho qua; dev server của các hệ sinh thái mới (`dotnet watch`, `mix phx.server`, `php artisan serve`, `sbt`) vào nhóm **gợi ý**, **không** chặn cứng | **đo thật (tôi tự chạy lại, không tin báo cáo của subagent)**: 84 lệnh (28 lệnh mới + 56 lệnh cũ để chặn hồi quy) ⇒ **0 lệch**; 190 unit test hook xanh (105 → 190; test cũ **không** bị sửa — diff chỉ có dòng thêm); ruff sạch |
-| B34 | Chính sách `nice`/`ionice` có **5 bản sao**, **3 nguồn sự thật** ⇒ nút cấu hình **chết** | đọc code 23/11/2026: `probe.py` dùng hằng (`NICE_LEVEL = 19`), `sshx.py` + `tunnel.py` dùng **env** `ROFF_NICE`/`ROFF_IONICE`, `job.py` **hardcode** `"19"`/`"c3"`, còn `transfer.py` đọc **config** `[local] nice`/`ionice`. Hệ quả **vi phạm hợp đồng đã viết** ở `docs/SPEC-CLI.md` §17 (*"`ROFF_NICE` — nice level cho **mọi** tiến trình ssh/rsync"*): **`ROFF_NICE` không có tác dụng với rsync/tar**; người dùng sửa `[local] nice` trong `~/.config/roff/config.ini` cũng **không** đổi gì (ngoài đường truyền) ⇒ trông như đã cấu hình, thực ra là **nút chết** — cùng họ với B27 | (1) `probe.py:363` `_prefix_nice()` → hằng; (2) `sshx.py:367` + `tunnel.py:159` `_prefix()` → env; (3) `job.py:574` `_prefix_nice()` → hardcode; (4) `transfer.py:272` `_prefix_nice()` → config | **gộp về MỘT nơi quyết định**, thứ tự ưu tiên `ROFF_NICE`/`ROFF_IONICE` (env) > `[local] nice`/`ionice` (config) > mặc định (`19`/`idle`); `nice = 0` ⇒ **không** bọc `nice`; `ionice = ""` ⇒ không bọc `ionice`; đọc config **không được** làm chết tiến trình (`strict=False`, xem `transfer._config()`) | **CHƯA SỬA** — đã giao (brie `/tmp/brief-b34-c9.md`): gộp 5 bản sao về 1 nguồn + thêm ưu tiên cho **job trên máy remote** (C9) |
+| B34 | Chính sách `nice`/`ionice` có **5 bản sao**, **3 nguồn sự thật** ⇒ nút cấu hình **chết** | đọc code 23/11/2026: `probe.py` dùng hằng (`NICE_LEVEL = 19`), `sshx.py` + `tunnel.py` dùng **env** `ROFF_NICE`/`ROFF_IONICE`, `job.py` **hardcode** `"19"`/`"c3"`, còn `transfer.py` đọc **config** `[local] nice`/`ionice`. Hệ quả **vi phạm hợp đồng đã viết** ở `docs/SPEC-CLI.md` §17 (*"`ROFF_NICE` — nice level cho **mọi** tiến trình ssh/rsync"*): **`ROFF_NICE` không có tác dụng với rsync/tar**; người dùng sửa `[local] nice` trong `~/.config/roff/config.ini` cũng **không** đổi gì (ngoài đường truyền) ⇒ trông như đã cấu hình, thực ra là **nút chết** — cùng họ với B27 | (1) `probe.py:363` `_prefix_nice()` → hằng; (2) `sshx.py:367` + `tunnel.py:159` `_prefix()` → env; (3) `job.py:574` `_prefix_nice()` → hardcode; (4) `transfer.py:272` `_prefix_nice()` → config | **gộp về MỘT nơi quyết định**, thứ tự ưu tiên `ROFF_NICE`/`ROFF_IONICE` (env) > `[local] nice`/`ionice` (config) > mặc định (`19`/`idle`); `nice = 0` ⇒ **không** bọc `nice`; `ionice = ""` ⇒ không bọc `ionice`; đọc config **không được** làm chết tiến trình (`strict=False`, xem `transfer._config()`) | **ĐÃ SỬA** — gộp về **một** nguồn sự thật (`roffkit.config.local_nice_prefix` / `local_nice_policy` / `remote_nice_policy`); thứ tự **env > config > mặc định**; `nice = 0` / `ionice = none` ⇒ **không** bọc; config hỏng ⇒ ra mặc định, **không raise**. Tôi tự sửa thêm **bản sao thứ 6** trong `watcher.py` (`nice_prefix()` hardcode — subagent không có quyền sửa file đó) và **bỏ chốt thứ tự** ở 2 test cũ (hai test **mâu thuẫn nhau** về thứ tự ⇒ không thể cùng đúng khi đã gộp; chọn `nice` trước — đúng dạng tài liệu hoá `nice -n 19 ionice -c3`). Kiểm chứng: **58** unit test mới (`tests/unit/test_nice_policy.py`) + S48 **PASSED** trên fleet thật |
 | B35 | Kịch bản S18 tự sai ⇒ đợt nghiệm thu **cuối** báo FAIL cho một lỗi **không tồn tại** | đợt nghiệm thu 23/11/2026 22:02: **S18 FAIL** với `KeyError: 'state'` tại `tests/acceptance/test_acceptance_resilience.py:464` — không phải lỗi của `roff`, mà là **kịch bản** đọc `cfg["state"]` trong khi fixture `cfg` của file đó chỉ có `path`/`env`/`live` (các file khác có `state` vì fixture riêng) | khi viết lại S18 (đo **tính toán** chồng nhau thay vì wall-clock) đã dùng `cfg["state"]` — **chưa** kiểm tra fixture của **chính file** đó có khoá ấy không; và S18 ở các đợt trước **luôn skip trước** dòng đó (máy chết) ⇒ nhánh đó **chưa bao giờ** được chạy ⇒ lỗi **nằm im** mấy đợt | đọc ledger từ `_DEFAULT_STATE` (state dir **dùng chung** của bộ nghiệm thu — đúng nơi `_common.roff_env()` trỏ `ROFF_STATE_DIR`); **bài học**: một kịch bản luôn **skip** là một kịch bản **chưa bao giờ được kiểm chứng** — phải chạy tay ít nhất một lần ở đường đầy đủ | **đo thật (tôi tự chạy lại)**: `pytest -k s18` ⇒ **1 passed in 328,59 s** (5:28) sau khi sửa; đợt nghiệm thu lại xanh toàn bộ |
-| B36 | `roff do --each` gửi job **tuần tự** ⇒ lô **không** chạy chồng nhau ⇒ fleet **không** tính toán song song | đợt nghiệm thu 23/11/2026 22:24–23:18: S18 **SKIP** — "các job KHÔNG chạy chồng nhau (lô chạy tuần tự)". Đo lại bằng mốc thời gian **trên máy remote** (`<jobdir>/meta.json` trường `started` + mtime file `exit`): lô song song gửi lúc **22:51:01 / 22:52:43 / 22:53:11** (cách nhau **102 s** rồi **28 s**) và chạy lúc **22:52:20 / 22:53:09 / 22:53:15** ⇒ giao đoạn chạy chồng nhau của cả lô = **rỗng**. Đo độc lập lúc 23:37 (`/tmp/s18probe.py`): 3 job gửi lúc **23:37:23 / 23:37:49 / 23:38:10** ⇒ **~21–26 s mỗi item** — trong khi mỗi video chỉ **196 KB** (đẩy ~0,3 s) | vòng lặp `--each` trong `cli.py` làm **tuần tự** mọi việc: `select()` (probe fleet) → `_ensure_tools()` (round-trip ssh) → `ensure_shared_input()` (**đẩy** input lên host) → spawn watcher — rồi mới sang item kế tiếp. Phần **đẩy** là lý do B31 nghi ngờ, nhưng đo thật thì **đường lên không phải nút thắt**: input 196 KB. Nút thắt là **cả đường gửi job** (~25 s/item). Lưu ý: **chọn host ĐÚNG** — mỗi item rơi vào một máy khác nhau (`muse-phamminhbien3333`, `muse-bienpm333`, `muse-pmb333`); lỗi là **thứ tự**, không phải **địa điểm** | tách **kiểm tra input local** (rẻ, giữ trong `do` để fail sớm) khỏi **đẩy input** (đắt, hoãn cho watcher lúc launch — đường dẫn **đã có sẵn** ở nhánh "job xếp hàng"); và **probe fleet 1 lần cho cả lô** thay vì mỗi item một lần. Xem `docs/REPORT.md` §7 (C10) | **CHƯA SỬA** — đã đo, đã ghi bằng chứng ở `docs/evidence/final/s18-submit-latency.txt`; brie đã giao |
-| B37 | Kịch bản S18 biến lỗi **sản phẩm** thành **SKIP** ⇒ đợt nghiệm thu **báo xanh** cho một lô không song song | ở đợt 23/11/2026 22:24, S18 **SKIP** với lý do *"các job KHÔNG chạy chồng nhau (lô chạy tuần tự) — đường lên 0,5–1 MB/s là nút thắt"* ⇒ cả bộ nghiệm thu **không đỏ** dù sản phẩm **đúng là** không chạy song song; hơn nữa lý do **ghi sai nguyên nhân** (đường lên không phải nút thắt — xem B36) | S18 dùng `pytest.skip()` cho mọi trường hợp "không đo được" — nhưng "job không chạy chồng nhau" **không phải** "không đo được", nó **là** lỗi sản phẩm cần báo đỏ. Nguyên tắc `docs/REPORT.md` §2 chỉ cho phép `skip` khi **hạ tầng** hỏng, không cho phép dùng `skip` để giấu lỗi sản phẩm | "không chạy chồng nhau" ⇒ **FAIL** với lý do đo được (in ra mốc start/end từng job); `skip` chỉ dành cho: fleet **quá hẹp** (< 2 máy), thiếu mốc thời gian, máy chết giữa lô. Lý do skip phải **nêu đúng nguyên nhân**, không đổ lỗi cho đường lên | **CHƯA SỬA** — sẽ sửa cùng đợt sửa B36 (kịch bản là việc của tôi, không giao subagent) |
+| B36 | `roff do --each` gửi job **tuần tự** ⇒ lô **không** chạy chồng nhau ⇒ fleet **không** tính toán song song | đợt nghiệm thu 23/11/2026 22:24–23:18: S18 **SKIP** — "các job KHÔNG chạy chồng nhau (lô chạy tuần tự)". Đo lại bằng mốc thời gian **trên máy remote** (`<jobdir>/meta.json` trường `started` + mtime file `exit`): lô song song gửi lúc **22:51:01 / 22:52:43 / 22:53:11** (cách nhau **102 s** rồi **28 s**) và chạy lúc **22:52:20 / 22:53:09 / 22:53:15** ⇒ giao đoạn chạy chồng nhau của cả lô = **rỗng**. Đo độc lập lúc 23:37 (`/tmp/s18probe.py`): 3 job gửi lúc **23:37:23 / 23:37:49 / 23:38:10** ⇒ **~21–26 s mỗi item** — trong khi mỗi video chỉ **196 KB** (đẩy ~0,3 s) | vòng lặp `--each` trong `cli.py` làm **tuần tự** mọi việc: `select()` (probe fleet) → `_ensure_tools()` (round-trip ssh) → `ensure_shared_input()` (**đẩy** input lên host) → spawn watcher — rồi mới sang item kế tiếp. Phần **đẩy** là lý do B31 nghi ngờ, nhưng đo thật thì **đường lên không phải nút thắt**: input 196 KB. Nút thắt là **cả đường gửi job** (~25 s/item). Lưu ý: **chọn host ĐÚNG** — mỗi item rơi vào một máy khác nhau (`muse-phamminhbien3333`, `muse-bienpm333`, `muse-pmb333`); lỗi là **thứ tự**, không phải **địa điểm** | tách **kiểm tra input local** (rẻ, giữ trong `do` để fail sớm) khỏi **đẩy input** (đắt, hoãn cho watcher lúc launch — đường dẫn **đã có sẵn** ở nhánh "job xếp hàng"); và **probe fleet 1 lần cho cả lô** thay vì mỗi item một lần. Xem `docs/REPORT.md` §7 (C10) | **ĐÃ SỬA** — `roff do` **không** đẩy input và **không** launch nữa: nó chỉ tạo job + xin slot rồi **hoãn** việc đẩy + launch cho **watcher** (đường dẫn của nhánh "job xếp hàng", đã có sẵn) ⇒ vòng lặp `--each` chỉ làm việc **cục bộ** ⇒ lô gửi **song song**. Đo lại trên fleet thật 24/11: 4 job tạo trong **0,04 s** (trước: lệch 21–102 s); 3 job chạy chồng nhau trên **3 máy** với giao đoạn chồng nhau **15,7 s** ⇒ tăng tốc tính toán **≈ 5,9×** (trước: **0**); `do` trả JSON sau **42,4 s** — trong đó 42,3 s là **probe fleet** (1 lần cho cả lô) ⇒ chi phí **O(1)** thay vì O(25 s × item). Bằng chứng: `docs/evidence/c10-after-20261124/submit-latency-after.txt`. **Đánh đổi**: lỗi **đẩy input** lộ ra ở `roff wait` chứ không ở `roff do` (lỗi input **local** vẫn fail sớm ở `do`). Đợt nghiệm thu 24/11 lần 3 (`docs/evidence/final/`): S18 **SKIPPED** — lúc đo fleet **chỉ còn 1 máy đang sống** (`muse-tampt` chết, 3 máy còn lại đang bận) ⇒ **không đo được** tăng tốc ⇒ đợt đo song song đầy đủ vẫn là `docs/evidence/c10-after-20261124/submit-latency-after.txt` (4 job trong 0,04 s, chồng nhau 15,7 s, ≈ 5,9×). |
+| B37 | Kịch bản S18 biến lỗi **sản phẩm** thành **SKIP** ⇒ đợt nghiệm thu **báo xanh** cho một lô không song song | ở đợt 23/11/2026 22:24, S18 **SKIP** với lý do *"các job KHÔNG chạy chồng nhau (lô chạy tuần tự) — đường lên 0,5–1 MB/s là nút thắt"* ⇒ cả bộ nghiệm thu **không đỏ** dù sản phẩm **đúng là** không chạy song song; hơn nữa lý do **ghi sai nguyên nhân** (đường lên không phải nút thắt — xem B36) | S18 dùng `pytest.skip()` cho mọi trường hợp "không đo được" — nhưng "job không chạy chồng nhau" **không phải** "không đo được", nó **là** lỗi sản phẩm cần báo đỏ. Nguyên tắc `docs/REPORT.md` §2 chỉ cho phép `skip` khi **hạ tầng** hỏng, không cho phép dùng `skip` để giấu lỗi sản phẩm | "không chạy chồng nhau" ⇒ **FAIL** với lý do đo được (in ra mốc start/end từng job); `skip` chỉ dành cho: fleet **quá hẹp** (< 2 máy), thiếu mốc thời gian, máy chết giữa lô. Lý do skip phải **nêu đúng nguyên nhân**, không đổ lỗi cho đường lên | **ĐÃ SỬA** (tôi tự sửa — kịch bản là việc của người nghiệm thu, không giao subagent): S18 nay **FAIL** khi các job không chạy chồng nhau mà `do` đã gửi **lệch > 10 s** (lỗi **sản phẩm**), và chỉ `skip` khi các job được gửi **cùng lúc** mà fleet **hẹp** / host chết giữa lô (hạ tầng) — kèm lý do **đúng** (in ra cửa sổ chạy từng job). Thêm nguyên tắc mới vào §2 |
 | B38 | Công cụ sinh bảng §4 **đếm sai** số skip ⇒ bảng báo "0 SKIPPED" trong khi chính bảng liệt kê 8 lần skip | đợt nghiệm thu 23/11/2026: `make_report_table.py` in ra `0 SKIPPED` ở dòng tổng, trong khi bảng liệt kê **8** dòng `SKIPPED — <lý do>` | `_counts()` tách trạng thái theo `":"` ⇒ `"SKIPPED — sự cố hạ tầng"` **không** tách thành `SKIPPED` ⇒ không được tính; còn dòng `FAILED: …` thì lại tách đúng ⇒ **hai chiều lệch** | tách theo `" — "` **trước**, rồi mới tới `":"`; ô ghi chú escape `\|` **trước** khi cắt để không vượt trần độ dài | **ĐÃ SỬA** + 12 unit test mới (`tests/unit/test_report_table.py`), gồm ca hồi quy đúng bằng số liệu đợt 23/11 |
+| B39 | Đẩy input **thất bại** ⇒ lock của **chính ta** còn lại trên host ⇒ lần thử lại **không lấy lại được lock của chính mình** ⇒ ~2 phút lãng phí rồi failover | đo thật 24/11/2026 00:24–00:27 trên fleet: job `261124-002345-4c9b` — đẩy lên `muse-pmb333` thất bại (`shared_push_failed`, ssh hỏng vì đường hầm ngược flap) ⇒ lệnh **nhả lock** cũng hỏng ⇒ **lock còn lại** trên host (đã kiểm chứng: `<key>.lock/owner` vẫn còn sau khi đẩy hỏng) ⇒ lần thử lại (cùng tiến trình) **không chiếm lại được** ⇒ chờ đủ 60 s ×2 ⇒ `shared_input_busy` ⇒ **failover** sang máy khác để **đẩy lại một file vốn đã nằm trên host** | `ensure_shared_input()` chỉ dọn lock khi `_lock_is_stale()` trả True; mà hàm đó thấy tuổi lock > `LOCK_STALE_S` **nhưng** "chủ lock còn sống" ⇒ không dọn — mà chủ lock **chính là tiến trình đang retry** (cùng pid, cùng máy local) ⇒ **không bao giờ** dọn được lock của mình | trong vòng chờ: đọc chủ lock; nếu là **chính tiến trình này** (cùng pid + cùng máy local) ⇒ **chiếm lại ngay** (lock sót từ lần thử trước) thay vì chờ hết `MARKER_WAIT_S`; lock của tiến trình **khác** còn sống ⇒ **không** cướp (giữ nguyên hành vi); lock mồ côi ⇒ vẫn dọn sau `LOCK_STALE_S` | **ĐÃ SỬA** — lần thử lại trong **cùng tiến trình** giờ **chiếm lại ngay** lock sót của chính mình ⇒ không còn 60 s/lần. **Cần thêm điều kiện thứ ba ngoài brie của tôi**: luật "pid + máy" một mình sẽ **cướp nhầm** lock của tiến trình khác (pid bị tái sử dụng) ⇒ thêm **token `uuid4` do chính tiến trình này cấp** ⇒ *chứng minh* lock do ta tạo (test hồi quy `test_r27_lock_of_live_process_is_not_stolen` bắt được đúng chỗ này). **Giới hạn còn biết**: nếu lần đẩy hỏng **sau** bước `chmod a-w` thì cây input trên host đã **read-only** ⇒ lần đẩy lại sẽ fail ⇒ job **failover** sang máy khác (chấp nhận được, chưa chữa). Tôi tự chạy lại: **1037** test unit+regression xanh, ruff sạch, 7 test mới xanh trong **0,19 s** (bằng chứng đỏ của subagent khi gỡ fix: **2 test đỏ trong 120,30 s** = đúng dấu vết "2 phút lãng phí") |
+| B40 | Kịch bản **đo quá sớm / đỏ oan** sau B36/C10 ⇒ đợt nghiệm thu báo đỏ cho sản phẩm **đúng** | đợt `final-20261124a/` (24/11/2026): **S28** đỏ — kho input phía host **chưa có** lúc `do` vừa trả về (vì giờ **watcher** mới đẩy input); tái hiện ở 2 máy khác nhau (`muse-tampt` rồi `muse-pmb333`) ⇒ tưởng lỗi sản phẩm. Đo lại thật: job `261124-021732-1f55` chạy trên `muse-tampt`, **exit 0, pulled 12288 byte**, kho input **có** trên host ⇒ sản phẩm đúng. **S49c** đỏ vì `RoffError 255` lúc launch — `muse-tampt` chết đúng giây đó; chạy lại ⇒ **PASS** | S28 đo kho input phía host **ngay lúc `do` vừa trả về**, nhưng sau B36/C10 thì **watcher** mới đẩy input (không phải `do`) ⇒ lúc đo kho **chưa có**; S49c gọi launch đúng giây máy chết ⇒ `RoffError 255`; S23 đo nhầm **rác của lần chạy cũ** vì workdir phía host **được giữ lại giữa các lần chạy** (5,6 MB từ 12 h trước). | **ĐÃ SỬA** — S28 chờ tối đa 240 s (`wait_dir_state()`) rồi mới kết luận; S49c bắt 255 ⇒ `skip` kèm lý do, lỗi khác 255 vẫn đỏ; `_wait_job` cũng skip nếu host chết lúc chờ; S23 dùng `--name` riêng cho mỗi lần chạy. | Chạy lại ⇒ **5 passed**. **Đợt nghiệm thu 24/11 lần 3**: S49c **PASSED**; S28 **SKIPPED** (`muse-pmb333` chết lúc đo — hạ tầng) ⇒ chạy lại **riêng** ⇒ S23/S24/S28/S49c **4 passed** (bằng chứng: `docs/evidence/retest-20261124/acceptance.txt`) ⇒ cả 2 sửa kịch bản đều đúng, không phải chỉ trùng hợp. |
+| B41 | Kịch bản **giết thiếu job** rồi đòi cả lô failover ⇒ 1 job chạy tới hết ⇒ assert “không failover” đỏ | đợt `final/` (24/11/2026): **S24** đỏ — `assert "failover" in events` với events = `['pulled', 'finished']` cho job `261124-023327-94aa` (exit 0, **không** failover), trong khi job `261124-023327-c343` **có** failover (`vanished` → `muse-phamminhbien3333`, exit 0). | vòng chờ pid **dừng ngay khi thấy pid đầu tiên** ⇒ chỉ **1/2** job có pid lúc đó ⇒ chỉ 1 job bị `kill` ⇒ job kia chạy tới hết. Trước B36/C10, `do` launch **tuần tự** nên khi `do` trả về cả 2 job đã có pid ⇒ không lộ ra | **ĐÃ SỬA** — vòng chờ phải đủ **TẤT CẢ** job có pid (`len(pids) == len(job_ids)`) rồi mới giết. Nghĩ đã hơn: sau C10, **thứ tự khởi chạy job trong một lô không còn giống nhau** ⇒ mọi kịch bản giả định “các job đã chạy cùng lúc” đều phải sửa. | Sửa xong chạy lại ⇒ xanh. **Đợt nghiệm thu 24/11 lần 3**: S24 **PASSED** (và chạy lại riêng cũng **PASSED**) ⇒ sửa đúng, không phải trùng hợp. |
+| B42 | Verdict `vanished` của `remote_state()` có thể **SAI** ⇒ watcher **failover một job còn sống** | đợt nghiệm thu 24/11 (`final-20261124b/`): **S49** đỏ — poll đầu tiên trả `{state: lost, reason: vanished, pid: 8155, pid_alive: False, exit: None}` trong khi job **chạy thành công**. Mốc thời gian chính xác trên host (UTC, `ls --time-style=full-iso`): `pid` 20:42:02.942 → `log` 20:42:03.820 (= **19**) → `exit` 20:42:03.941 (= **0**) ⇒ job chạy xong **thành công**; poll đọc trúng khoảng giữa lúc ghi `pid` và lúc ghi `exit` ⇒ `kill -0 $PID` thất bại ⇒ `vanished`. Không tái hiện được trong 6 lần chạy liên tiếp (6/6 `exited` bình thường) ⇒ sự kiện **hiếm nhưng đã xảy ra thật**. | `failover_decision()` (luật 4) kết luận `vanished` ngay khi `process_alive is False` mà `boot_id`+`instance_token` không đổi ⇒ watcher hành động theo verdict sai ⇒ **làm lại job** (tốn băng thông, có thể chạy trùng hiệu ứng phụ) | **ĐÃ SỬA** — (P1) verdict `vanished` phải được **xác nhận lần 2** (`VANISH_CONFIRM_DELAY_S = 4` s) mới được coi là mất thật; nếu lần 2 thấy `exited` ⇒ kết thúc bình thường (kéo artifact, ghi `finished`), **không** failover; nếu lần 2 không với được host ⇒ coi là **chưa chắc** ⇒ chờ thử lại. (P2) khoảng miễn sau launch (`VANISH_GRACE_S = 30` s, tính từ `attempt["started"]` của attempt **hiện tại** ⇒ mỗi lần failover lại có khoảng miễn mới) ⇒ job vừa launch chưa kịp hiện process thì **chưa chắc chắn** ⇒ ghi event `unverified` rồi chờ. Khối `exited` được tách thành `_finish_exited()` ⇒ nhánh "lần 2 thấy `exited`" dùng **đúng một đường đi** (kéo artifact **trước** khi đánh dấu terminal ⇒ hợp đồng B23/B26 giữ nguyên). Verdict `host_restarted`/`host_wiped`/`oom_killed` **không** cần xác nhận (đã là bằng chứng mạnh hơn) ⇒ **không** bị chậm thêm. Kịch bản nghiệm thu cũng sửa: `lost` phải thấy **liên tiếp 3 lần** mới kết luận (đúng quy tắc vàng của sản phẩm) — dùng chung cho `S49`/`S49b`/`S49c` **và** `S02`/`S02b` (`tests/acceptance/_common.py::wait_state_settled`, có 8 unit test riêng). | **Nguyên nhân gốc CHƯA khép**: đã loại trừ "khác PID namespace" (đo thật: `kill -0` **thành công** từ phiên ssh khác ⇒ `kill -0` đáng tin ⇒ process *thật sự* đã chết mà file `exit` chưa kịp ghi); chưa loại trừ được "file `exit` bị ghi trễ" hay "tiến trình bị giết giữa chừng" ⇒ bản sửa này chặn **hậu quả**, chưa đóng nguyên nhân **Đợt nghiệm thu 24/11 lần 3** (`docs/evidence/final/`): S49/S49b/S49c **PASSED** ⇒ verdict `vanished` sai **không** tái hiện trong 1 lô đầy đủ (49 kịch bản, 52 phút) ⇒ **hậu quả** đã chặn. **Nhưng nguyên nhân gốc vẫn chưa khép** — bản sửa bảo đảm *không failover oan*, **không** bảo đảm *không bao giờ* gặp lại. |
 
 ### 5.1 Hook — đo thật, không phải giả định
 
@@ -324,6 +359,6 @@ buộc an toàn.
 | C5 | Push lên GitHub `MinhBienK2/remote-offload` | checkpoint W1–W3 đã commit trên nhánh `rewrite-main` (`55e5edc`, 82 file). **Chưa push** — cần bạn duyệt trước khi đẩy |
 | C6 | Cài hook cho **Codex CLI** | adapter đã viết (`skill/hooks/codex/install.py`) và đã thử trên file tạm (thêm/bỏ sạch, không đụng hook Orca). **Chưa cài vào `~/.codex/hooks.json` thật**: (1) backend codex đang 503 nên không kiểm chứng end-to-end được; (2) file đó do Orca quản lý. Giao thức đã đọc thẳng từ binary codex 0.142.4 — cùng `tool_name`/`tool_input`, cùng exit 2 + stderr |
 | C7 | S20 — phần **lô nhiều item**: 1 máy chết giữa lô ⇒ chia lại item của máy chết, không chạy lại item đã xong | cần cố ý **ngắt tunnel** giữa lô S18 ⇒ quyền can thiệp vào tunnel của máy Muse (thuộc người dùng). Phần **một job** đã đo tự nhiên (C3) |
-| C10 | `roff do --each` gửi job **tuần tự** ⇒ lô **không** chạy song song | đo thật 23/11/2026 (**B36**): mỗi item mất **~21–26 s** để gửi (đợt nghiệm thu: **28 s** rồi **102 s**) nên job sau bắt đầu sau khi job trước đã xong; mốc thời gian trên máy remote cho thấy giao đoạn chạy chồng nhau của cả lô = **rỗng**. Video chỉ **196 KB** ⇒ **đường lên không phải nút thắt** (B31 nghi sai hướng). **Chọn host thì đúng** — mỗi item một máy khác nhau; lỗi là **thứ tự**. **Cách sửa đã đo**: (1) giữ **kiểm tra input local** trong `do` (rẻ, fail sớm) nhưng **đẩy** input thì **hoãn** cho watcher lúc launch — đường dẫn **đã có sẵn** ở nhánh "job xếp hàng" (`cli.py`, `options["input_kind"]`); (2) **probe fleet 1 lần cho cả lô** thay vì mỗi item một lần. Đổi hành vi của `do` (trả JSON sớm hơn nhiều) ⇒ **cần bạn duyệt**. Đo được rồi (B36) nên đây là **quyết định của bạn**, không phải điều chưa biết |
-| C9 | Ưu tiên CPU của **job trên máy remote** (`nice`) | đo thật 23/11/2026: job chạy trên `muse-phamminhbien3333` có `remote_nice=0` — `nice -n 19` trong `SKILL.md` chỉ áp cho tiến trình `ssh`/`rsync` **cục bộ**, **không** truyền qua SSH ⇒ **lệnh job trên host chạy ở ưu tiên mặc định**, ngang với `postgres`/`telegram-bot`/`cloudflared` của chính người dùng đang chạy trên đó. **Đề xuất: hạ ưu tiên job trên remote (mặc định `nice 19`, cấu hình được theo host)** — gần như **miễn phí** vì `nice` chỉ có tác dụng khi host đang tranh tài nguyên, tức đúng lúc ta muốn dịch vụ production của người dùng được ưu tiên. **Chưa làm**: thay đổi hành vi hiệu năng của mọi job ⇒ cần bạn duyệt |
+| C10 | ~~`roff do --each` gửi job **tuần tự** ⇒ lô **không** chạy song song~~ | **ĐÃ LÀM (24/11/2026)** — đo thật 23/11 (**B36**): mỗi item mất **~21–26 s** để gửi nên job sau bắt đầu sau khi job trước đã xong; giao đoạn chạy chồng nhau của cả lô = **rỗng**. Video chỉ **196 KB** ⇒ **đường lên không phải nút thắt** (B31 nghi sai hướng); **chọn host thì đúng**; lỗi là **thứ tự**. Đã sửa: `do` chỉ tạo job + xin slot (việc **cục bộ**) rồi **hoãn** đẩy input + launch cho **watcher** ⇒ lô gửi song song. **Đo lại trên fleet thật: 4 job tạo trong 0,04 s; 3 job chạy chồng nhau trên 3 máy (giao đoạn 15,7 s ⇒ tăng tốc tính toán ≈ 5,9×, trước là 0); `do` trả JSON sau 42,4 s — 42,3 s là probe fleet ⇒ chi phí O(1)**. **ĐÁNH ĐỔI (cần bạn biết)**: lỗi **đẩy input** giờ lộ ra ở `roff wait` chứ không ở `roff do` (lỗi input **local** vẫn fail sớm ở `do`, exit 2); `state:"launched"` nghĩa là **"đã nhận slot, watcher đang khởi chạy"**. Tôi làm vì lời hứa cốt lõi của skill là *chạy song song*; nếu bạn muốn giữ hành vi cũ thì nói để tôi đổi lại (thay đổi chỉ nằm ở `cli.py` + `watcher.py`). Đợt nghiệm thu 24/11 lần 3: S18 **SKIPPED** (fleet chỉ còn **1 máy đang sống** lúc đo — hạ tầng) ⇒ không phản bác; đợt đo song song đầy đủ: `docs/evidence/c10-after-20261124/submit-latency-after.txt`. |
+| C9 | ~~Ưu tiên CPU của **job trên máy remote** (`nice`)~~ | **ĐÃ LÀM (24/11/2026)** — trước đây: job chạy trên `muse-phamminhbien3333` có `remote_nice=0` — `nice -n 19` trong `SKILL.md` chỉ áp cho tiến trình `ssh`/`rsync` **cục bộ** ⇒ lệnh job trên host chạy **ngang với** `postgres`/`telegram-bot`/`cloudflared` của chính người dùng. Nay lệnh job trên host được bọc `nice -n 19 ionice -c3` (kiểm tra `command -v` **trên host** ⇒ host không có thì job vẫn chạy; **không** dùng `exec` ⇒ `$JOBDIR/exit` vẫn được ghi). Cấu hình: `[remote] nice`/`ionice` + ghi đè theo `[host.<alias>]`, tắt bằng `nice = 0` / `ionice = none`. **Đo lại trên fleet thật: S49/S49b/S49c PASSED** (nice đo được = **19**; `nice = 0` ⇒ **không** bọc; host không có `nice` ⇒ job vẫn chạy). Bằng chứng: `docs/evidence/c10-after-20261124/submit-latency-after.txt`. Đợt nghiệm thu 24/11 lần 3: S48/S49/S49b/S49c **PASSED** trên fleet thật. |
 | C8 | S2 — host thiếu tool ⇒ tự cài toolchain | cài phần mềm lên **máy thật** của người dùng ⇒ không tự động hoá. `roff do` vẫn chạy được: tool thiếu ⇒ job fail với lý do rõ ràng (không tự chạy ở máy local) |

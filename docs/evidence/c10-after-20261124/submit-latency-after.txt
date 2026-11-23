@@ -1,0 +1,72 @@
+BẰNG CHỨNG — B36/C10 ĐÃ SỬA: `roff do --each` gửi job SONG SONG
+================================================================================
+Ngày đo: **24/11/2026** (sau khi sửa) · Máy: local (12 core) · Fleet: 4 máy Muse
+Đợt nghiệm thu #2 chạy 23/11 22:24–23:18 (bằng chứng **trước** khi sửa:
+`docs/evidence/final/s18-submit-latency.txt`)
+
+--------------------------------------------------------------------------------
+1. ĐO SAU KHI SỬA — 4 video 196 KB, `--each`, lệnh nặng (lặp 6 lần encode)
+--------------------------------------------------------------------------------
+  `roff do --cmd <nặng> --each '/tmp/s18probe/v*.mp4' --out … --need ffmpeg`
+
+  **Thời điểm TẠO job** (ledger `created_at`) — trước đây cách nhau 21–102 s:
+    261124-002345-4c9b  1795454625.738
+    261124-002345-67ec  1795454625.759
+    261124-002345-48eb  1795454625.768
+    261124-002345-8b89  1795454625.778
+    ⇒ lệch nhau **0,04 s** ⇒ phần **submit lô** là việc **cục bộ** hoàn toàn.
+
+  **Cửa sổ chạy remote** (`meta.json` trường `started` + mtime file `exit`):
+    v1  muse-tampt              1795454642.9 → 1795454666.3  (23,4 s)
+    v2  muse-bienpm333          1795454644.8 → 1795454688.4  (43,6 s)
+    v3  muse-phamminhbien3333   1795454650.6 → 1795454675.4  (24,8 s)
+    ⇒ 3 job trên **3 máy khác nhau**, giao đoạn chạy chồng nhau =
+      [1795454650.6 ; 1795454666.3] = **15,7 s**
+      tổng thời gian chạy remote 91,8 s ÷ 15,7 s ⇒ **tăng tốc tính toán ≈ 5,9×**
+      (3 job, 3 máy) — **trước khi sửa**: 0 (rỗng).
+    v0  muse-phamminhbien3333   1795454850.4 → 1795454875.1  (24,7 s)
+      ⇒ job thứ 4 rơi vào máy đã có 1 job chạy ⇒ **xếp hàng** (đúng slot
+      policy) — nhưng nó **đã lỗi đẩy input 3 lần** trước khi chạy được
+      ⇒ xem **B39** bên dưới.
+
+  **Thời gian `roff do` trả JSON** (2 item, 00:32:40):
+    t0 = 1795455118.29 ; job tạo lúc 1795455160.65/.67 ; `do` trả lúc +42,40 s
+    ⇒ **42,3 s là PROBE FLEET** (1 lần cho cả lô, 4 host qua đường hầm ngược
+      đang flap) ⇒ **0,02 s** cho phần tạo lô.
+    ⇒ chi phí của `do` bây giờ **O(1)** theo số item, **không** phải
+      O(25 s × số item) như trước.
+
+--------------------------------------------------------------------------------
+2. ĐO SAU KHI SỬA — C9 trên fleet thật (`tests/acceptance/test_acceptance_nice_policy.py`)
+--------------------------------------------------------------------------------
+  S48  1 nguồn sự thật cho 5 module              PASSED
+  S49  job trên máy remote chạy ở **nice 19**    PASSED   (trước: nice 0)
+  S49b `[remote] nice = 0` ⇒ **không** bọc nice  PASSED   (nice đo được = 0)
+  S49c host **không có** `nice` ⇒ job vẫn chạy   PASSED
+  (4 passed in 62.45 s, lệnh:
+   `ROFF_LOCAL=1 python3 -m pytest tests/acceptance/test_acceptance_nice_policy.py
+    -v -m acceptance -rfEs --basetemp=/tmp/pytest-roff-nice-accept`)
+
+--------------------------------------------------------------------------------
+3. B39 — lỗi phát hiện **trong lúc** đo (đã giao sửa)
+--------------------------------------------------------------------------------
+Job `261124-002345-4c9b`: đẩy input lên `muse-pmb333` **thất bại** (ssh hỏng —
+đường hầm ngược flap liên tục) ⇒ lệnh **nhả lock** cũng hỏng ⇒ **lock của
+chính tiến trình đó còn lại** trên host ⇒ lần thử lại (cùng tiến trình) **không
+chiếm lại được lock của chính mình** (`_lock_is_stale` thấy "chủ lock còn sống"
+— đúng tiến trình đang retry) ⇒ chờ đủ 60 s mỗi lần ⇒ `shared_input_busy` ×2 ⇒
+**~2 phút 20 giây** lãng phí ⇒ rồi **failover** sang máy khác để **đẩy lại một
+file vốn đã nằm trên host**.
+
+  00:24:23.7  push_failed  shared_push_failed
+  00:25:32.4  push_failed  shared_input_busy   (chờ 60 s)
+  00:26:42.6  push_failed  shared_input_busy   (chờ 60 s)
+  00:26:42.6  input_push_failed ⇒ failover
+  00:27:30    finished (exit 0)
+
+Trên host đã kiểm chứng: `/home/hatch/.roff/inputs/<key>.lock/owner` **còn lại**
+sau khi đẩy hỏng.
+
+⇒ Cần: lần thử lại phải **chiếm lại được lock của chính mình** (cùng pid +
+cùng máy local) thay vì chờ hết `MARKER_WAIT_S`. Lock của tiến trình **khác**
+còn sống thì **không** được cướp.

@@ -9,7 +9,6 @@ Chạy:  pytest tests/acceptance/test_lifecycle_real.py -q -m acceptance
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -18,6 +17,9 @@ REPO = Path(__file__).resolve().parents[2]
 SKILL = REPO / "skill"
 if str(SKILL) not in sys.path:
     sys.path.insert(0, str(SKILL))
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _common as common  # noqa: E402
 
 pytestmark = pytest.mark.acceptance
 
@@ -96,13 +98,7 @@ def test_s02_job_lifecycle_on_real_host(host_and_profile, ledger, tmp_path):
     job_mod.launch(alias, j, env={"ROFF_SMOKE": "1"}, cpus=1, mem_mb=64)
 
     # --- CHỜ KẾT THÚC ---
-    deadline = time.time() + 180
-    state = {}
-    while time.time() < deadline:
-        state = job_mod.remote_state(alias, j, timeout=30)
-        if state.get("state") in ("exited", "lost", "cancelled"):
-            break
-        time.sleep(3)
+    state = common.wait_state_settled(alias, j, timeout=180, poll=3.0)
 
     assert state.get("state") == "exited", f"job không kết thúc bình thường: {state}"
     assert int(state.get("exit", -1)) == 0, f"exit code sai: {state}"
@@ -163,13 +159,7 @@ def test_s02b_job_failure_exit_code_on_real_host(host_and_profile, ledger):
 
     job_mod.launch(alias, j, cpus=1, mem_mb=64)
 
-    deadline = time.time() + 120
-    state = {}
-    while time.time() < deadline:
-        state = job_mod.remote_state(alias, j, timeout=30)
-        if state.get("state") in ("exited", "lost", "cancelled"):
-            break
-        time.sleep(2)
+    state = common.wait_state_settled(alias, j, timeout=120, poll=2.0)
 
     assert state.get("state") == "exited", f"job không kết thúc: {state}"
     assert int(state.get("exit", -1)) == 3, (

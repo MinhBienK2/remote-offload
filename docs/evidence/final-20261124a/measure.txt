@@ -1,0 +1,56 @@
+[đo] chạy lệnh tương tác trước khi có roff (baseline)…
+[đo] gọi roff do…
+[đo] roff do -> rc=0
+{
+  "ok": true,
+  "exit_code": 0,
+  "job": "261124-021253-f8ea",
+  "state": "launched",
+  "host": "muse-phamminhbien3333",
+  "host_reasons": [
+    "project 'remote-offload' đã có sẵn trên host (+40)",
+    "toolchain đã cài sẵn (bin, node) (+10)",
+    "còn 2.0/4 core rảnh (×3 → +5.9)",
+    "RAM khả dụng 890 MB (+8.9)",
+    "layout bền vững (/home/hatch/.roff) (+15)",
+    "máy restart 1 lần trong 24h (-20)"
+  ],
+  "ledger": "/tmp/roff-measure-clo_shfk/state/jobs/261124-021253-f8ea.json",
+  "next": [
+    "roff wait 261124-021253-f8ea --timeout 7200"
+  ],
+  "inferred_needs": []
+}
+[đo] trong lúc job chạy: {
+  "max_cpu_pct_one_core": 3.0,
+  "mean_cpu_pct_one_core": 0.08,
+  "max_rss_mb": 26.8,
+  "iowait_pct": 0.47,
+  "idle_pct": 0.0,
+  "duration_s": 70.5,
+  "leaked_processes": [
+    "1233355 /usr/bin/python3 /home/minhbien/Documents/remote-offload/skill/roff.py __watch 2"
+  ]
+}
+[đo] chạy lệnh tương tác khi roff đang chạy…
+[đo] wait -> rc=0 {"ok": true, "exit_code": 0, "job": "261124-021253-f8ea", "state": "exited", "exit": 0, "host": "muse-phamminhbien3333", "artifacts": [], "pulled": true}
+[đo] chờ tiến trình roff ổn định: 0.0s (0 còn sống)
+{
+  "cpu_pct_max": 3.0,
+  "cpu_pct_mean": 0.08,
+  "cpu_ok": true,
+  "cpu_peak_ok": true,
+  "rss_mb_max": 26.8,
+  "rss_ok": true,
+  "idle_pct_min": 0.0,
+  "iowait_pct_max": 0.5,
+  "leaked": [],
+  "bench_baseline_s": 0.0236,
+  "bench_during_s": 0.0239,
+  "slowdown_pct": 1.3,
+  "slowdown_ok": true,
+  "budget_problems": []
+}
+[đo] KẾT QUẢ: PASS
+
+----- stderr -----

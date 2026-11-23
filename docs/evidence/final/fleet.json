@@ -5,27 +5,16 @@
       "reachable": true,
       "error": null,
       "cores": 4,
-      "mem_available_mb": 837,
-      "disk_free_mb": 143439,
+      "mem_available_mb": 1204,
+      "disk_free_mb": 142225,
       "durable": true,
       "layout_root": "/home/hatch/.roff",
       "internet": true
     },
     {
       "alias": "muse-tampt",
-      "reachable": true,
-      "error": null,
-      "cores": 4,
-      "mem_available_mb": 924,
-      "disk_free_mb": 147071,
-      "durable": true,
-      "layout_root": "/home/hatch/.roff",
-      "internet": false
-    },
-    {
-      "alias": "muse-bienpm333",
       "reachable": false,
-      "error": "timeout",
+      "error": "connection_lost",
       "cores": 0,
       "mem_available_mb": 0,
       "disk_free_mb": 0,
@@ -34,12 +23,23 @@
       "internet": false
     },
     {
+      "alias": "muse-bienpm333",
+      "reachable": true,
+      "error": null,
+      "cores": 4,
+      "mem_available_mb": 1043,
+      "disk_free_mb": 148109,
+      "durable": true,
+      "layout_root": "/home/hatch/.roff",
+      "internet": false
+    },
+    {
       "alias": "muse-phamminhbien3333",
       "reachable": true,
       "error": null,
       "cores": 4,
-      "mem_available_mb": 622,
-      "disk_free_mb": 148218,
+      "mem_available_mb": 606,
+      "disk_free_mb": 147982,
       "durable": true,
       "layout_root": "/home/hatch/.roff",
       "internet": true

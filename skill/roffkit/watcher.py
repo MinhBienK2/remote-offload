@@ -19,7 +19,12 @@ Ngoài ra:
 
 * **không bao giờ** retry khi job tự fail (exit != 0 do job) — bug R20;
 * ``wait_for()`` poll **ledger cục bộ**, không ssh (0 round-trip);
-* watcher là **tiến trình nền**, sống sót khi agent chết (kịch bản S10).
+* watcher là **tiến trình nền**, sống sót khi agent chết (kịch bản S10);
+* verdict ``vanished`` **phải qua 2 lớp bảo vệ** trước khi failover —
+  ``vanished`` là kết luận **mạnh** nhưng **không** phải bằng chứng tuyệt
+  đối (đọc trạng thái đúng lúc process vừa chết ⇒ verdict sai, đo thật
+  24/11/2026): **(P1)** hỏi lại host lần 2, **(P2)** không kết luận trong
+  khoảng miễn ngay sau launch.
 
 Module này **không in ra stdout** (quy tắc chung của roff).
 """
@@ -36,6 +41,7 @@ from typing import Any
 try:  # phần A — fallback tối giểu để test chạy được khi A chưa merge
     from .errors import (
         EXIT_INPUT,
+        EXIT_JOB_FAILED,
         EXIT_NO_WORKDIR,
         EXIT_TIMEOUT,
         EXIT_UNREACHABLE,
@@ -47,10 +53,11 @@ try:  # phần A — fallback tối giểu để test chạy được khi A chư
         REASON_WIPED,
         RoffError,
     )
-except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi A/B merge
+except ImportError:  # pragma: no cover - module chạy đứng riêng (không có package)
     from typing import Any as _Any
 
     EXIT_INPUT = 2
+    EXIT_JOB_FAILED = 1
     EXIT_NO_WORKDIR = 97
     EXIT_TIMEOUT = 124
     EXIT_UNREACHABLE = 255
@@ -79,9 +86,17 @@ except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi A/B
 
 
 try:
-    from .config import Config
-except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi A/B merge
+    from .config import Config, local_nice_prefix
+except ImportError:  # pragma: no cover - module chạy đứng riêng (không có package)
     from dataclasses import dataclass as _dataclass
+
+    def local_nice_prefix() -> list[str]:  # type: ignore[no-redef]
+        """Fallback tối thiểu — xem :func:`roffkit.config.local_nice_prefix`.
+
+        Module chạy **đứng riêng** ⇒ không có ``config.py`` ⇒ không có
+        chính sách nice/ionice ⇒ không bọc.
+        """
+        return []
 
     @_dataclass
     class Config:  # type: ignore[no-redef]
@@ -93,7 +108,7 @@ except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi A/B
 
 try:
     from .fleet import env_fleet_aliases
-except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi A/B merge
+except ImportError:  # pragma: no cover - module chạy đứng riêng (không có package)
     def env_fleet_aliases(cfg: Any) -> list[str]:  # type: ignore[misc]
         """Bản sao tối giểu (chưa có phần A)."""
         return []
@@ -101,7 +116,7 @@ except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi A/B
 
 try:
     from .probe import cached_profiles
-except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi A/B merge
+except ImportError:  # pragma: no cover - module chạy đứng riêng (không có package)
     def cached_profiles(aliases: list[str], cfg: Any) -> list[Any]:  # type: ignore[misc]
         """Bản sao tối thiểu (chưa có phần B)."""
         return []
@@ -109,7 +124,7 @@ except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi A/B
 
 try:
     from .policy import Need, select
-except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi A/B merge
+except ImportError:  # pragma: no cover - module chạy đứng riêng (không có package)
     from dataclasses import dataclass as _dataclass
     from dataclasses import field as _field
 
@@ -163,6 +178,8 @@ __all__ = [
     "job_events",
     "record_event",
     "REASON_INPUT_PUSH_FAILED",
+    "VANISH_CONFIRM_DELAY_S",
+    "VANISH_GRACE_S",
 ]
 
 
@@ -241,6 +258,29 @@ DEFAULT_PULL_RETRIES = 3
 #:
 #: Cấu hình qua biến môi trường ``ROFF_PULL_RETRY_DELAY_S``.
 DEFAULT_PULL_RETRY_DELAY_S = 5.0
+
+#: Khoảng chờ (giây) **trước** khi hỏi lại host lần 2 để xác nhận ``vanished``.
+#:
+#: ``vanished`` là kết luận **mạnh** (host còn sống, ``boot_id`` +
+#: ``instance_token`` không đổi, nhưng không còn process) — nhưng nó **KHÔNG**
+#: phải bằng chứng tuyệt đối: đọc trạng thái đúng lúc process **vừa chết**
+#: (``kill -0`` thất bại trong khi file ``exit`` **chưa kịp** ghi) thì verdict
+#: **sai** (đo thật 24/11/2026 trên fleet Muse: job chạy thành công, exit 0,
+#: nice 19 — nhưng poll báo ``vanished``).
+#:
+#: ⇒ Hỏi lại host **một lần nữa** sau khoảng ngắn; lần hỏi thứ hai vẫn thấy
+#: vậy mới coi là mất thật. Lần hỏi thứ hai thấy ``exited`` ⇒ job đã xong
+#: bình thường ⇒ xử lý như ``exited`` (kéo artifact, ghi ``finished``).
+VANISH_CONFIRM_DELAY_S = 4.0
+
+#: Khoảng miễn (giây) kể từ lúc launch mà **KHÔNG** được kết luận ``vanished``.
+#:
+#: Độ trễ ssh trên host Muse đo được 4–6 s ⇒ job **vừa launch** có thể chưa
+#: hiện process trên host ⇒ thấy "không còn process" ngay sau launch **không**
+#: đủ bằng chứng. Trong khoảng này, thấy process không còn ⇒ coi là **chưa
+#: chắc chắn** (đúng quy tắc vàng: ghi event ``unverified`` rồi chờ thử lại),
+#: **không** failover.
+VANISH_GRACE_S = 30.0
 
 
 # --------------------------------------------------------------------------
@@ -494,6 +534,126 @@ def _loss_reason(job: Job, state: dict) -> str | None:
     return state.get("reason")
 
 
+def _vanish_grace_remaining(job: Job) -> float:
+    """Số giây còn lại của **khoảng miễn** ``vanished`` (tính từ lúc launch).
+
+    Khoảng miễn tính từ ``attempt["started"]`` của attempt **hiện tại** ⇒
+    sau mỗi lần failover lại có khoảng miễn mới (attempt mới có ``started``
+    mới).
+
+    Trả ``0.0`` khi attempt không ghi ``started`` (job định dạng cũ) ⇒ **không**
+    có khoảng miễn, nhưng vẫn phải qua bước xác nhận lần 2 (P1).
+
+    Args:
+        job: job đang theo dõi.
+
+    Returns:
+        Số giây còn lại (``0.0`` = hết khoảng miễn).
+    """
+    attempt = job.last_attempt() or {}
+    try:
+        started = float(attempt.get("started") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if started <= 0.0:
+        return 0.0
+    elapsed = time.time() - started
+    if elapsed < 0.0:
+        # Đồng hồ lệch ⇒ coi như vừa launch (an toàn: chờ, đừng failover).
+        return VANISH_GRACE_S
+    return max(0.0, VANISH_GRACE_S - elapsed)
+
+
+def _confirm_vanished(job: Job, job_id: str, state: dict) -> dict:
+    """Hỏi lại host **lần 2** để xác nhận ``vanished`` (P1).
+
+    ``vanished`` **không** phải bằng chứng tuyệt đối: đọc trạng thái đúng lúc
+    process vừa chết (``kill -0`` thất bại trong khi file ``exit`` chưa kịp
+    ghi) thì verdict **sai** ⇒ failover một job **còn sống** (làm lại job, tốn
+    băng thông, có thể chạy trùng hiệu ứng phụ).
+
+    ⇒ Chỉ coi là mất thật khi lần hỏi thứ hai **vẫn** thấy process không còn
+    (và không có exit file). Lần hỏi thứ hai thấy ``exited`` ⇒ job đã xong
+    bình thường ⇒ xử lý như ``exited`` (**không** failover).
+
+    Verdict mạnh hơn (``host_restarted`` / ``host_wiped`` / ``oom_killed``)
+    **không** đi qua hàm này ⇒ không làm chậm những case đó.
+
+    Args:
+        job: job đang theo dõi.
+        job_id: id job (để ghi event).
+        state: trạng thái lần 1 (đã kết luận ``vanished``).
+
+    Returns:
+        dict trạng thái lần 2. Hỏi lại **không được** ⇒ dict
+        ``reachable=False`` ⇒ coi như **chưa chắc** (quy tắc vàng: mất kết
+        nối KHÔNG đồng nghĩa job chết).
+    """
+    _record_event(
+        job_id,
+        "vanish_confirm",
+        host=job.host,
+        delay_s=VANISH_CONFIRM_DELAY_S,
+        pid=state.get("pid"),
+    )
+    _sleep(VANISH_CONFIRM_DELAY_S)
+    try:
+        again = remote_state(job.host, job, timeout=REMOTE_TIMEOUT)
+    except Exception as exc:  # pragma: no cover - lỗi mạng
+        _record_event(job_id, "vanish_confirm_failed", host=job.host, detail=str(exc))
+        return {"reachable": False, "state": "unreachable", "reason": None}
+    if not isinstance(again, dict):
+        return {"reachable": False, "state": "unreachable", "reason": None}
+    return again
+
+
+def _finish_exited(job: Job, job_id: str, code: Any) -> None:
+    """Job đã **xong** trên host: kéo artifact → ``exited`` → kết thúc.
+
+    Tách riêng khỏi vòng lặp :func:`watch` để dùng lại được khi bước xác nhận
+    lần 2 (P1) phát hiện job **đã xong** thay vì coi là ``vanished`` — cùng
+    một đường đi ⇒ cùng một hợp đồng (kéo artifact **trước** khi đánh dấu
+    terminal, rồi ghi event ``finished``).
+
+    Args:
+        job: job vừa xong.
+        job_id: id job.
+        code: exit code trên host (``None`` nếu không đọc được).
+    """
+    if code == 0:
+        # KÉO ARTIFACT **TRƯỚC** KHI ĐÁNH DẤU TERMINAL.
+        # Nếu đánh dấu trước, `roff wait` sẽ báo "exited" lúc thư mục
+        # --out còn trống → agent đọc artifact ra rỗng. Lỗi này đã xảy
+        # ra thật khi nghiệm thu S3 (23/11/2026).
+        pulled_ok = _pull_artifacts(job)
+        if not pulled_ok:
+            # Pull hỏng hẳn (đã hết số lần thử) ⇒ job **remote** vẫn
+            # chạy xong tốt (exit 0) nhưng artifact **chưa về** local.
+            # Ghi `reason=pull_failed` để `roff wait` báo lỗi (exit 74)
+            # thay vì báo thành công rồi để agent đọc thư mục rỗng (B23).
+            job.reason = REASON_PULL_FAILED
+        # KÉO PATH `--sync-back` VỀ PROJECT LOCAL (B26).
+        # Trước đây không có mã nào làm việc này ⇒ `--sync-back` là
+        # lệnh rỗng: job báo thành công, `pulled: true`, nhưng file
+        # không về project ⇒ agent tin là đã có file.
+        try:
+            sync_options = job_options(job_id)
+        except Exception:  # pragma: no cover - ledger hỏng
+            sync_options = {}
+        if not _pull_sync_back(job, sync_options):
+            # Path sync-back **không** về local ⇒ báo lỗi (exit 74,
+            # `reason=sync_back_failed`) — KHÔNG nuốt (bài học B23).
+            # `pulled` giữ nguyên: artifact chính đã về thì đã về.
+            if pulled_ok:
+                job.reason = REASON_SYNC_BACK_FAILED
+    job.exit_code = code
+    if not _save_state(job, "exited"):
+        _release_slot(job_id)
+        return
+    _record_event(job_id, "finished", exit=code, host=job.host)
+    _release_slot(job_id)
+
+
 def _save_state(job: Job, state: str) -> bool:
     """Ghi ``state`` vào ledger mà **không** ghi đè trạng thái terminal đã có.
 
@@ -726,6 +886,65 @@ def _acquire_slot(job: Job, options: dict) -> Any | None:
         return None
 
 
+class _StartFailure(Exception):
+    """Lỗi khi khởi chạy job (nội bộ) — mang **lỗi gốc** + cách ghi ledger.
+
+    * ``exc`` — lỗi gốc (giữ nguyên ``code``/``detail`` để ``roff do`` báo lại
+      nguyên văn khi đi đường dẫn **nội tuyến**);
+    * ``reason``/``event`` — lý do + tên event ghi vào ledger;
+    * ``job_level`` — lỗi của **job** (không phải hạ tầng) ⇒ job kết thúc
+      luôn ở state ``lost`` (không failover, không quay vòng).
+    """
+
+    def __init__(
+        self,
+        exc: Exception,
+        reason: str,
+        event: str,
+        job_level: bool = False,
+        code: int = 0,
+        retryable: bool = False,
+        detail: str = "",
+    ) -> None:
+        super().__init__(str(exc))
+        self.exc = exc
+        self.reason = reason
+        self.event = event
+        self.job_level = job_level
+        self.code = int(code or 0)
+        self.detail = detail or str(exc)
+        """Chi tiết ghi vào ledger (``start_error_detail``)."""
+        self.retryable = retryable
+        """Lỗi **chuẩn bị input** do host chết ⇒ đường dẫn nội tuyến thử
+        host khác (W3c). Lỗi **launch** thì KHÔNG retry (host còn sống, chỉ
+        job hỏng) — đúng như hành vi cũ của ``roff do``."""
+
+    def record(self, job: Job) -> None:
+        """Ghi lỗi vào ledger (đúng như ``_start`` cũ làm)."""
+        if self.job_level:
+            _fail_job(job, self.reason, self.event, self.detail, self.code)
+        else:
+            _fail_start(job, self.reason, self.event, self.detail, self.code)
+
+    def as_roff_error(self, job: Job) -> RoffError:
+        """Lỗi ``RoffError`` tương đương lỗi gốc (để ``roff do`` báo ra)."""
+        code = self.code or EXIT_JOB_FAILED
+        fields: dict[str, Any] = {
+            "error": f"khởi chạy job thất bại trên host {job.host}: {self.reason}",
+            "job": job.id,
+            "host": job.host,
+        }
+        if isinstance(self.exc, RoffError):
+            code = self.exc.code or code
+            original = str(self.exc.fields.get("error") or "")
+            if original:
+                fields["error"] = original
+            detail = str(self.exc.fields.get("detail") or "")
+            if detail:
+                fields["detail"] = detail
+        return RoffError(code, self.reason, **fields)
+
+
 def _start(job: Job) -> bool:
     """Chuẩn bị input trên host rồi launch job (lần đầu hoặc sau khi xếp hàng).
 
@@ -736,17 +955,51 @@ def _start(job: Job) -> bool:
     đây là lỗi **hạ tầng** (``input_push_failed``) hay lỗi của job ⇒ failover
     hay đánh dấu ``lost`` (B17).
     """
+    try:
+        _start_now(job)
+    except _StartFailure as failure:
+        failure.record(job)
+        return False
+    return True
+
+
+def start_now(job_id: str) -> None:
+    """Khởi chạy job **ngay trong tiến trình này** (không spawn watcher).
+
+    Dùng khi **không có watcher nào** sẽ khởi chạy job — chế độ
+    ``ROFF_NO_WATCHER=1`` (chỉ dùng cho test) — lúc đó ``roff do`` phải tự
+    đẩy input + launch, và phải **báo lỗi ngay** (không nuốt) để giữ đúng
+    hợp đồng exit-code của ``roff do``.
+
+    Raises:
+        RoffError: lỗi đẩy input / launch (code = exit code của lỗi gốc).
+    """
+    job = load_job(job_id)
+    try:
+        _start_now(job)
+    except _StartFailure as failure:
+        failure.record(job)
+        raise failure.as_roff_error(job) from failure.exc
+
+
+def _start_now(job: Job) -> None:
+    """Đẩy input + tạo thư mục + launch job trên host (ném lỗi nếu hỏng)."""
     options = job_options(job.id)
     workdir = str(options.get("workdir") or "")
     layout_root = _layout_root_of_job(job, options)
     if not workdir or not layout_root:
-        _fail_start(
-            job,
+        raise _StartFailure(
+            RoffError(
+                EXIT_JOB_FAILED,
+                REASON_LAUNCH_FAILED,
+                error="thiếu workdir hoặc layout_root trong ledger",
+                job=job.id,
+                host=job.host,
+            ),
             REASON_LAUNCH_FAILED,
             "push_failed",
-            "thiếu workdir hoặc layout_root trong ledger",
+            detail="thiếu workdir hoặc layout_root trong ledger",
         )
-        return False
 
     # --- 1) chuẩn bị mọi input trên host này -----------------------------
     specs = _input_specs(options)
@@ -761,13 +1014,16 @@ def _start(job: Job) -> bool:
         )
     except Exception as exc:
         reason = _push_failure_reason(exc)
-        if _is_job_level_error(exc):
-            # Lỗi của **job** (vd file local đã mất) ⇒ kết thúc luôn, không
-            # failover (máy khác cũng không có file đó), không quay vòng.
-            _fail_job(job, reason, "prepare_input_failed", str(exc))
-            return False
-        _fail_start(job, reason, "prepare_input_failed", str(exc))
-        return False
+        # Lỗi của **job** (vd file local đã mất) ⇒ kết thúc luôn, không
+        # failover (máy khác cũng không có file đó), không quay vòng.
+        raise _StartFailure(
+            exc,
+            reason,
+            "prepare_input_failed",
+            job_level=_is_job_level_error(exc),
+            code=_code_of(exc),
+            retryable=not _is_job_level_error(exc),
+        )
 
     if env_extra:
         try:
@@ -802,11 +1058,13 @@ def _start(job: Job) -> bool:
             )
         except Exception as exc:
             reason = _push_failure_reason(exc)
-            if _is_job_level_error(exc):
-                _fail_job(job, reason, "push_failed", str(exc))
-                return False
-            _fail_start(job, reason, "push_failed", str(exc))
-            return False
+            raise _StartFailure(
+                exc,
+                reason,
+                "push_failed",
+                job_level=_is_job_level_error(exc),
+                code=_code_of(exc),
+            )
         job.item = remote
         options["item_shared_key"] = key
         options["item_shared_rel"] = rel
@@ -825,8 +1083,12 @@ def _start(job: Job) -> bool:
                 job.host, os.path.dirname(out_remote), run=_shell_runner
             )
     except Exception as exc:
-        _fail_start(job, REASON_WORKDIR_MISSING, "workdir_missing", str(exc))
-        return False
+        raise _StartFailure(
+            exc,
+            REASON_WORKDIR_MISSING,
+            "workdir_missing",
+            code=_code_of(exc),
+        )
 
     # Thư mục checkpoint phải có sẵn trên host (W3n) — job **xếp hàng** được
     # launch ở đây nên không ai tạo hộ được.
@@ -836,10 +1098,12 @@ def _start(job: Job) -> bool:
         try:
             layout_mod.remote_mkdirs(job.host, checkpoint, run=_shell_runner)
         except Exception as exc:
-            _fail_start(
-                job, REASON_WORKDIR_MISSING, "checkpoint_dir_failed", str(exc)
+            raise _StartFailure(
+                exc,
+                REASON_WORKDIR_MISSING,
+                "checkpoint_dir_failed",
+                code=_code_of(exc),
             )
-            return False
         env["ROFF_CHECKPOINT"] = checkpoint
 
     try:
@@ -852,30 +1116,49 @@ def _start(job: Job) -> bool:
         )
     except RoffError as exc:
         if exc.code == EXIT_NO_WORKDIR:
-            job.state = "lost"
-            job.reason = "workdir_missing"
-            save_job(job)
-            _record_event(job.id, "workdir_missing", host=job.host)
-            return False
+            raise _StartFailure(
+                exc, "workdir_missing", "workdir_missing",
+                job_level=True, code=exc.code,
+            )
         if exc.code == EXIT_INPUT:
             # job cấu hình sai (thiếu out_remote/project…) → không retry mãi
-            job.state = "lost"
-            job.reason = "invalid_job"
-            save_job(job)
-            _record_event(job.id, "invalid_job", detail=str(exc))
-            return False
-        _fail_start(job, REASON_LAUNCH_FAILED, "launch_failed", str(exc))
-        return False
+            raise _StartFailure(
+                exc, "invalid_job", "invalid_job", job_level=True, code=exc.code
+            )
+        raise _StartFailure(
+            exc,
+            REASON_LAUNCH_FAILED,
+            "launch_failed",
+            code=_code_of(exc),
+        )
     job.state = "launched"
     save_job(job)
+    # (B36/C10) Đã launch thật ⇒ watcher **không** start lại lần nữa (vòng
+    # poll kế tiếp sẽ chỉ theo dõi trạng thái remote). Có checkpoint ⇒
+    # failover sau này chạy lại với ``$ROFF_RESUME=1``.
+    try:
+        set_job_options(
+            job.id,
+            deferred_start=False,
+            resume=bool(options.get("checkpoint")),
+        )
+    except Exception:  # pragma: no cover - ledger hỏng
+        pass
     return True
 
 
-def _fail_start(job: Job, reason: str, event: str, detail: str = "") -> None:
+def _fail_start(
+    job: Job, reason: str, event: str, detail: str = "", code: int = 0
+) -> None:
     """Ghi lỗi `_start` vào ledger (event + ``start_error``).
 
     ``start_error`` là thứ watcher đọc để biết đây là lỗi **hạ tầng**
     (``input_push_failed``) hay lỗi của job ⇒ failover hay đánh dấu ``lost``.
+
+    ``code`` (nếu có) = **exit code** của lỗi gốc (vd 255 = host không với
+    được, 2 = input sai). Nhờ vậy đường dẫn **nội tuyến** (xem
+    :func:`start_now`) báo lại đúng exit code cho ``roff do`` — không phải
+    đoán lại từ chuỗi reason.
     """
     _record_event(job.id, event, host=job.host, detail=detail or reason)
     try:
@@ -883,23 +1166,31 @@ def _fail_start(job: Job, reason: str, event: str, detail: str = "") -> None:
             job.id,
             start_error=reason,
             start_error_detail=detail or reason,
+            start_error_code=int(code or 0),
         )
     except Exception:  # pragma: no cover - ledger hỏng
         pass
 
 
-def _fail_job(job: Job, reason: str, event: str, detail: str = "") -> bool:
+def _fail_job(
+    job: Job, reason: str, event: str, detail: str = "", code: int = 0
+) -> bool:
     """Kết thúc job ngay với ``reason`` rõ ràng (lỗi của **job**, không phải hạ tầng).
 
     Lỗi loại này **không** được failover (failover cũng hỏng — vd file local
     đã mất thì máy khác cũng không có) và **không** được quay vòng vô hạn ⇒
     job kết thúc luôn ở state ``lost`` với ``reason`` đúng.
     """
-    _fail_start(job, reason, event, detail)
+    _fail_start(job, reason, event, detail, code)
     job.state = "lost"
     job.reason = reason
     save_job(job)
     return False
+
+
+def _code_of(exc: Exception) -> int:
+    """Exit code của lỗi (0 nếu không phải :class:`RoffError`)."""
+    return _exit_code(exc)
 
 
 def _push_failure_reason(exc: Exception) -> str:
@@ -1378,6 +1669,9 @@ def _failover(job: Job, reason: str) -> bool:
             pull_error="",
             manifest=[],
             sync_back_error="",
+            # (B36/C10) Failover đã launch thật trên host mới ⇒ watcher
+            # không được start lại lần nữa ở vòng poll kế tiếp.
+            deferred_start=False,
         )
     except Exception:  # pragma: no cover - ledger hỏng
         pass
@@ -1561,6 +1855,20 @@ def watch(job_id: str) -> None:
        * ``lost`` & không retry → ``lost`` → kết thúc;
        * không kết nối được → **chờ, thử lại, KHÔNG failover**;
        * còn chạy → ghi heartbeat, ngủ ``POLL_INTERVAL`` giây.
+
+    Riêng verdict ``vanished`` có **2 lớp bảo vệ** (đo thật 24/11/2026: job
+    chạy thành công, exit 0 — nhưng poll đọc trúng khoảng process vừa chết
+    nên báo ``vanished``):
+
+    * **P2 — khoảng miễn sau launch** (:data:`VANISH_GRACE_S`): trong khoảng
+      này "không còn process" ⇒ **chưa chắc chắn** ⇒ ghi event ``unverified``,
+      chờ thử lại, **không** failover;
+    * **P1 — xác nhận lần 2** (:data:`VANISH_CONFIRM_DELAY_S`): ngoài khoảng
+      miễn mà vẫn thấy ``vanished`` ⇒ hỏi lại host 1 lần nữa; lần 2 vẫn
+      thấy vậy mới failover, lần 2 thấy ``exited`` ⇒ coi như ``exited``.
+
+    Verdict mạnh hơn (``host_restarted`` / ``host_wiped`` / ``oom_killed``)
+    **không** qua 2 lớp này ⇒ failover ngay.
     """
     try:
         options = job_options(job_id)
@@ -1590,13 +1898,22 @@ def watch(job_id: str) -> None:
             # bị kẹt vĩnh viễn (W3a).
             _reconcile_slots(job_id)
 
-        if job.state == "queued":
+        try:
+            options = job_options(job_id)
+        except Exception:  # pragma: no cover - ledger hỏng
+            options = {}
+        # (B36/C10) Job do `roff do` tạo mà **chưa** được launch: `do` chỉ
+        # tạo job + xin slot, còn **đẩy input** + **launch** do watcher lo.
+        # Dấu hiệu: option ``deferred_start`` còn bật **và** job chưa có
+        # attempt nào (chưa từng launch) ⇒ watcher phải `_start()`.
+        # (Sau khi launch thành công, `deferred_start` được tắt ⇒ không
+        # launch lần nữa.)
+        needs_start = job.state == "queued" or (
+            bool(options.get("deferred_start")) and not job.attempts
+        )
+        if needs_start:
             # Job đang **xếp hàng** chờ slot. Không được launch khi chưa có
             # slot (sẽ vượt quá giới hạn của host) — phải xin slot trước.
-            try:
-                options = job_options(job_id)
-            except Exception:  # pragma: no cover - ledger hỏng
-                options = {}
             lease = _acquire_slot(job, options)
             if lease is None:
                 # Chưa được slot ⇒ host đang bận. Đây **không phải lỗi**:
@@ -1652,43 +1969,55 @@ def watch(job_id: str) -> None:
         kind = state.get("state")
 
         if kind == "exited":
-            code = state.get("exit")
-            if code == 0:
-                # KÉO ARTIFACT **TRƯỚC** KHI ĐÁNH DẤU TERMINAL.
-                # Nếu đánh dấu trước, `roff wait` sẽ báo "exited" lúc thư mục
-                # --out còn trống → agent đọc artifact ra rỗng. Lỗi này đã xảy
-                # ra thật khi nghiệm thu S3 (23/11/2026).
-                pulled_ok = _pull_artifacts(job)
-                if not pulled_ok:
-                    # Pull hỏng hẳn (đã hết số lần thử) ⇒ job **remote** vẫn
-                    # chạy xong tốt (exit 0) nhưng artifact **chưa về** local.
-                    # Ghi `reason=pull_failed` để `roff wait` báo lỗi (exit 74)
-                    # thay vì báo thành công rồi để agent đọc thư mục rỗng (B23).
-                    job.reason = REASON_PULL_FAILED
-                # KÉO PATH `--sync-back` VỀ PROJECT LOCAL (B26).
-                # Trước đây không có mã nào làm việc này ⇒ `--sync-back` là
-                # lệnh rỗng: job báo thành công, `pulled: true`, nhưng file
-                # không về project ⇒ agent tin là đã có file.
-                try:
-                    sync_options = job_options(job_id)
-                except Exception:  # pragma: no cover - ledger hỏng
-                    sync_options = {}
-                if not _pull_sync_back(job, sync_options):
-                    # Path sync-back **không** về local ⇒ báo lỗi (exit 74,
-                    # `reason=sync_back_failed`) — KHÔNG nuốt (bài học B23).
-                    # `pulled` giữ nguyên: artifact chính đã về thì đã về.
-                    if pulled_ok:
-                        job.reason = REASON_SYNC_BACK_FAILED
-            job.exit_code = code
-            if not _save_state(job, "exited"):
-                _release_slot(job_id)
-                return
-            _record_event(job_id, "finished", exit=code, host=job.host)
-            _release_slot(job_id)
+            _finish_exited(job, job_id, state.get("exit"))
             return
 
         if kind == "lost":
             reason = _loss_reason(job, state)
+            if reason == REASON_VANISHED:
+                # --- P2: khoảng miễn ngay sau launch ------------------------
+                # Job **vừa launch** có thể chưa hiện process trên host
+                # (độ trễ ssh 4–6 s) ⇒ "không còn process" lúc này **chưa
+                # chắc chắn** ⇒ ghi event ``unverified`` rồi chờ thử lại —
+                # TUYỆT ĐỐI không failover.
+                if _vanish_grace_remaining(job) > 0.0:
+                    _record_event(
+                        job_id,
+                        "unverified",
+                        host=job.host,
+                        reason=REASON_VANISHED,
+                        detail="vanished trong khoảng miễn sau launch",
+                    )
+                    job.heartbeat = time.time()
+                    if not _save_state(job, job.state):
+                        return
+                    _sleep(POLL_INTERVAL)
+                    continue
+                # --- P1: hỏi lại host lần 2 trước khi kết luận mất ---------
+                # ``vanished`` có thể **sai** khi đọc trúng khoảng process
+                # vừa chết (``kill -0`` thất bại, file ``exit`` chưa kịp
+                # ghi) ⇒ hỏi lại 1 lần nữa; lần 2 vẫn thấy vậy mới mất thật.
+                again = _confirm_vanished(job, job_id, state)
+                if not again.get("reachable", False):
+                    # Hỏi lại **không được** ⇒ CHƯA CHẮC (quy tắc vàng:
+                    # mất kết nối KHÔNG đồng nghĩa job chết).
+                    reason = None
+                elif again.get("state") == "exited":
+                    # Job **đã xong** ⇒ coi như ``exited`` (kéo artifact, ghi
+                    # ``finished``) — KHÔNG failover (job còn sống!).
+                    _finish_exited(job, job_id, again.get("exit"))
+                    return
+                elif again.get("state") == "lost":
+                    if again.get("pid_alive"):
+                        # Không nhất quán (báo ``lost`` nhưng process **còn
+                        # sống**) ⇒ chưa chắc chắn ⇒ chờ thử lại.
+                        reason = None
+                    else:
+                        # Vẫn mất (lần 2 xác nhận) ⇒ lấy reason mới nhất.
+                        reason = _loss_reason(job, again)
+                else:
+                    # Vẫn còn chạy ⇒ CHƯA CHẮC (verdict lần 1 là race).
+                    reason = None
             if reason is None:
                 # chưa chắc chắn → chờ, thử lại (quy tắc vàng)
                 _record_event(job_id, "unverified", host=job.host)
@@ -1733,17 +2062,17 @@ def watch(job_id: str) -> None:
 # spawn + wait
 # --------------------------------------------------------------------------
 def nice_prefix() -> list[str]:
-    """Tiền tố ``nice -n 19 ionice -c3`` cho tiến trình nền (Q18/W3k).
+    """Tiền tố ưu tiên CPU/I-O cho tiến trình nền (Q18/W3k).
 
     Watcher chạy **nền** trên máy local ⇒ không được giành CPU/I/O của người
     dùng (giống ssh/rsync mà skill vẫn dùng).
+
+    **MỘT nguồn sự thật** (B34): gọi :func:`roffkit.config.local_nice_prefix`
+    ⇒ cùng tiền tố với probe/sshx/tunnel/transfer/job. Trước B34 hàm này
+    **hardcode** ``nice -n 19 ionice -c3`` ⇒ ``ROFF_NICE``/``[local] nice``
+    không có tác dụng với watcher ⇒ **bản sao thứ 6** của chính sách.
     """
-    parts: list[str] = []
-    if shutil.which("nice"):
-        parts += ["nice", "-n", "19"]
-    if shutil.which("ionice"):
-        parts += ["ionice", "-c3"]
-    return parts
+    return local_nice_prefix()
 
 
 def spawn_watcher(job_id: str) -> None:

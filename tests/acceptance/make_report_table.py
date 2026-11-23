@@ -73,6 +73,10 @@ NAMES: dict[str, str] = {
     "test_s46_sync_back_pulls_file_into_project": "S46 — `--sync-back` thực sự kéo file về project",
     "test_s47_missing_config_fails_loud_and_creates_no_job": "S47 — config chỉ định mà thiếu ⇒ fail to, không tạo job",
     "test_s47_config_present_keeps_fleet_restricted": "S47b — config có thật ⇒ `exclude` được giữ",
+    "test_s48_nice_policy_has_one_source_of_truth": "S48 — chính sách nice/ionice: 5 module, 1 nguồn sự thật",
+    "test_s49_remote_job_runs_at_nice_19": "S49 — job trên máy remote chạy ở nice 19",
+    "test_s49b_remote_job_nice_zero_is_not_wrapped": "S49b — nice = 0 ⇒ không bọc nice",
+    "test_s49c_remote_job_runs_when_host_has_no_nice": "S49c — host không có nice ⇒ job vẫn chạy",
 }
 
 #: Kịch bản chạy bằng **script riêng** (không phải pytest).
@@ -270,9 +274,11 @@ def _section(tag: str, results: dict[str, str], rows: list) -> str:
         f"**{skipped} SKIPPED**"
         + (f", {other} kết quả khác" if other else "")
         + f" (tổng {len(results)} test có kết quả).",
-        "- Test `SKIPPED` = **sự cố hạ tầng** (máy Muse chết giữa lúc chạy), "
-        "không phải lỗi của `roff` — xem `docs/REPORT.md` §2. Lý do cụ thể của "
-        "từng lần skip nằm ở cột *Ghi chú*.",
+        "- Theo nguyên tắc `docs/REPORT.md` §2, `SKIPPED` **chỉ** dành cho sự "
+        "cố **hạ tầng** (máy Muse chết giữa lúc chạy), **không** phải lỗi sản "
+        "phẩm. Lý do cụ thể của từng lần skip nằm ở cột *Ghi chú* — **đọc** "
+        "cột đó: nếu lý do ghi là lỗi sản phẩm thì bảng này **sai** và kịch "
+        "bản phải được sửa (B37).",
         "",
         "| # | Kịch bản | Kết quả | Ghi chú |",
         "|---|---|---|---|",

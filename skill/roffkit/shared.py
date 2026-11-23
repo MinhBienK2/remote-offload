@@ -24,6 +24,13 @@ Cây input trong kho bị khoá **read-only** (``chmod -R a-w``) để job nào 
 input của job khác **fail loudly** thay vì hỏng dữ liệu âm thầm. Marker nằm
 ngoài ``{key}/`` nên không bị ảnh hưởng.
 
+**Lock sót lại của chính ta** (B39): đường hầm tới fleet hay flap ⇒ lệnh
+``rm -rf`` nhả lock cũng hỏng ⇒ lock của **chính tiến trình này** còn lại
+trên host. Lần thử lại **trong cùng tiến trình** phải **chiếm lại được ngay**
+(xem :func:`_owner_is_self` + :func:`_owner_token_is_ours`), nếu không mỗi
+lần thử lại đều chờ đủ :data:`MARKER_WAIT_S` ⇒ ``shared_input_busy`` ⇒ lãng
+phí hàng chục giây, rồi failover để đẩy lại một file vốn đã có trên host.
+
 Module này không in ra stdout (quy tắc chung của roff).
 """
 
@@ -209,10 +216,24 @@ def _local_host() -> str:
         return ""
 
 
+#: Token owner (``uuid4().hex``) do **chính tiến trình này** cấp.
+#:
+#: Dùng để nhận ra lock **sót lại của ta** (B39) mà **không** nhầm với lock
+#: của tiến trình khác — xem :func:`_owner_token_is_ours`.
+_SELF_OWNER_IDS: dict[str, float] = {}
+
+#: Số token tối đa giữ lại (watcher sống hàng giờ ⇒ không được phình bộ nhớ).
+_SELF_OWNER_IDS_MAX = 512
+
+
 def _owner_payload() -> dict:
     """Thông tin chủ lock: tiến trình local đang giữ mutex."""
+    token = uuid.uuid4().hex
+    _SELF_OWNER_IDS[token] = time.time()
+    while len(_SELF_OWNER_IDS) > _SELF_OWNER_IDS_MAX:
+        _SELF_OWNER_IDS.pop(next(iter(_SELF_OWNER_IDS)), None)
     return {
-        "id": uuid.uuid4().hex,
+        "id": token,
         "pid": os.getpid(),
         "host": _local_host(),
         "started": time.time(),
@@ -247,6 +268,80 @@ def _owner_alive(owner: dict) -> bool:
     except OSError:  # pragma: no cover
         return False
     return True
+
+
+def _owner_is_self(owner: dict) -> bool:
+    """Chủ lock có **chính là tiến trình này** không?
+
+    Cần **cả** máy lẫn ``pid``: ``pid`` chỉ có ý nghĩa **trong 1 máy** (mỗi
+    máy đều có pid 1234) ⇒ chỉ so ``pid`` thì sẽ cướp nhầm lock của tiến
+    trình khác trên máy khác.
+    """
+    if not owner:
+        return False
+    if str(owner.get("host") or "") != _local_host():
+        return False
+    try:
+        pid = int(owner.get("pid"))
+    except (TypeError, ValueError):
+        return False
+    return pid == os.getpid()
+
+
+def _owner_token_is_ours(owner: dict) -> bool:
+    """Token chủ lock có do **chính tiến trình này** cấp không?
+
+    ``pid`` + máy local khớp **chưa đủ** để kết luận "lock là của ta":
+    ``pid`` có thể đã bị **tái sử dụng** cho tiến trình khác (lock do tiến
+    trình cũ để lại) ⇒ cướp nhầm. Token (``uuid4`` sinh ngay trong tiến
+    trình này) thì **chứng minh** được: chỉ tiến trình này mới cấp được
+    token đó ⇒ lock đó do chính ta tạo ⇒ **lock sót lại của ta**.
+    """
+    token = str(owner.get("id") or "")
+    if not token:
+        return False
+    return token in _SELF_OWNER_IDS
+
+
+def _lock_held_here(host: str, lock_path: str, owner: dict) -> bool:
+    """Tiến trình này có **đang giữ** lock đó không?
+
+    Có ⇒ là luồng khác của **cùng** tiến trình đang đẩy ⇒ **không được
+    cướp** (đẩy trùng ⇒ hỏng dữ liệu âm thầm).
+    """
+    held = str(_HELD_LOCKS.get((host, lock_path)) or "")
+    return bool(held) and held == str(owner.get("id") or "")
+
+
+def _own_leftover_lock(host: str, lock_path: str, owner: dict | None = None) -> bool:
+    """Lock đang có là lock **sót lại của chính tiến trình này** không?
+
+    Cả 3 điều kiện phải khớp:
+
+    1. ``pid`` + máy local == của tiến trình này
+       (:func:`_owner_is_self`) — trên cùng máy, ``pid`` là duy nhất giữa
+       các tiến trình **đang sống**;
+    2. token owner do **chính tiến trình này** cấp
+       (:func:`_owner_token_is_ours`) — *chứng minh* lock do ta tạo, không
+       suy đoán theo ``pid`` (pid có thể đã bị tái sử dụng);
+    3. tiến trình này **không được đang giữ** lock đó
+       (:func:`_lock_held_here`) — nếu đang giữ (luồng khác của cùng
+       process đang đẩy) ⇒ **không** được cướp.
+
+    Args:
+        owner: thông tin chủ lock **đã đọc sẵn** (tiết kiệm 1 round-trip);
+            ``None`` ⇒ tự đọc.
+
+    Returns:
+        ``True`` nếu đó là lock sót của ta ⇒ được phép dọn rồi chiếm lại.
+    """
+    if owner is None:
+        owner = _lock_owner(host, lock_path)
+    if not _owner_is_self(owner):
+        return False
+    if not _owner_token_is_ours(owner):
+        return False
+    return not _lock_held_here(host, lock_path, owner)
 
 
 #: Lock đang giữ: ``{(host, lock_path): token owner}`` — để nhả khi tiến
@@ -580,17 +675,22 @@ def _lock_owner(host: str, lock_path: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _lock_is_stale(host: str, lock_path: str) -> bool:
+def _lock_is_stale(host: str, lock_path: str, owner: dict | None = None) -> bool:
     """Lock đã chết chưa (để dọn rồi chiếm lại được)?
 
     * lock quá :data:`LOCK_STALE_S` **và** chủ lock không còn sống ⇒ chết;
     * chủ lock **còn sống** ⇒ KHÔNG xoá (trừ khi quá :data:`LOCK_HARD_STALE_S`
       — chủ bị kẹt ⇒ không được kẹt vĩnh viễn).
+
+    Args:
+        owner: thông tin chủ lock **đã đọc sẵn** (tiết kiệm 1 round-trip);
+            ``None`` ⇒ tự đọc.
     """
     age = _lock_age(host, lock_path)
     if age is None or age <= LOCK_STALE_S:
         return False
-    owner = _lock_owner(host, lock_path)
+    if owner is None:
+        owner = _lock_owner(host, lock_path)
     if owner and _owner_alive(owner):
         return age > LOCK_HARD_STALE_S
     return True
@@ -696,11 +796,33 @@ def ensure_shared_input(
     while True:
         acquired, owner = _acquire_lock(host, lock_path)
         if acquired:
+            # Ghi ngay (trước mọi lệnh khác) ⇒ nếu có luồng khác của cùng
+            # tiến trình đang chờ, nó thấy lock là "của ta đang giữ" ⇒
+            # không cướp (xem :func:`_lock_held_here`).
+            _HELD_LOCKS[(host, lock_path)] = str(owner.get("id") or "")
             break
         # Có người khác đang đẩy cùng nguồn ⇒ chờ marker.
         marker = _read_marker(host, marker_path, target)
         if _marker_matches(marker, size, mtime):
+            # Bản copy đã có ⇒ dùng lại (không đẩy lần nữa). Nhưng nếu
+            # lock còn lại là của **chính ta** (lần thử trước bị hỏng) ⇒
+            # dọn luôn, kẻo nó chặn người khác tới hết thời gian chờ.
+            if _own_leftover_lock(host, lock_path):
+                _lock_dirty(host, lock_path)
             return _remote()
+        # Đọc chủ lock **1 lần**, dùng cho cả 2 quyết định bên dưới.
+        lock_owner = _lock_owner(host, lock_path)
+        if _own_leftover_lock(host, lock_path, lock_owner):
+            # B39: lock còn lại là của **CHÍNH tiến trình này** ⇒ đó là lock
+            # sót từ lần thử trước (lệnh ``rm -rf`` nhả lock cũng hỏng vì
+            # host flap) ⇒ **chiếm lại ngay**, không chờ hết MARKER_WAIT_S
+            # (trước đây: mỗi lần thử lại chờ đủ 60 s ⇒ ~2 phút rồi
+            # failover để đẩy lại một file vốn đã có trên host).
+            _lock_dirty(host, lock_path)
+            if not _lock_exists(host, lock_path):
+                continue  # đã dọn ⇒ vòng sau chiếm lại được
+            _sleep(POLL_INTERVAL)  # dọn hỏng (host flap) ⇒ chờ 1 nhịp rồi thử lại
+            continue
         if time.monotonic() >= deadline:
             raise RoffError(
                 EXIT_UNREACHABLE,
@@ -709,14 +831,13 @@ def ensure_shared_input(
                 detail=f"lock {lock_path} vẫn còn sau {MARKER_WAIT_S:.0f}s",
                 host=host,
             )
-        if _lock_is_stale(host, lock_path):
+        if _lock_is_stale(host, lock_path, owner=lock_owner):
             # Lock chết (agent bị kill / host flap) ⇒ dọn rồi chiếm lại **ngay**,
             # không chờ tới deadline (trước đây phải quay vòng ~30 lần ≈ 30 phút).
             _lock_dirty(host, lock_path)
             continue
         _sleep(POLL_INTERVAL)
 
-    _HELD_LOCKS[(host, lock_path)] = str(owner.get("id") or "")
     heartbeat = _LockHeartbeat(host, lock_path, str(owner.get("id") or ""))
     heartbeat.start()
     try:

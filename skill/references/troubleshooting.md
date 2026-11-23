@@ -111,8 +111,11 @@ use another host, or point Playwright at an existing browser
 
 ## Nothing local runs at all
 
-`roff` keeps the local machine light: remote commands run under
-`nice -n 19 ionice -c3`, transfers are capped, and the watcher polls the local
-ledger rather than the hosts. If the local machine is busy anyway, check
+`roff` keeps the local machine light: its **local** `ssh`/`rsync` clients run
+under `nice -n 19 ionice -c3`, transfers are capped, and the watcher polls the
+local ledger rather than the hosts. The **job on the host** also runs under
+`nice -n 19 ionice -c3`, so it does not fight the services the user already
+runs on that machine (`[remote] nice`/`ionice` in `~/.config/roff/config.ini`
+changes that; `nice = 0` turns the wrapper off). If the local machine is busy anyway, check
 `pgrep -af 'roff|ssh'` — a tunnel you opened on purpose is expected to be
 there; anything else is leftover from a run that did not finish.

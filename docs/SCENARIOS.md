@@ -327,21 +327,31 @@ Chứng minh lõi **không phụ thuộc harness**.
 - Phía **song song** chạy trên **≥ 2 máy khác nhau** (nếu fleet hẹp lúc đo thì
   **không** kiểm chứng được ⇒ bỏ qua, không báo đỏ).
 - Các job **chạy chồng nhau**: cửa sổ chạy remote của chúng có giao nhau.
-- Tăng tốc **tính toán** ≥ **0,6 × N** (tổng thời gian chạy remote ÷ thời gian
-  của đoạn chạy chồng nhau).
+- Tăng tốc **tính toán** ≥ **0,6 × (số máy đã dùng)** — đo bằng **tổng thời
+  gian chạy remote ÷ trục thời gian của cả lô**: **1,0× ⇒ lô chạy tuần tự**
+  (lỗi sản phẩm), **~k× ⇒ k job chạy đồng thời trên k máy**.
+  *(Đo bằng "đoạn mọi job cùng chạy" sẽ vỡ khi fleet hẹp hơn số item — 3 job
+  trên 2 máy không có đoạn chung dù 2 job **có** chạy chồng nhau ⇒ báo đỏ
+  oan. Đó là lý do đổi công thức, 24/11/2026.)*
 - Tăng tốc **wall-clock** vẫn được **đo và in ra** để đọc (không khẳng định —
 > xem lý do ở trên).
 - Mọi output có sha256 đúng (so với encode chuẩn 1 máy).
 - Không có artifact trùng lặp do bản sao (Q36).
 
 > **"Không chạy chồng nhau" là lỗi SẢN PHẨM hay HẠ TẦNG?** (B37, 23/11/2026 —
-> bằng chứng: `docs/evidence/final/s18-submit-latency.txt`). Phân biệt bằng
+> bằng chứng: `docs/evidence/final-20261123/s18-submit-latency.txt`). Phân biệt bằng
 > **mốc gửi** (lúc `do` tạo job), đọc từ ledger:
 > - các job được gửi **lệch nhau > 10 s** ⇒ `roff do --each` gửi **tuần tự**
 >   ⇒ lỗi **sản phẩm** (B36) ⇒ **FAIL**, **không** được `skip` — nếu không,
 >   lỗi sản phẩm sẽ bị báo xanh mỗi đợt nghiệm thu;
 > - các job được gửi **cùng lúc** mà vẫn không chạy chồng nhau ⇒ fleet **hẹp**
->   / host chết giữa lô ⇒ **hạ tầng** ⇒ `skip` (kèm lý do đúng).
+>   / host chết giữa lô ⇒ **hạ tầng** ⇒ `skip` (kèm lý do đúng). Kịch bản
+>   **tự phân biệt** 2 nguyên nhân bằng event trong ledger: có `disconnected`/
+>   `failover` ⇒ *"máy chết/sập giữa lô"*; không có ⇒ *"máy đang bận (job xếp
+>   hàng)"*. Đo thật 24/11/2026: lô gửi cùng lúc (lệch **0,0 s**) nhưng 2 job
+>   lệch **117 s** vì máy ghim đã chết (watcher ghi `disconnected` liên tục
+>   ~90 s rồi `failover` sang máy khác) ⇒ **hạ tầng**, và lý do skip phải nói
+>   đúng là *chết/sập*, không phải *bận*.
 >
 > Đợt nghiệm thu 23/11/2026 22:24 rơi vào ca **thứ nhất**: các job gửi lúc
 > 22:51:01 / 22:52:43 / 22:53:11 (lệch 102 s rồi 28 s) ⇒ **FAIL**. Lý do skip
@@ -378,6 +388,13 @@ Chứng minh lõi **không phụ thuộc harness**.
 > **Còn chưa đo**: phần "**lô** nhiều item" (chia lại item của máy chết, không
 > chạy lại item đã xong) — cần cố ý ngắt tunnel giữa lô S18, tức là cần quyền
 > can thiệp vào tunnel của máy Muse (thuộc người dùng).
+>
+> **Verdict mạnh không bị chậm (B42).** Từ 24/11/2026, verdict `vanished`
+> phải được **xác nhận lần 2** trước khi failover (đọc trạng thái đúng lúc
+> process vừa chết thì verdict **sai** ⇒ failover một job **còn sống**). Còn
+> `host_restarted` / `host_wiped` / `oom_killed` là bằng chứng **mạnh hơn**
+> ⇒ failover **ngay**, không bị chậm thêm ⇒ S20 (máy chết ⇒ `boot_id` đổi)
+> và S24 (máy bị wipe ⇒ token đổi) **không** bị ảnh hưởng.
 
 ### S21 — 1 video dài, split → encode N host → concat
 
@@ -410,6 +427,14 @@ Chứng minh lõi **không phụ thuộc harness**.
 
 **Cách chạy**: `roff do --each '<5 file *.bin>' --out ./out --cmd 'cp "$ROFF_ITEM" "$ROFF_OUT/"'`.
 
+> **Phải dùng `--name` (tên project) riêng cho mỗi lần chạy.** Thư mục làm việc
+> trên host (`<layout_root>/projects/<project>/part-N`) **được giữ lại giữa các
+> lần chạy** ⇒ lần chạy sau sẽ thấy **rác của lần chạy cũ** ở đúng chỗ mà
+> phép đo "workdir không chứa bản copy input" nhìn vào ⇒ **đỏ oan**. Đo thật
+> 24/11/2026: một file 5,6 MB từ lần chạy cũ làm S23 đỏ, trong khi chạy lại với
+> project name riêng thì workdir **rỗng** ⇒ sản phẩm **không** nhân bản input
+> vào workdir.
+
 **Đạt khi**:
 - Trên **mỗi** host, thư mục input dùng chung (`<layout_root>/inputs/`) có **đúng 1 bản
   copy** của input, không phải N bản (kiểm bằng `du -sb` trên host + đếm job trên host).
@@ -430,6 +455,15 @@ Chứng minh lõi **không phụ thuộc harness**.
 - `$ROFF_ITEM` trên B **tồn tại** và trỏ đúng item (job exit 0, output đúng sha256).
 - Host mới được **ensure toolchain** trước khi launch (nếu host mới thiếu tool thì
   phải chạy setup script).
+
+> **Phải giết TẤT CẢ job của lô, không giết một job** (B41). Kịch bản này
+> dùng cách **giết process group** của job để giả lập "job biến mất" ⇒
+> watcher phải failover. Nhưng nếu chỉ giết **một** job trong lô thì job còn
+> lại **chạy tới hết** (exit 0, **không** có event `failover`) ⇒ điều kiện
+> "mọi job đều failover" **không** đạt — và đó là **đúng** (job còn lại không
+> mất). ⇒ vòng chờ pid phải đủ **TẤT CẢ** job có pid rồi mới giết.
+> Sau B36/C10 các job của lô được **watcher** khởi chạy lệch nhau vài giây
+> ⇒ lúc `roff do` vừa trả JSON, **chưa chắc** job nào đã có pid ⇒ phải chờ.
 
 ---
 
@@ -895,6 +929,111 @@ nhiều lần trong một đợt). Ba lớp phòng thủ:
 FAILED** — 8 do `Connection refused`, và **2 lỗi nằm trong chính bộ test**
 (S07 cắt kết nối *trước khi* job lên `launched`; S11 không kiểm `exit` của
 shard) ⇒ mỗi lần đỏ phải hỏi: *lỗi ở sản phẩm hay ở kịch bản?*
+
+
+## 12f. Chính sách ưu tiên CPU/I-O — một nguồn sự thật + job trên máy remote (bổ sung 24/11/2026, B34 + C9)
+
+Hai lỗi cùng một họ: **cấu hình bị bỏ qua im lặng**.
+
+* **B34** — chính sách `nice`/`ionice` bị **copy 5 lần** với **3 nguồn sự
+  thật**: `probe.py` dùng hằng, `sshx.py` + `tunnel.py` dùng **env**, `job.py`
+  **hardcode**, `transfer.py` đọc **config**. Hệ quả: `ROFF_NICE` **không có
+  tác dụng** với rsync/tar (hợp đồng §17 nói ngược), còn sửa `[local] nice`
+  trong `~/.config/roff/config.ini` chỉ có tác dụng với đường truyền ⇒ **nút
+  cấu hình chết**.
+* **C9** — đo thật 23/11/2026: job trên `muse-phamminhbien3333` có
+  `remote_nice = 0` ⇒ lệnh của người dùng chạy **ngang với**
+  `postgres`/`telegram-bot`/`cloudflared` của chính người dùng trên cùng máy
+  đó.
+
+Sau khi sửa: **một** hàm quyết định (`roffkit.config.local_nice_prefix` /
+`remote_nice_policy`), thứ tự ưu tiên `env > config > mặc định`; và lệnh
+job trên host được bọc `nice`/`ionice` — kiểm tra **trên host** bằng
+`command -v` ⇒ host không có thì job vẫn chạy.
+
+### S48 — Chính sách `nice`/`ionice`: 5 module, **1** nguồn sự thật
+
+**Cách chạy**:
+
+```bash
+pytest tests/acceptance/test_acceptance_nice_policy.py::test_s48_nice_policy_has_one_source_of_truth -v -m acceptance
+```
+
+**Đạt khi**:
+- gọi hàm tiền tố của **cả 5 module** (`probe._prefix_nice`, `sshx._prefix`,
+  `tunnel._prefix`, `job._prefix_nice`, `transfer._prefix_nice`) với **cùng**
+  env + **cùng** config ⇒ **5 kết quả phải bằng nhau**;
+- ca kiểm (bảng brie S48): không env ⇒ `nice -n 19` + `ionice -c3`;
+  `ROFF_NICE=5` ⇒ `nice -n 5`; `ROFF_NICE=5` + `[local] nice=7` ⇒ `nice -n 5`
+  (env **thắng** config); không env + `[local] nice=7` ⇒ `nice -n 7`;
+  `ROFF_NICE=0` ⇒ **không** bọc `nice`; `ROFF_IONICE=none` ⇒ **không** bọc
+  `ionice`; `ROFF_IONICE=realtime|best-effort|idle` ⇒ `ionice -c1|-c2|-c3`;
+- config **hỏng** (sai cú pháp INI) ⇒ **vẫn** ra giá trị mặc định, **không**
+  raise (nguyên tắc `transfer._config(strict=False)` — B27).
+
+Kịch bản này **không cần fleet thật** ⇒ vẫn kiểm chứng được khi cả 4 máy
+Muse đang chết.
+
+**Đã kiểm chứng (24/11/2026)**:
+`tests/acceptance/test_acceptance_nice_policy.py` ⇒ **1 passed** (S48), và
+`tests/unit/test_nice_policy.py` ⇒ **58 passed** (bảng ca kiểm đầy đủ +
+đo thật trên máy chạy test).
+
+### S49 — Job trên máy remote chạy ở `nice` đã hạ
+
+**Cách chạy**:
+
+```bash
+pytest tests/acceptance/test_acceptance_nice_policy.py::test_s49_remote_job_runs_at_nice_19 -v -m acceptance
+```
+
+**Đạt khi**:
+- lệnh của người dùng trên host in ra **nice của chính nó**
+  (`awk '{print $19}' /proc/self/stat` — trường 19 của `/proc/self/stat` là
+  nice, 1-based: pid=1, comm=2, state=3, …, nice=19) ⇒ giá trị đó = **19**;
+- job có **exit code đúng** ⇒ `$JOBDIR/exit` **được ghi** ⇒ `run.sh` **không**
+  được dùng `exec` (sau `exec`, `rc=$?` không bao giờ chạy ⇒ job không bao
+  giờ có exit code).
+
+Vì sao quan trọng: `nice` chỉ có tác dụng khi host **đang tranh tài nguyên** —
+tức đúng lúc ta muốn dịch vụ production của người dùng được ưu tiên.
+
+**ĐÃ kiểm chứng trên fleet thật (24/11/2026)**:
+`ROFF_LOCAL=1 python3 -m pytest tests/acceptance/test_acceptance_nice_policy.py
+-v -m acceptance -rfEs --basetemp=/tmp/pytest-roff-nice-accept`
+⇒ **4 passed in 62,45 s** (S48, S49, S49b, S49c) trên 4 máy Muse thật.
+Trước khi sửa: nice của job trên host = **0** (đo 23/11/2026); sau khi sửa:
+**19**. Bằng chứng: `docs/evidence/c10-after-20261124/submit-latency-after.txt`.
+
+### S49b — `nice = 0` ⇒ **không** bọc `nice`
+
+**Cách chạy**:
+
+```bash
+ROFF_REMOTE_NICE=0 pytest tests/acceptance/test_acceptance_nice_policy.py::test_s49b_remote_job_nice_zero_is_not_wrapped -v -m acceptance
+```
+
+**Đạt khi**: nice của tiến trình job trên host = **0** (không bị hạ), và job
+vẫn có exit code đúng. Dùng cho máy mà ta **không** muốn tranh với dịch vụ
+production của chính người dùng.
+
+*(ĐÃ chạy trên fleet thật 24/11/2026 — **PASSED**.)*
+
+### S49c — Host **không có** `nice` ⇒ job vẫn chạy
+
+**Cách chạy**:
+
+```bash
+pytest tests/acceptance/test_acceptance_nice_policy.py::test_s49c_remote_job_runs_when_host_has_no_nice -v -m acceptance
+```
+
+**Đạt khi**: chạy lại **đúng** `run.sh` đã ship lên host với `PATH` chỉ chứa
+`sh`, `cat`, `dirname`, `awk` (không có `nice`/`ionice`) ⇒ job **vẫn chạy**,
+`$JOBDIR/exit` **vẫn được ghi** với exit code đúng ⇒ host thiếu công cụ
+**không** làm job chết.
+
+*(ĐÃ chạy trên fleet thật 24/11/2026 — **PASSED**. Cơ chế cũng đã đo thật trên
+máy chạy unit test: `tests/unit/test_nice_policy.py`.)*
 
 
 # Test hồi quy (R1–R27)

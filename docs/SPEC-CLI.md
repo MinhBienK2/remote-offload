@@ -103,11 +103,30 @@ thì host bị loại. `inferred_needs` là `[]` khi câu lệnh không đủ d�
 
 | `state` | Nghĩa | Job đã chạy chưa? |
 |---|---|---|
-| `"launched"` | đã chiếm slot và đã launch trên host | rồi |
+| `"launched"` | đã **chiếm slot**; watcher đang đẩy input + launch trên host | đang khởi chạy |
 | `"queued"` | **hết slot** trên host → job chờ, watcher sẽ tự xin slot và launch | chưa |
 
 Cả hai trả **exit 0**. `state:"queued"` **không phải lỗi** — nó nói "máy đang
 bận, job sẽ tự chạy". Agent **không** được fallback sang chạy local.
+
+**Mốc "input được đẩy lúc nào" (B36/C10).** `roff do` **không** đẩy input và
+**không** launch: nó chỉ tạo job + xin slot, rồi **hoãn** việc đẩy input +
+launch cho **watcher** (mỗi job 1 watcher). Nhờ vậy một lô `--each` được gửi
+**song song** — trước đây mỗi item tốn ~21–26 s tuần tự nên các job của một
+lô **không bao giờ chạy chồng nhau** (đo thật 23/11/2026:
+`docs/evidence/final-20261123/s18-submit-latency.txt`).
+
+Hệ quả (đánh đổi, nói rõ):
+
+* `state:"launched"` ⇒ job **đã nhận slot**, watcher **đang** khởi chạy nó
+  (đẩy input rồi launch) — process trên host có thể chưa chạy lúc `do` trả
+  JSON (vài giây).
+* Lỗi **đẩy input** (host chết lúc rsync/clone, URL hỏng, file local biến
+  mất) **không** lộ ra ở `roff do` nữa mà lộ ra ở **watcher** ⇒ `roff do` trả
+  exit 0, còn `roff wait` mới báo lỗi (reason rõ ràng trong ledger). Việc
+  **failover** sang host khác vẫn còn nguyên (watcher tự failover).
+* Lỗi **sai cấu hình** vẫn lộ ra ở `roff do` ngay: input local không tồn
+  tại (exit 2), option sai (exit 2), cả fleet chết (exit 10).
 
 Khi `roff do` **không** tạo được job nào (ví dụ cả fleet chết giữa chừng) ⇒
 exit **10** với `reason:"no_host"`, `rejected` (lý do loại từng host) và
@@ -294,7 +313,8 @@ Watcher chạy nền. Không gọi tay. Spawn bằng `setsid nohup`.
 2. Nạp config (sai ⇒ exit 3).
 3. Nếu `--after job:X` ⇒ chờ X xong (poll ledger).
 4. Probe fleet (cache `probe_cache_s`; `--host X` ⇒ **probe mới** X, không
-   dùng cache — cache cũ không được che host được ghim).
+   dùng cache — cache cũ không được che host được ghim). Probe **1 lần cho
+   cả lô** — không probe lại cho từng item.
 5. Chọn host qua `policy.select` — trừ khi `--host` ép.
    * Giải tán item của lô `--each` ra nhiều host; khi số host dùng được
      **ít hơn** số item thì item thừa **dồn** vào host tải thấp nhất
@@ -306,12 +326,24 @@ Watcher chạy nền. Không gọi tay. Spawn bằng `setsid nohup`.
      watcher, trả JSON `{job, state:"queued", host, next}` với **exit 0**.
    * Watcher sẽ tự xin slot sau và launch khi được.
 7. Nếu cần tool chưa có ⇒ chạy `ensure` (setup script theo registry).
-8. Push input (nếu có input local) vào **kho dùng chung của host**
-   (`<layout_root>/inputs/{key}/`) — mỗi (host, nguồn) **một lần**, có
-   `--partial` để resume.
-9. Launch job trên host (`setsid nohup`), ghi meta.json.
-10. Spawn watcher.
+8. Ghi ledger: kế hoạch input (`input_specs`, `input_sources`, `item_local`)
+   + cờ `deferred_start` ⇒ **watcher** sẽ tự làm bước 9–10.
+9. **Watcher** (nền, 1 tiến trình/job): push input (nếu có input local) vào
+   **kho dùng chung của host** (`<layout_root>/inputs/{key}/`) — mỗi (host,
+   nguồn) **một lần**, có `--partial` để resume — rồi launch job trên host
+   (`setsid nohup`), ghi meta.json.
+10. Watcher theo dõi job (heartbeat, failover, pull artifact).
 11. Trả JSON `{job, state, host, host_reasons, next}` — exit **0**.
+
+**Vì sao bước 9–10 nằm ở watcher (B36/C10).** Trước đây `do` tự push input +
+launch ⇒ mỗi item của lô `--each` tốn ~7 round-trip ssh (~21–26 s đo thật)
+**tuần tự** ⇒ các job của lô **không bao giờ chạy chồng nhau** ⇒ fleet không
+tính toán song song. Hoãn cho watcher ⇒ mỗi watcher tự đẩy + launch **song
+song** ⇒ lô chạy chồng nhau, và `do` trả JSON **ngay**.
+
+Ngoại lệ: nếu **không có watcher nào** sẽ khởi chạy job (chế độ
+`ROFF_NO_WATCHER=1` — chỉ dùng cho test) thì `do` tự làm bước 9 **ngay** (để
+job không bị bỏ rơi) và báo lỗi ngay như trước.
 
 **Không bao giờ** chạy lệnh `--cmd` trên máy local. Nếu không còn host nào
 dùng được ⇒ exit **10** với `error` liệt kê host nào bị loại và vì say, kèm
@@ -325,12 +357,14 @@ dùng được ⇒ exit **10** với `error` liệt kê host nào bị loại v�
 | `ROFF_CONFIG` | đường dẫn config (mặc định `~/.config/roff/config.ini`) |
 | `ROFF_SSH_CONFIG` | đường dẫn `ssh config` khác (mặc định `~/.ssh/config`) — mọi lệnh ssh sẽ dùng `-F` file này |
 | `ROFF_CACHE_DIR` | thư mục cache local mà `roff gc` dọn (mặc định `<state>/cache`) |
-| `ROFF_NICE` | nice level cho mọi tiến trình ssh/rsync của roff (mặc định `19`) |
-| `ROFF_IONICE` | ionice class cho mọi tiến trình ssh/rsync của roff (mặc định `idle`) |
+| `ROFF_NICE` | nice level cho **mọi** tiến trình local của roff — ssh/rsync/tar/probe/tunnel (mặc định `19`) — **thắng** `[local] nice` trong config |
+| `ROFF_IONICE` | ionice class cho **mọi** tiến trình local của roff (mặc định `idle`) — **thắng** `[local] ionice` trong config |
+| `ROFF_REMOTE_NICE` | nice level cho **lệnh job chạy trên máy remote** (mặc định `19`) — **thắng** `[remote] nice` và `[host.<alias>] nice` |
+| `ROFF_REMOTE_IONICE` | ionice class cho **lệnh job chạy trên máy remote** (mặc định `idle`) — **thắng** `[remote] ionice` và `[host.<alias>] ionice` |
 | `ROFF_SLOT_WAIT_S` | số giây chờ xin slot khi `roff do` (mặc định `900`) — **giữ cho tương thích**: `roff do` hiện không chờ slot (timeout 0), nên biến này không còn tác dụng |
 | `ROFF_PULL_RETRIES` | số lần **thử lại** kéo artifact khi pull hỏng (mặc định `3`) — reverse tunnel hay flap nên thử lại trước khi báo `pull_failed` (exit 74) |
 | `ROFF_PULL_RETRY_DELAY_S` | giãn cách giữa 2 lần thử kéo artifact, giây (mặc định `5`) |
-| `ROFF_NO_WATCHER=1` | không spawn watcher (chỉ dùng cho test) |
+| `ROFF_NO_WATCHER=1` | không spawn watcher (chỉ dùng cho test) — khi đó `do` tự đẩy input + launch (đường dẫn nội tuyến, tuần tự) |
 | `ROFF_LOCAL=1` | hook bỏ qua; **không** có tác dụng với CLI |
 
 > Thư mục skill **không** cấu hình được: nó suy ra từ vị trí `roff.py` (`__file__`),
@@ -338,6 +372,42 @@ dùng được ⇒ exit **10** với `error` liệt kê host nào bị loại v�
 
 Biến của **hook** (không phải của CLI) — xem `skill/hooks/claude-code/README.md`:
 `ROFF_LOCAL=1`, `ROFF_HOOK_OFF=1`, `ROFF_HOOK_OUTPUT=json`, `ROFF_HOOK_TOOLS=name1,name2`.
+
+### 17.1 Chính sách `nice`/`ionice`
+
+**Một** nơi quyết định (`roffkit.config`) — mọi module (`probe`, `sshx`,
+`tunnel`, `job`, `transfer`) dùng chung ⇒ cùng env + cùng config ⇒ **cùng**
+một kết quả.
+
+Thứ tự ưu tiên: **biến môi trường > config > mặc định**.
+
+| Nơi | Dùng cho | Mặc định | Biến môi trường |
+|---|---|---|---|
+| `[local] nice` / `[local] ionice` | tiến trình **local** của roff (ssh/rsync/tar/probe/tunnel) | `19` / `idle` | `ROFF_NICE` / `ROFF_IONICE` |
+| `[remote] nice` / `[remote] ionice` | **lệnh của người dùng chạy trên máy remote** | `19` / `idle` | `ROFF_REMOTE_NICE` / `ROFF_REMOTE_IONICE` |
+| `[host.<alias>] nice` / `ionice` | ghi đè `[remote]` cho **riêng host** đó | (không ghi đè) | (như trên) |
+
+Giá trị `ionice` nhận: `idle` (→ `ionice -c3`), `best-effort` (→ `-c2`),
+`realtime` (→ `-c1`), hoặc số `0`–`3`.
+
+Quy tắc biên:
+
+* `nice = 0` ⇒ **không** bọc `nice` (người dùng muốn job ưu tiên cao);
+* `nice` âm ⇒ coi như `0` (nâng ưu tiên cần quyền đặc biệt — roff không tự
+  làm việc đó); `nice > 19` ⇒ coi như `19`;
+* `ionice` rỗng hoặc `none` ⇒ **không** bọc `ionice`;
+* giá trị rác trong biến môi trường ⇒ **bỏ qua** (đọc tiếp config);
+* config **hỏng / không đọc được** ⇒ dùng **mặc định**, **không** làm chết
+  tiến trình (cùng nguyên tắc `strict=False` của B27);
+* `ionice = realtime` (`-c1`) **cần quyền** (`CAP_SYS_NICE` / root) — đo thật
+  24/11/2026 trên máy chạy unit test: không có quyền thì `ionice` fail với
+  *"Operation not permitted"* ⇒ **job không chạy**. Với `idle` (mặc định) thì
+  mọi user đều được; trên fleet Muse (đăng nhập **root**) `realtime` dùng
+  được, nhưng nếu host đăng nhập bằng user thường thì **đừng** đặt
+  `realtime`.
+
+Trên máy remote, `nice`/`ionice` được kiểm tra **trên host** (`command -v`)
+trước khi bọc ⇒ host không có thì job chạy bình thường.
 
 ## 18. Skill
 

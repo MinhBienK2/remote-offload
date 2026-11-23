@@ -1,0 +1,19 @@
+{
+  "tag": "final",
+  "started_at": "2026-11-24 01:21:58",
+  "steps": {
+    "fleet": {
+      "ok": true
+    },
+    "acceptance": {
+      "rc": 1,
+      "seconds": 2973.0,
+      "tail": "ạy).\n        alias = next((a for a in fleet if ssh_ok(a)), \"\")\n        if not alias:\n            pytest.skip(\"mọi máy muse đã chết giữa chừng — sự cố hạ tầng\")\n        pin_host(cfg, alias, slots=1)\n    \n        src = tmp_path / \"data\"\n        src.mkdir()\n        (src / \"payload.bin\").write_bytes(b\"s28\" * 4096)\n        out = tmp_path / \"out\"\n    \n        rc, obj, err = do_on(alias, [\n            \"--in\", str(src),\n            \"--cmd\", \"sleep 45; cp \\\"$ROFF_IN/payload.bin\\\" \\\"$ROFF_OUT/payload.bin\\\"\",\n            \"--out\", str(out),\n            \"--name\", \"s28-gc\",\n        ], cfg)\n        if rc == 255 and str(obj.get(\"reason\") or \"\") == \"host_unreachable\":\n            pytest.skip(f\"host {alias} chết ngay lúc gửi job — sự cố hạ tầng\")\n        assert rc == 0, f\"roff do lỗi: rc={rc} obj={obj} err={err[-300:]}\"\n        job = obj.get(\"job\")\n        assert job\n    \n        led = ledger(cfg[\"state\"], job)\n        root = layout_root_of(led)\n        key = str((led.get(\"_roff\") or {}).get(\"input_shared_key\") or \"\")\n        assert key, f\"job không ghi input_shared_key: {led.get('_roff')}\"\n        store = f\"{root}/inputs/{key}\"\n    \n        # kho input phải tồn tại trên host\n        state = dir_state(alias, store)\n        if state is None:\n            pytest.skip(f\"host {alias} không với được lúc đo — sự cố hạ tầng\")\n>       assert state is True, (\n            f\"không thấy kho input {store} trên {alias} (ssh hỏng: {state})\")\nE       AssertionError: không thấy kho input /home/hatch/.roff/inputs/b57c65a13f9c3032 trên muse-tampt (ssh hỏng: False)\nE       assert False is True\n\ntests/acceptance/test_acceptance_w3_resilience.py:487: AssertionError\n=========================== short test summary info ============================\nFAILED tests/acceptance/test_acceptance_nice_policy.py::test_s49c_remote_job_runs_when_host_has_no_nice\nFAILED tests/acceptance/test_acceptance_w3_resilience.py::test_s28_gc_cleans_host_input_store_but_not_running_jobs\nSKIPPED [1] tests/acceptance/_common.py:184: job 261124-013945-89ae mất vì host chết (reason=workdir_missing) — sự cố hạ tầng, không phải lỗi roff\nSKIPPED [1] tests/acceptance/_common.py:184: job 261124-014456-0b35 mất vì host chết (reason=input_push_failed) — sự cố hạ tầng, không phải lỗi roff\nSKIPPED [1] tests/acceptance/test_acceptance_safety.py:260: host muse-tampt chết lúc dựng HTTP server — sự cố hạ tầng: ex.html\"; cd \"$d\" && nohup python3 -m http.server 8731 --bind 127.0.0.1 </dev/null >/dev/null 2>&1 & echo $! > /tmp/roff-s12-http.pid; sleep 2; cat /tmp/roff-s12-http.pid']' timed out after 60 seconds\nSKIPPED [1] tests/acceptance/test_acceptance_w4_w5.py:146: không dựng được HTTP server trên muse-tampt\nSKIPPED [1] tests/acceptance/test_acceptance_w4_w5.py:217: không dựng được HTTP server trên muse-tampt\nSKIPPED [1] tests/acceptance/test_acceptance_w7.py:254: host muse-tampt chết (job giữ slot failover sang muse-phamminhbien3333) — sự cố hạ tầng\n============= 2 failed, 48 passed, 6 skipped in 2972.26s (0:49:32) =============\n"
+    },
+    "measure": {
+      "rc": 0,
+      "seconds": 112.2
+    }
+  },
+  "finished_at": "2026-11-24 02:14:08"
+}

@@ -1,0 +1,19 @@
+{
+  "tag": "final",
+  "started_at": "2026-11-24 02:24:06",
+  "steps": {
+    "fleet": {
+      "ok": true
+    },
+    "acceptance": {
+      "rc": 1,
+      "seconds": 3276.8,
+      "tail": "kip(f\"máy remote chết lúc gửi job — sự cố hạ tầng: {err[-200:]}\")\n        assert rc == 0, f\"roff do thất bại: rc={rc} obj={obj} err={err[-400:] if err else ''}\"\n        alias = used_hosts[-1]\n        job_ids = [j for j in (obj.get(\"jobs\") or [obj.get(\"job\")]) if j]\n        assert len(job_ids) == 2, f\"phải tạo 2 job: {job_ids}\"\n    \n        # Chờ job thực sự chạy (có pid trong ledger)\n        pids: list[int] = []\n        deadline = time.time() + 180\n        while time.time() < deadline and not pids:\n            for jid in job_ids:\n                led = _ledger(cfg[\"state\"], jid)\n                for att in led.get(\"attempts\") or []:\n                    if att.get(\"pid\"):\n                        pids.append(int(att[\"pid\"]))\n            if not pids:\n                time.sleep(3)\n        assert pids, \"job chưa ghi nhận pid ⇒ không giết được để thử failover\"\n    \n        # Giết process group của chính job (không đụng tiến trình khác của user)\n        for pid in set(pids):\n            ssh_out(alias, f\"kill -TERM -{pid} 2>/dev/null || true\")\n        time.sleep(10)\n    \n        results = _wait_all(cfg[\"state\"], job_ids, timeout=900, env=cfg[\"env\"])\n    \n        failover_hosts: dict[str, str] = {}\n        for jid in job_ids:\n            led = _ledger(cfg[\"state\"], jid)\n            events = [e.get(\"event\") for e in ((led.get(\"_roff\") or {}).get(\"events\") or [])]\n>           assert \"failover\" in events, f\"job {jid} không failover: {events}\"\nE           AssertionError: job 261124-023327-94aa không failover: ['pulled', 'finished']\nE           assert 'failover' in ['pulled', 'finished']\n\ntests/acceptance/test_acceptance_dataflow.py:381: AssertionError\n=========================== short test summary info ============================\nFAILED tests/acceptance/test_acceptance_dataflow.py::test_s24_failover_keeps_item_and_workdir\nSKIPPED [1] tests/acceptance/_common.py:184: job 261124-024502-70a2 mất vì host chết (reason=workdir_missing) — sự cố hạ tầng, không phải lỗi roff\nSKIPPED [1] tests/acceptance/_common.py:184: job 261124-024953-3aea mất vì host chết (reason=host_restarted) — sự cố hạ tầng, không phải lỗi roff\nSKIPPED [1] tests/acceptance/test_acceptance_safety.py:260: host muse-pmb333 chết lúc dựng HTTP server — sự cố hạ tầng: ex.html\"; cd \"$d\" && nohup python3 -m http.server 8731 --bind 127.0.0.1 </dev/null >/dev/null 2>&1 & echo $! > /tmp/roff-s12-http.pid; sleep 2; cat /tmp/roff-s12-http.pid']' timed out after 60 seconds\nSKIPPED [1] tests/acceptance/test_acceptance_w3_resilience.py:0: sự cố hạ tầng (rc=255) — máy remote chết / đường truyền đứt; KHÔNG phải lỗi của roff (docs/REPORT.md §2)\nSKIPPED [1] tests/acceptance/test_acceptance_w3_resilience.py:540: host muse-pmb333 không với được lúc đo — sự cố hạ tầng\nSKIPPED [2] tests/acceptance/test_acceptance_w7.py:0: sự cố hạ tầng (connection timed out) — máy remote chết / đường truyền đứt; KHÔNG phải lỗi của roff (docs/REPORT.md §2)\n============= 1 failed, 48 passed, 7 skipped in 3276.22s (0:54:36) =============\n"
+    },
+    "measure": {
+      "rc": 0,
+      "seconds": 128.3
+    }
+  },
+  "finished_at": "2026-11-24 03:21:44"
+}

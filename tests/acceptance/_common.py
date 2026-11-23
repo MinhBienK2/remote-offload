@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -222,6 +223,64 @@ HOST_DOWN_MARKERS = (
     # lệnh ssh giữa chừng chết ⇒ đó là máy chết/đường truyền đứt.
     "rc=255",
 )
+
+
+#: Số lần liên tiếp phải thấy ``lost`` mới kết luận job đã mất.
+#:
+#: ``remote_state()`` đọc ``kill -0 $PID`` trên host ⇒ nằm giữa lúc process
+#: vừa sinh / vừa chết và lúc file ``exit`` được ghi, verdict có thể **sai**.
+#: Đo thật 24/11/2026: job chạy **thành công** (``exit=0``) nhưng poll đọc
+#: trúng khoảnh giữa lúc ghi ``pid`` và lúc ghi ``exit`` ⇒ báo ``vanished``.
+#: ⇒ "chưa chắc chắn thì chờ và thử lại" (đúng quy tắc vàng của sản phẩm).
+LOST_CONFIRMATIONS = 3
+
+
+def _host_alive(alias: str) -> bool:
+    """Host còn với được không (1 lần ssh rẻ)."""
+    try:
+        p = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", alias, "echo UP"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except Exception:
+        return False
+    return p.returncode == 0 and "UP" in p.stdout
+
+
+def wait_state_settled(alias, job, timeout=240.0, poll=3.0):
+    """Chờ trạng thái job **ổn định** trên host.
+
+    ``exited``/``cancelled`` ⇒ kết luận ngay. ``lost`` ⇒ phải thấy
+    **liên tiếp** :data:`LOST_CONFIRMATIONS` lần mới kết luận (xem
+    :data:`LOST_CONFIRMATIONS`).
+
+    Returns:
+        dict trạng thái cuối (cùng kiểu ``remote_state()`` trả về).
+    """
+    from roffkit import job as job_mod
+
+    deadline = time.monotonic() + timeout
+    state: dict = {}
+    lost_seen = 0
+    while True:
+        try:
+            state = job_mod.remote_state(alias, job, timeout=30)
+        except Exception:
+            state = {}
+        kind = state.get("state")
+        if kind == "lost":
+            lost_seen += 1
+            if lost_seen >= LOST_CONFIRMATIONS:
+                return state
+        else:
+            lost_seen = 0
+            if kind in ("exited", "cancelled"):
+                return state
+        if not state and not _host_alive(alias):
+            pytest.skip(f"host {alias} chết lúc chờ job — sự cố hạ tầng")
+        if time.monotonic() >= deadline:
+            return state
+        time.sleep(poll)
 
 
 def is_host_down(rc: int, obj: dict | None = None, err: str = "") -> bool:

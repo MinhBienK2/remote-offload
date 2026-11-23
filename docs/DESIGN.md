@@ -122,7 +122,7 @@ tối ưu theo "ít byte đi qua máy local", không phải "nhiều core nhất
 | Q15 | `--after`, `--in job:`, `--shards N` |
 | Q16 | **Tự chạy setup script** khi thiếu tool; idempotent theo `boot_id` + `instance_token` |
 | Q17 | Một chiều; `--sync-back <paths>` khi cần |
-| Q18 | Mọi tiến trình local chạy `nice -n 19 ionice -c3` |
+| Q18 | Mọi tiến trình local chạy `nice -n 19 ionice -c3`; **mọi** lệnh job chạy trên máy remote cũng vậy (C9) — cùng **một** nguồn sự thật (env > config > mặc định, B34) |
 | Q19 | **Không giữ tương thích** v1. Xoá layout cũ trên host |
 | Q20 | Bỏ lịch sử git; orphan branch mới |
 | Q21 | Chia subagent: tôi viết test + nghiệm thu, subagent viết code, subagent Opus review độc lập |
@@ -132,7 +132,7 @@ tối ưu theo "ít byte đi qua máy local", không phải "nhiều core nhất
 | Q25 | `--retry 1` mặc định; **chỉ retry lỗi hạ tầng, không bao giờ retry job tự fail**; timeout 2 h |
 | Q26 | Người dùng **restart thật** máy Muse giữa lúc test |
 | Q27–Q28 | Dùng được mọi máy `muse-*`; ngưỡng tài nguyên local: CPU roff+ssh **trung bình** < 2% một core (đỉnh theo cửa sổ 0,5 s **không** dùng làm ngưỡng — nó bắt cả khởi động interpreter của watcher ⇒ FAIL giả, đo thật 23/11/2026), RAM < 100 MB, lệnh tương tác không chậm > 20% |
-| Q29–Q31 | Fleet = `muse-*` + `qwen1-direct`; **60** mục kịch bản nghiệm thu trong danh mục (mã `S1`–`S47`, `S44` không dùng): **52** kịch bản có test tự động, **5** phải đo bằng tay, **2** chạy bằng script riêng, **1** đã đo bằng bằng chứng sự cố thật |
+| Q29–Q31 | Fleet = `muse-*` + `qwen1-direct`; **64** mục kịch bản nghiệm thu trong danh mục (mã `S1`–`S49`, `S44` không dùng): **56** kịch bản có test tự động, **5** phải đo bằng tay, **2** chạy bằng script riêng, **1** đã đo bằng bằng chứng sự cố thật |
 | Q32 | **Sổ chiếm chỗ chung ở local** (`flock`) cho mọi phiên/agent/harness |
 | Q33 | **Xếp hàng FIFO** khi fleet bận, có `--priority`; không bao giờ chạy local thay thế |
 | Q34 | `--cpus N` / `--mem`, export `$ROFF_CPUS`; mặc định job chiếm trọn host |
@@ -175,7 +175,7 @@ skill/
 docs/
   DESIGN.md           ← file này
   SPEC-CLI.md         ← hợp đồng CLI: từng lệnh, từng tham số, từng exit code
-  SCENARIOS.md        ← 60 mục kịch bản nghiệm thu + test hồi quy
+  SCENARIOS.md        ← 64 mục kịch bản nghiệm thu + test hồi quy
   REPORT.md           ← kết quả nghiệm thu (viết sau khi chạy)
 ```
 
@@ -360,7 +360,7 @@ bị khóa read-only sau khi đẩy xong để một job không sửa bóp dữ 
 
 Quy tắc băng thông:
 - trần **2 luồng truyền đồng thời** toàn máy (Q37), dùng chung qua sổ `flock`
-- mọi tiến trình transfer chạy `nice -n 19 ionice -c3`
+- mọi tiến trình transfer chạy `nice -n 19 ionice -c3` (chính sách **chung** với mọi module — B34: trước đó có 5 bản sao / 3 nguồn sự thật)
 - `--bwlimit` tuỳ chọn
 - **không nén** dữ liệu đã nén (`.mp4 .mov .mkv .jpg .png .zip .gz .xz .bz2 .zst`)
 - nén `-z` cho dữ liệu text/code (đo thật: 100 MB zero-byte nén còn 10,7 s vs random 3 phút)
@@ -384,10 +384,19 @@ probe_cache_s = 60
 
 [local]
 max_parallel_transfers = 2
+# Ưu tiên của **tiến trình local** của roff (ssh/rsync/watcher).
+# `nice = 0` ⇒ không bọc nice; `ionice = none` ⇒ không bọc ionice.
 nice = 19
 ionice = idle
 cache_max_mb = 5120
 cache_min_free_mb = 3072
+
+[remote]
+# Ưu tiên của **lệnh job chạy trên máy remote** (C9) ⇒ job của roff không
+# cạnh tranh với postgres/telegram-bot/cloudflared của người dùng trên đó.
+# Ghi đè theo host: [host.muse-pmb333] nice = 10
+nice = 19
+ionice = idle
 
 [heavy]
 # lệnh bị hook chặn (ngoài danh sách mặc định)
@@ -470,7 +479,7 @@ Chi tiết đầy đủ: `docs/SPEC-CLI.md` (viết bởi subagent, tôi duyệt
 
 ## 7. Kịch bản nghiệm thu
 
-60 mục kịch bản (mã `S1`–`S47`, `S44` không dùng): 52 kịch bản có test tự động trong `tests/acceptance/`, 5 đo tay, 2 chạy bằng script riêng, 1 đã đo bằng bằng chứng sự cố thật — chi tiết ở `docs/SCENARIOS.md`. Tóm tắt:
+64 mục kịch bản (mã `S1`–`S49`, `S44` không dùng): 56 kịch bản có test tự động trong `tests/acceptance/`, 5 đo tay, 2 chạy bằng script riêng, 1 đã đo bằng bằng chứng sự cố thật — chi tiết ở `docs/SCENARIOS.md`. Tóm tắt:
 
 | Nhóm | Kịch bản |
 |---|---|

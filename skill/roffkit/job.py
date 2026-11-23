@@ -22,7 +22,6 @@ import io
 import json
 import os
 import shlex
-import shutil
 import subprocess
 import tarfile
 import time
@@ -39,7 +38,7 @@ try:  # phần A — fallback tối giểu để test chạy được khi A chư
         EXIT_UNREACHABLE,
         RoffError,
     )
-except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi A/B merge
+except ImportError:  # pragma: no cover - module chạy đứng riêng (không có package)
     from typing import Any as _Any
 
     EXIT_CANCELLED = 130
@@ -67,12 +66,12 @@ except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi A/B
 
 try:  # lớp ssh trung tâm (ControlMaster) — không định nghĩa lại option ssh ở đây
     from . import sshx
-except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi sshx merge
+except ImportError:  # pragma: no cover - module chạy đứng riêng (không có package)
     sshx = None  # type: ignore[assignment]
 
 try:  # B25: nguồn sự thật cho tham số ``-F`` (dùng khi rơi vào fallback)
     from . import fleet
-except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi sshx merge
+except ImportError:  # pragma: no cover - module chạy đứng riêng (không có package)
     fleet = None  # type: ignore[assignment]
 
 
@@ -85,6 +84,28 @@ except ImportError:  # pragma: no cover - chạy module lẻ
         secure_dir=lambda path: None,
         secure_file=lambda path: None,
     )
+
+
+try:  # B34/C9: chính sách nice/ionice — MỘT nguồn sự thật cho 5 module
+    from .config import local_nice_prefix, remote_nice_args
+except ImportError:  # pragma: no cover - module chạy đứng riêng (không có package)
+    def local_nice_prefix() -> list[str]:  # type: ignore[no-redef]
+        """Fallback tối thiểu — xem :func:`roffkit.config.local_nice_prefix`.
+
+        Module chạy **đứng riêng** ⇒ không có ``config.py`` ⇒ **không có**
+        chính sách nice/ionice ⇒ không bọc. Chỉ là chế độ dự phòng; đường
+        chính của ``roff`` luôn import được ``config.py``.
+        """
+        return []
+
+    def remote_nice_args(host=None, config=None) -> tuple[str, str]:  # type: ignore[no-redef]
+        """Fallback tối thiểu — xem :func:`roffkit.config.remote_nice_args`.
+
+        Không đọc được config ⇒ dùng **mặc định an toàn** (``nice 19`` + I/O
+        ``idle``) để job vẫn không cạnh tranh với dịch vụ production của
+        người dùng trên cùng máy đó (C9).
+        """
+        return ("19", "3")
 
 
 __all__ = [
@@ -572,13 +593,12 @@ def remote_workdir(job: Job) -> str:
 # chạy lệnh con (seam cho test)
 # --------------------------------------------------------------------------
 def _prefix_nice() -> list[str]:
-    """Tiền tố ``nice -n 19 ionice -c3`` cho tiến trình con (Q18)."""
-    parts: list[str] = []
-    if shutil.which("nice"):
-        parts += ["nice", "-n", "19"]
-    if shutil.which("ionice"):
-        parts += ["ionice", "-c3"]
-    return parts
+    """Tiền tố ``ionice``/``nice`` cho tiến trình con (Q18).
+
+    **MỘT nguồn sự thật** (B34): gọi :func:`roffkit.config.local_nice_prefix`
+    ⇒ cùng tiền tố với probe/sshx/tunnel/transfer.
+    """
+    return local_nice_prefix()
 
 
 def _config_args() -> list[str]:
@@ -670,7 +690,25 @@ if [ -f "$JOBDIR/env" ]; then
   set +a
 fi
 cd "$ROFF_WORK" 2>/dev/null || cd "$JOBDIR"
-sh -c "$(cat "$JOBDIR/cmd")"
+# Ưu tiên CPU/I-O của **job trên máy remote** (C9): mặc định `nice 19` +
+# I/O `idle` ⇒ job KHÔNG cạnh tranh với postgres/telegram-bot/cloudflared
+# của chính người dùng đang chạy trên cùng máy đó.
+#   * `nice`/`ionice` kiểm tra **trên host** (`command -v`) ⇒ host không có
+#     thì job vẫn chạy bình thường, KHÔNG chết;
+#   * `__NICE__`/`__IONICE__` rỗng ⇒ không bọc (nice = 0 / ionice = none);
+#   * KHÔNG dùng `exec`: `run.sh` phải còn sống để ghi `$JOBDIR/exit` — sau
+#     `exec`, `rc=$?` không bao giờ chạy ⇒ job không bao giờ có exit code.
+if [ -n "__NICE__" ] && command -v nice >/dev/null 2>&1; then
+  if [ -n "__IONICE__" ] && command -v ionice >/dev/null 2>&1; then
+    nice -n __NICE__ ionice -c__IONICE__ -- sh -c "$(cat "$JOBDIR/cmd")"
+  else
+    nice -n __NICE__ -- sh -c "$(cat "$JOBDIR/cmd")"
+  fi
+elif [ -n "__IONICE__" ] && command -v ionice >/dev/null 2>&1; then
+  ionice -c__IONICE__ -- sh -c "$(cat "$JOBDIR/cmd")"
+else
+  sh -c "$(cat "$JOBDIR/cmd")"
+fi
 rc=$?
 printf '%s\n' "$rc" > "$JOBDIR/exit"
 exit $rc
@@ -851,10 +889,14 @@ def launch(
         "shards": job.shards,
         "item": job.item,
     }
+    # Chính sách nice/ionice cho **lệnh job chạy trên host** (C9) — chốt ở
+    # phía local rồi điền vào `run.sh` (máy remote có thể không có `nice`).
+    nice_value, ionice_value = remote_nice_args(host)
+    run_sh = _RUN_SH.replace("__NICE__", nice_value).replace("__IONICE__", ionice_value)
     members = {
         "env": (_env_file(env), 0o600),
         "cmd": (str(job.cmd).encode("utf-8"), 0o600),
-        "run.sh": (_RUN_SH.encode("utf-8"), 0o700),
+        "run.sh": (run_sh.encode("utf-8"), 0o700),
         "launch.sh": (
             _build_launch_script(out_dir, work_dir, job, cpus, mem_mb, layout_root).encode(
                 "utf-8"

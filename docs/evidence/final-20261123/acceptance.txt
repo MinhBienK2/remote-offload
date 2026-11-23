@@ -1,0 +1,72 @@
+============================= test session starts ==============================
+platform linux -- Python 3.10.12, pytest-8.2.0, pluggy-1.6.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+rootdir: /home/minhbien/Documents/remote-offload
+configfile: pytest.ini
+plugins: anyio-4.14.0, langsmith-0.3.45, asyncio-0.23.6
+asyncio: mode=strict
+collecting ... collected 52 items
+
+tests/acceptance/test_acceptance_b22.py::test_s43_gc_removes_orphan_lock_but_keeps_live_lock PASSED [  1%]
+tests/acceptance/test_acceptance_config_safety.py::test_s47_missing_config_fails_loud_and_creates_no_job PASSED [  3%]
+tests/acceptance/test_acceptance_config_safety.py::test_s47_config_present_keeps_fleet_restricted PASSED [  5%]
+tests/acceptance/test_acceptance_dataflow.py::test_s23_input_pushed_once_per_host SKIPPED [  7%]
+tests/acceptance/test_acceptance_dataflow.py::test_s24_failover_keeps_item_and_workdir SKIPPED [  9%]
+tests/acceptance/test_acceptance_fleet.py::test_s03_ffmpeg_transcode_artifacts PASSED [ 11%]
+tests/acceptance/test_acceptance_fleet.py::test_s04_url_input_prefers_internet_host PASSED [ 13%]
+tests/acceptance/test_acceptance_fleet.py::test_s05_insufficient_ram_never_runs_local PASSED [ 15%]
+tests/acceptance/test_acceptance_fleet.py::test_s13_all_hosts_dead_never_runs_local PASSED [ 17%]
+tests/acceptance/test_acceptance_fleet.py::test_s14_secret_not_in_remote_argv PASSED [ 19%]
+tests/acceptance/test_acceptance_fleet.py::test_s15_stale_master_does_not_kill_foreign_pid PASSED [ 21%]
+tests/acceptance/test_acceptance_pull_failed.py::test_s45_pull_failure_is_reported_not_swallowed PASSED [ 23%]
+tests/acceptance/test_acceptance_resilience.py::test_s07_tunnel_drop_does_not_failover PASSED [ 25%]
+tests/acceptance/test_acceptance_resilience.py::test_s09_side_effects_never_retried PASSED [ 26%]
+tests/acceptance/test_acceptance_resilience.py::test_s10_job_survives_agent_death PASSED [ 28%]
+tests/acceptance/test_acceptance_resilience.py::test_s11_shards_spread_over_hosts PASSED [ 30%]
+tests/acceptance/test_acceptance_resilience.py::test_s18_parallel_speedup SKIPPED [ 32%]
+tests/acceptance/test_acceptance_review.py::test_s31_ssh_actually_uses_replacement_ssh_config PASSED [ 34%]
+tests/acceptance/test_acceptance_review.py::test_s31b_without_replacement_config_alias_is_unknown PASSED [ 36%]
+tests/acceptance/test_acceptance_review.py::test_s32_broken_ledger_does_not_wipe_the_slot_queue PASSED [ 38%]
+tests/acceptance/test_acceptance_safety.py::test_s14_secret_never_leaks PASSED [ 40%]
+tests/acceptance/test_acceptance_safety.py::test_s13_all_hosts_dead PASSED [ 42%]
+tests/acceptance/test_acceptance_safety.py::test_s12_tunnel_serves_and_stops_cleanly SKIPPED [ 44%]
+tests/acceptance/test_acceptance_safety.py::test_s19_three_sessions_share_the_fleet PASSED [ 46%]
+tests/acceptance/test_acceptance_sync_back.py::test_s46_sync_back_pulls_file_into_project PASSED [ 48%]
+tests/acceptance/test_acceptance_w3_resilience.py::test_s25_leaked_slot_does_not_block_host_forever PASSED [ 50%]
+tests/acceptance/test_acceptance_w3_resilience.py::test_s26_queued_job_auto_launches_when_slot_frees PASSED [ 51%]
+tests/acceptance/test_acceptance_w3_resilience.py::test_s27_state_files_are_private PASSED [ 53%]
+tests/acceptance/test_acceptance_w3_resilience.py::test_s28_gc_cleans_host_input_store_but_not_running_jobs PASSED [ 55%]
+tests/acceptance/test_acceptance_w3_resilience.py::test_s29_error_exit_codes_are_not_confused PASSED [ 57%]
+tests/acceptance/test_acceptance_w3_resilience.py::test_s30_job_routed_to_host_that_has_the_tool PASSED [ 59%]
+tests/acceptance/test_acceptance_w4_w5.py::test_s33_tunnel_link_end_to_end_on_real_fleet SKIPPED [ 61%]
+tests/acceptance/test_acceptance_w4_w5.py::test_s33b_tunnel_link_reports_remote_not_listening PASSED [ 63%]
+tests/acceptance/test_acceptance_w4_w5.py::test_s33c_tunnel_list_shows_then_hides_the_link SKIPPED [ 65%]
+tests/acceptance/test_acceptance_w4_w5.py::test_s34_doctor_reports_json_and_exit_code PASSED [ 67%]
+tests/acceptance/test_acceptance_w4_w5.py::test_s34b_doctor_does_not_write_anything PASSED [ 69%]
+tests/acceptance/test_acceptance_w4_w5.py::test_s34c_doctor_default_does_not_probe_network PASSED [ 71%]
+tests/acceptance/test_acceptance_w4_w5.py::test_s35_gc_removes_legacy_and_old_terminal_jobs PASSED [ 73%]
+tests/acceptance/test_acceptance_w4_w5.py::test_s35b_legacy_job_is_not_held_as_running PASSED [ 75%]
+tests/acceptance/test_acceptance_w4_w5.py::test_s35c_wait_on_legacy_job_returns_immediately PASSED [ 76%]
+tests/acceptance/test_acceptance_w4_w5.py::test_s36_changing_ssh_config_does_not_reuse_the_old_master PASSED [ 78%]
+tests/acceptance/test_acceptance_w6.py::test_s37_infers_tool_from_command PASSED [ 80%]
+tests/acceptance/test_acceptance_w6.py::test_s37_explicit_need_is_not_guessed_away PASSED [ 82%]
+tests/acceptance/test_acceptance_w6.py::test_s38_inferred_tool_never_rejects_or_installs PASSED [ 84%]
+tests/acceptance/test_acceptance_w6.py::test_s39_builtin_command_infers_nothing PASSED [ 86%]
+tests/acceptance/test_acceptance_w6.py::test_s39_waits_for_inferred_job_to_finish PASSED [ 88%]
+tests/acceptance/test_acceptance_w7.py::test_s40_orphan_shared_lock_is_cleaned_and_job_runs PASSED [ 90%]
+tests/acceptance/test_acceptance_w7.py::test_s41_missing_local_input_ends_with_clear_reason PASSED [ 92%]
+tests/acceptance/test_acceptance_w7.py::test_s42_pinned_host_unreachable_fails_loud_without_failover PASSED [ 94%]
+tests/acceptance/test_lifecycle_real.py::test_s02_job_lifecycle_on_real_host PASSED [ 96%]
+tests/acceptance/test_lifecycle_real.py::test_s02b_job_failure_exit_code_on_real_host PASSED [ 98%]
+tests/acceptance/test_lifecycle_real.py::test_s06_resume_partial_transfer_on_real_host PASSED [100%]
+
+=========================== short test summary info ============================
+SKIPPED [1] tests/acceptance/test_acceptance_dataflow.py:0: sự cố hạ tầng (connection timed out) — máy remote chết / đường truyền đứt; KHÔNG phải lỗi của roff (docs/REPORT.md §2)
+SKIPPED [1] tests/acceptance/test_acceptance_dataflow.py:0: sự cố hạ tầng (assert 255 == 0) — máy remote chết / đường truyền đứt; KHÔNG phải lỗi của roff (docs/REPORT.md §2)
+SKIPPED [1] tests/acceptance/test_acceptance_resilience.py:491: các job KHÔNG chạy chồng nhau (lô chạy tuần tự) — đường lên 0,5–1 MB/s là nút thắt, không phải scheduler (docs/REPORT.md §3)
+SKIPPED [1] tests/acceptance/test_acceptance_safety.py:260: host muse-pmb333 chết lúc dựng HTTP server — sự cố hạ tầng: ex.html"; cd "$d" && nohup python3 -m http.server 8731 --bind 127.0.0.1 </dev/null >/dev/null 2>&1 & echo $! > /tmp/roff-s12-http.pid; sleep 2; cat /tmp/roff-s12-http.pid']' timed out after 60 seconds
+SKIPPED [1] tests/acceptance/test_acceptance_w4_w5.py:177: muse-pmb333 chết lúc gọi qua link — sự cố hạ tầng
+SKIPPED [1] tests/acceptance/test_acceptance_w4_w5.py:229: máy chết lúc mở link — sự cố hạ tầng:
+================== 46 passed, 6 skipped in 3217.69s (0:53:37) ==================
+
+----- stderr -----
