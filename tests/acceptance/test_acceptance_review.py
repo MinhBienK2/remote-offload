@@ -27,6 +27,15 @@ from pathlib import Path
 
 import pytest
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _common as common  # noqa: E402
+_DEFAULT_STATE = common.DEFAULT_STATE  # dùng chung (xem _common.py)
+
+
+
+#: State dir **riêng cho test** — test KHÔNG được ghi vào ledger thật của
+#: người dùng (``~/.local/state/roff``). Nếu không, mỗi lần chạy nghiệm thu lại
+
 REPO = Path(__file__).resolve().parents[2]
 SKILL = REPO / "skill"
 LAUNCHER = SKILL / "roff.py"
@@ -38,9 +47,7 @@ DEAD_PORT = 59999
 
 
 def roff_json(args, timeout=300, env=None):
-    e = dict(os.environ)
-    if env:
-        e.update(env)
+    e = common.roff_env(env)
     p = subprocess.run([sys.executable, str(LAUNCHER)] + list(args),
                        capture_output=True, text=True, timeout=timeout, env=e)
     lines = [ln for ln in p.stdout.strip().splitlines() if ln.strip()]

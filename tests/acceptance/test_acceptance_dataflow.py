@@ -11,13 +11,21 @@ khi lỗi là do host chết (không phải do logic của roff).
 """
 import hashlib
 import json
-import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 import pytest
+
+#: State dir **riêng cho test** — test KHÔNG được ghi vào ledger thật của
+#: người dùng (``~/.local/state/roff``). Nếu không, mỗi lần chạy nghiệm thu lại
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _common as common  # noqa: E402
+_DEFAULT_STATE = common.DEFAULT_STATE  # dùng chung (xem _common.py)
+
+from _common import wait_or_skip  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 SKILL = REPO / "skill"
@@ -32,9 +40,7 @@ HOST_DEATH_REASONS = {"no_host", "host_unreachable", "unknown_host", "empty_flee
 
 
 def roff(args, timeout=300, env=None):
-    e = dict(os.environ)
-    if env:
-        e.update(env)
+    e = common.roff_env(env)
     p = subprocess.run([sys.executable, str(LAUNCHER)] + list(args),
                        capture_output=True, text=True, timeout=timeout, env=e)
     return p
@@ -134,13 +140,16 @@ def _sha256(path: Path) -> str:
 
 
 def _wait_all(state_dir: Path, job_ids, timeout=900, env=None):
-    """Chờ mọi job tới trạng thái cuối; trả về dict job_id -> payload."""
+    """Chờ mọi job tới trạng thái cuối; trả về dict job_id -> payload.
+
+    Job **mất vì máy chết** ⇒ ``skip`` (sự cố hạ tầng), không phải lỗi `roff`.
+    """
     out = {}
     deadline = time.time() + timeout
     for jid in job_ids:
         remaining = max(30, deadline - time.time())
-        rc, obj, err = roff_json(["wait", jid, "--timeout", str(int(remaining))],
-                                  timeout=remaining + 60, env=env)
+        rc, obj, err = wait_or_skip(jid, timeout=remaining + 60, env=env,
+                                    wait_timeout=int(remaining))
         assert rc == 0, f"job {jid} không hoàn tất: rc={rc} obj={obj} err={err[-300:]}"
         out[jid] = obj
     return out
@@ -204,6 +213,8 @@ def test_s23_input_pushed_once_per_host(fleet, cfg, tmp_path):
         ]
 
     rc, obj, err = _do_with_retry(build, cfg, timeout=1200)
+    if common.is_host_down(rc, obj, err):
+        pytest.skip(f"máy remote chết lúc gửi job — sự cố hạ tầng: {err[-200:]}")
     assert rc == 0, f"roff do thất bại: rc={rc} obj={obj} err={err[-400:]}"
     job_ids = obj.get("jobs") or [obj.get("job")]
     job_ids = [j for j in job_ids if j]
@@ -326,6 +337,8 @@ def test_s24_failover_keeps_item_and_workdir(fleet, cfg, tmp_path):
             break
         time.sleep(5)
 
+    if common.is_host_down(rc, obj, err):
+        pytest.skip(f"máy remote chết lúc gửi job — sự cố hạ tầng: {err[-200:]}")
     assert rc == 0, f"roff do thất bại: rc={rc} obj={obj} err={err[-400:] if err else ''}"
     alias = used_hosts[-1]
     job_ids = [j for j in (obj.get("jobs") or [obj.get("job")]) if j]

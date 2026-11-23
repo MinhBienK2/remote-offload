@@ -1,0 +1,49 @@
+{
+  "hosts": [
+    {
+      "alias": "muse-pmb333",
+      "reachable": true,
+      "error": null,
+      "cores": 4,
+      "mem_available_mb": 1435,
+      "disk_free_mb": 143755,
+      "durable": true,
+      "layout_root": "/home/hatch/.roff",
+      "internet": true
+    },
+    {
+      "alias": "muse-tampt",
+      "reachable": true,
+      "error": null,
+      "cores": 4,
+      "mem_available_mb": 776,
+      "disk_free_mb": 147490,
+      "durable": true,
+      "layout_root": "/home/hatch/.roff",
+      "internet": false
+    },
+    {
+      "alias": "muse-bienpm333",
+      "reachable": true,
+      "error": null,
+      "cores": 4,
+      "mem_available_mb": 816,
+      "disk_free_mb": 148389,
+      "durable": true,
+      "layout_root": "/home/hatch/.roff",
+      "internet": false
+    },
+    {
+      "alias": "muse-phamminhbien3333",
+      "reachable": true,
+      "error": null,
+      "cores": 4,
+      "mem_available_mb": 707,
+      "disk_free_mb": 148453,
+      "durable": true,
+      "layout_root": "/home/hatch/.roff",
+      "internet": true
+    }
+  ],
+  "count": 4
+}

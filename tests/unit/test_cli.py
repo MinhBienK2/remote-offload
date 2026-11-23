@@ -680,7 +680,7 @@ def test_push_requires_name(env, fake_ssh, tmp_path):
 def test_pull_fetches_artifacts(env, fake_ssh, tmp_path):
     """``roff pull`` kéo artifact về local."""
     good_host(fake_ssh)
-    job = make_job(job_id="job-pull", state="exited", exit_code=0)
+    make_job(job_id="job-pull", state="exited", exit_code=0)
     rc, out, _err = run(["pull", "job-pull", "--local", str(tmp_path / "out")], env)
     assert rc == 0
     payload = only_json(out)

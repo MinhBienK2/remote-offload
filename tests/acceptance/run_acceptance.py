@@ -18,8 +18,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -39,8 +41,13 @@ def run(argv, cwd=REPO, timeout=3600, env=None):
         "argv": argv,
         "rc": p.returncode,
         "seconds": round(time.time() - started, 1),
+        # `stdout` bị **cắt** ở cuối (chỉ để in log) — nhưng bằng chứng phải
+        # giữ **toàn bộ**: cắt mất đầu ⇒ mất dòng kết quả của các test đầu
+        # ⇒ `make_report_table.py` báo "—" cho những test đó.
         "stdout": p.stdout[-20000:],
+        "stdout_full": p.stdout[:2_000_000],
         "stderr": p.stderr[-20000:],
+        "stderr_full": p.stderr[:2_000_000],
     }
 
 
@@ -70,13 +77,31 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--skip", action="append", default=[],
                     choices=["acceptance", "measure", "s1"])
+    ap.add_argument("--only", action="append", default=[],
+                    choices=["acceptance", "measure", "s1"],
+                    help="chỉ chạy các bước này (bỏ qua các bước còn lại)")
     ap.add_argument("--tag", default=None)
     args = ap.parse_args()
+
+    # `--only` thắng `--skip`: chạy **đúng** các bước được yêu cầu.
+    #
+    # BUG (đo thật 23/11/2026): trước đây `--skip` **không có tác dụng** —
+    # `steps` được tính từ `--only` hoặc lấy **đủ** 3 bước, còn danh sách
+    # `skipped` chỉ được dùng để in ra ⇒ `--skip s1` vẫn **chạy** S1 ⇒ mở
+    # phiên Claude Code mới ⇒ **tốn token** ngoài ý muốn (đã thấy đúng lần
+    # này: `--skip s1` mà S1 vẫn chạy, mất ~5 phút + token).
+    if args.only:
+        steps = [s for s in ("acceptance", "measure", "s1") if s in args.only]
+    else:
+        steps = [s for s in ("acceptance", "measure", "s1") if s not in args.skip]
+    skipped = [s for s in args.skip if s not in steps]
 
     tag = args.tag or time.strftime("%Y%m%d-%H%M%S")
     outdir = EVIDENCE / tag
     outdir.mkdir(parents=True, exist_ok=True)
     print(f"[nghiệm thu] thư mục bằng chứng: {outdir}")
+    print(f"[nghiệm thu] bước: {', '.join(steps)}"
+          + (f" | bỏ qua: {', '.join(skipped)}" if skipped else ""))
 
     report = {"tag": tag, "started_at": time.strftime("%Y-%m-%d %H:%M:%S"), "steps": {}}
 
@@ -88,19 +113,37 @@ def main() -> int:
     for h in (snap.get("hosts") or []):
         print(f"    {h['alias']:24} reachable={h['reachable']} mem={h['mem_available_mb']}MB")
 
-    if "acceptance" not in args.skip:
+    if "acceptance" in steps:
         print("[2/4] pytest tests/acceptance …")
-        res = run([sys.executable, "-m", "pytest", "tests/acceptance", "-q", "-m",
-                   "acceptance", "-rf"], timeout=5400)
+        # `-v` (không `-q`): mỗi test có **một dòng kết quả** trong acceptance.txt
+        # ⇒ `make_report_table.py` đọc được trạng thái từng kịch bản.
+        #
+        # `-rfEs`: báo cả **failed**, **error** lẫn **skipped** — cần `-s` để
+        # **lý do** của mỗi lần skip nằm trong bằng chứng (đọc được ngay là
+        # kịch bản bị bỏ qua vì hạ tầng hay vì lỗi của roff).
+        #
+        # `--basetemp` **bắt buộc** (đo thật 23/11/2026): pytest dùng thư mục
+        # `tmp_path` theo mặc định là `/tmp/pytest-of-<user>/pytest-<N>`; nếu
+        # **một** pytest khác (ví dụ lần chạy unit song song) xoá thư mục
+        # đó, thư mục của đợt đang chạy cũng bị xoá ⇒ test đỏ với lý do
+        # "FileNotFoundError" ở chỗ không liên quan. Thư mục riêng theo tag
+        # ⇒ cô lập tuyệt đối với mọi lần chạy khác.
+        basetemp = Path(tempfile.gettempdir()) / f"pytest-roff-acceptance-{tag}"
+        if basetemp.exists():
+            shutil.rmtree(basetemp, ignore_errors=True)
+        res = run([sys.executable, "-m", "pytest", "tests/acceptance", "-v", "-m",
+                   "acceptance", "-rfEs", f"--basetemp={basetemp}"], timeout=5400)
         (outdir / "acceptance.txt").write_text(
-            res["stdout"] + "\n----- stderr -----\n" + res["stderr"], encoding="utf-8")
+            (res.get("stdout_full") or res["stdout"])
+            + "\n----- stderr -----\n"
+            + (res.get("stderr_full") or res["stderr"]), encoding="utf-8")
         report["steps"]["acceptance"] = {
             "rc": res["rc"], "seconds": res["seconds"],
             "tail": res["stdout"][-3000:],
         }
         print(f"    rc={res['rc']} trong {res['seconds']}s")
 
-    if "measure" not in args.skip:
+    if "measure" in steps:
         print("[3/4] đo tài nguyên máy local khi job chạy remote…")
         res = run([sys.executable, str(HERE / "measure_job.py")], timeout=1800)
         (outdir / "measure.txt").write_text(
@@ -108,7 +151,7 @@ def main() -> int:
         report["steps"]["measure"] = {"rc": res["rc"], "seconds": res["seconds"]}
         print(f"    rc={res['rc']}")
 
-    if "s1" not in args.skip:
+    if "s1" in steps:
         print("[4/4] S1 — skill tự bật ở dự án khác…")
         res = run([sys.executable, str(HERE / "s1_skill_activation.py")], timeout=1200)
         (outdir / "s1.txt").write_text(

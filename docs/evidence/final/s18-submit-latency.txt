@@ -1,0 +1,71 @@
+BẰNG CHỨNG — B36: `roff do --each` gửi job **tuần tự**, lô KHÔNG chạy chồng nhau
+================================================================================
+Ngày đo: 23/11/2026 · Máy: local (12 core) · Fleet: 4 máy Muse (qua reverse tunnel)
+
+--------------------------------------------------------------------------------
+1. DỮ KIỆN TỪ ĐỢT NGHIỆM THU CHÍNH THỨC (`docs/evidence/final/`, 22:24–23:18)
+--------------------------------------------------------------------------------
+S18 (`test_s18_parallel_speedup`) **SKIP** với lý do:
+
+    "các job KHÔNG chạy chồng nhau (lô chạy tuần tự) — đường lên 0,5–1 MB/s là
+     nút thắt, không phải scheduler (docs/REPORT.md §3)"
+
+Mốc thời gian **thật** lấy từ **máy remote** (`/home/hatch/.roff/jobs/<id>/meta.json`
+trường `started` + mtime của file `exit`) — không phải từ log của `roff`:
+
+  Lô TUẦN TỰ (ghim 1 host — `muse-pmb333`), 4 video v0..v3:
+    v0  22:47:25 → 22:47:40   (14 s)
+    v1  22:48:20 → 22:48:34   (14 s)      cách nhau 55 s
+    v2  22:49:15 → 22:49:30   (14 s)      cách nhau 55 s
+    v3  22:50:10 → 22:50:24   (14 s)      cách nhau 55 s
+    ⇒ đúng như thiết kế: 1 host = 1 slot ⇒ xếp hàng, chạy một.
+
+  Lô SONG SONG (không ghim host), 4 video — mỗi video MỘT máy khác nhau:
+    v0  22:52:20 → 22:52:54   (34 s)   job 261123-225101-9fb8
+    v1  (không đo được — máy chết trước khi đọc lại)
+    v2  22:53:09 → 22:53:23   (14 s)   job 261123-225243-4a64  (máy `muse-tampt`)
+    v3  22:53:15 → 22:53:44   (29 s)   job 261123-225311-0b02
+    Giao đoạn chạy chồng nhau của CẢ 4: [max(start), min(end)]
+      = [22:53:15 ; 22:52:54] ⇒ **RỖNG** ⇒ không có khoảng nào cả 4 chạy cùng.
+    ⇒ v2 và v3 có chồng nhau 8 s; v0 thì không chồng với ai.
+
+  ⇒ **Khoảng cách giữa lần gửi (submit) của các item — mốc quan trọng nhất:**
+    v0  gửi lúc 22:51:01
+    v2  gửi lúc 22:52:43      (+102 s)
+    v3  gửi lúc 22:53:11      (+28 s)
+    (mốc gửi = timestamp trong mã job `261123-HHMMSS-xxxx`)
+
+--------------------------------------------------------------------------------
+2. ĐO LẠI ĐỘC LẬP (`/tmp/s18probe.py`, 23:37) — fleet lúc đó còn sống
+--------------------------------------------------------------------------------
+  video: 4 × 196.546 byte (320×240, 2 s)          ⇒ đẩy lên .4 s ở 0,5–1 MB/s
+  `roff do --cmd <nặng> --each v*.mp4 --need ffmpeg`
+    → rc=255 (máy chết giữa lô), 3 job được tạo:
+        261123-233723-431a  → muse-phamminhbien3333   gửi lúc 23:37:23
+        261123-233749-32bb  → muse-bienpm333           gửi lúc 23:37:49   (+26 s)
+        261123-233810-f7fd  → muse-pmb333              gửi lúc 23:38:10   (+21 s)
+  ⇒ **mỗi item mất ~21–26 s mới gửi xong**, dù mỗi video chỉ 196 KB.
+  ⇒ chọn host **ĐÚNG**: mỗi item một máy khác nhau (không phải lỗi phân bổ).
+  ⇒ nhưng vì gửi **tuần tự**, job sau bắt đầu sau khi job trước đã xong
+    ⇒ **fleet không bao giờ tính toán song song** cho một lô `--each`.
+
+--------------------------------------------------------------------------------
+3. VÌ SAO LÝ DO SKIP GHI SAI
+--------------------------------------------------------------------------------
+Lý do trong báo cáo là *"đường lên 0,5–1 MB/s là nút thắt"*. Đo thật thì input
+chỉ **196 KB** ⇒ đẩy mất **0,3 s** ⇒ đường lên **không** phải nút thắt.
+Nút thắt là **đường gửi job**: mỗi item tốn ~21–26 s (probe fleet + đẩy input +
+launch), và các việc đó làm **tuần tự**.
+
+Lý do skip ĐÚNG phải là: *"các job không chạy chồng nhau vì `do --each` gửi
+tuần tự (~25 s/item) — đường gửi job là nút thắt, không phải đường lên"*.
+
+--------------------------------------------------------------------------------
+4. HỆ QUẢ
+--------------------------------------------------------------------------------
+* S18 **không** đo được tăng tốc tính toán ⇒ `docs/REPORT.md` §3.1 chỉ được đo
+  trên **1 job** ⇒ chưa chứng minh được "tăng tốc" của `remote-offload` với lô.
+* Đây là **nửa còn lại** của lời hứa cốt lõi của skill: việc nặng **có** chạy
+  trên máy khác, nhưng **một lô** thì chạy như hàng đợi, không phải như fan-out.
+* Cùng dòng với **B31** (đợt trước tưởng do đường lên) — nhưng nguyên nhân
+  **khác**, và lần này đã đo được chính xác.

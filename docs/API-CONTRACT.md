@@ -23,6 +23,13 @@ skill/
     watcher.py             ← C
     tunnel.py              ← D
     cli.py                 ← C  (khung lệnh; A/B/D cung cấp phần của mình)
+    shared.py              ← W3  (kho input dùng chung theo host: lock + marker)
+    inputs.py              ← W3  (chuẩn bị input: path/git/http/job)
+    toolchain.py           ← W3  (đảm bảo host có tool cần dùng)
+    sshx.py                ← W3  (ControlMaster, fingerprint, cổng an toàn)
+    perm.py                ← W3  (quyền file state: 0600 / thư mục 0700)
+    doctor.py              ← W5  (`roff doctor` — chỉ báo, không sửa)
+    infer.py               ← W6  (suy ra tool từ câu lệnh)
   hooks/claude-code/pretooluse.py   ← D
   setups/*.sh                        ← D
   references/*.md                    ← D
@@ -50,8 +57,9 @@ subagent khác ⇒ **dừng lại và ghi vào báo cáo**, đừng tự sửa.
 EXIT_OK          = 0     # thành công
 EXIT_JOB_FAILED  = 1     # job chạy xong và fail
 EXIT_INPUT       = 2     # input sai, chưa có gì chạy (argparse cũng về đây)
-EXIT_CONFIG      = 3     # config sai / không đọc được
+EXIT_CONFIG      = 3     # config sai / không đọc được / KHÔNG TỒN TẠI (B27)
 EXIT_NO_HOST     = 10    # không còn host nào dùng được (hết slot / hết fleet)
+EXIT_PULL_FAILED = 74    # job CHẠY XONG (exit 0) nhưng artifact CHƯA về local
 EXIT_JOB_LOST    = 69    # job mất: restart / wipe / OOM / vanished
 EXIT_NO_WORKDIR  = 97    # workdir không tồn tại trên host
 EXIT_TIMEOUT     = 124   # wait hết giờ — KHÔNG phải lỗi, job vẫn chạy
@@ -63,6 +71,13 @@ REASON_RESTARTED = "host_restarted"
 REASON_WIPED     = "host_wiped"
 REASON_OOM       = "oom_killed"
 REASON_VANISHED  = "vanished"
+
+# reason cho EXIT_PULL_FAILED
+REASON_PULL_FAILED = "pull_failed"
+
+# reason cho EXIT_PULL_FAILED do sync-back (B26) — cùng exit 74
+REASON_SYNC_BACK_FAILED = "sync_back_failed"
+REASON_SYNC_BACK_OUTSIDE_PROJECT = "sync_back_outside_project"   # exit 2
 
 class RoffError(Exception):
     """Mang exit code + payload JSON. cli.main() bắt và in ra."""
@@ -82,6 +97,29 @@ def emit(obj: dict, code: int = 0) -> None:
 
 `payload()` của `RoffError` luôn có `ok: False`, `reason` (nếu có), `error` (nếu có),
 `exit_code`. Với code 255 bắt buộc có `detail` (text lỗi ssh gốc).
+
+**Phân biệt 1 và 74 (B23) — quan trọng cho agent:**
+
+| exit | Nghĩa | Agent nên làm gì |
+|---|---|---|
+| `1` | **job** chạy xong và **fail** (`exit` của job ≠ 0) | **đừng** chạy lại job; đọc log để sửa lệnh |
+| `74` | job **chạy xong thành công** (`exit` = 0) nhưng **artifact chưa về** local (`pulled=false`, có `pull_error`) | **kéo lại** bằng `roff pull <job> --local <dir>` — **không** cần chạy lại job |
+
+Trả về `74` mà báo `exit: 0` là cố ý: công việc trên máy remote **đã** xong,
+chỉ là bước kéo về local hỏng (thường do reverse tunnel rớt). Job cũ (không có
+khoá `pulled` trong ledger) thì **không** coi là hỏng ⇒ `roff wait` vẫn trả `0`
+như trước.
+
+**Exit 74 còn dùng cho `sync_back_failed` (B26).** Job đã chạy xong (`exit:0`),
+artifact **đã** về (`pulled:true`), nhưng path `--sync-back` **chưa** về ⇒
+`reason="sync_back_failed"` + `sync_back_error` khác rỗng ⇒ vẫn `74` ⇒ **kéo
+lại**, không chạy lại job.
+
+**Exit 3 cho `config_missing` (B27).** `ROFF_CONFIG` trỏ tới file **không tồn
+tại** ⇒ `roff` **dừng** thay vì im lặng bỏ `include`/`exclude` của người dùng
+⇒ fleet nới từ 4 lên 8 máy (gồm máy đã bị `exclude`). Không có `ROFF_CONFIG`
+**và** không có config mặc định ⇒ **không** lỗi (fleet = mọi host, hành vi mặc
+định).
 
 ## 3. `config.py`
 
@@ -336,7 +374,8 @@ def transfer_slot(timeout: float) -> ContextManager:
 ## 10. `job.py`
 
 ```python
-JOB_STATES = ("queued", "launched", "running", "exited", "lost", "cancelled")
+JOB_STATES = ("queued", "launched", "running", "exited", "lost", "cancelled", "unknown")
+TERMINAL_STATES = ("exited", "lost", "cancelled", "unknown")
 
 @dataclass
 class Job:
@@ -380,7 +419,25 @@ def cancel(host: str, job: Job) -> dict:
     """Kill process group của job (pid đã ghi trong meta.json). Không pkill theo pattern."""
 
 def heartbeat_path(job_id: str) -> str
+
+def gc_jobs(state_dir: str | None = None,
+            max_age_days: float = DEFAULT_GC_MAX_AGE_DAYS) -> dict:
+    """Dọn ledger job (W5b — bug B13).
+
+    Xoá: (1) file job **định dạng cũ** (không có khoá ``state``) — 951 file
+    rác trên máy người dùng, mỗi file giữ 1 slot ⇒ ``roff wait`` treo tới
+    hết timeout; (2) job **terminal** đã quá ``max_age_days`` (mặc định 30);
+    (3) file phụ ``.heartbeat`` / ``.env`` của job đã bị xoá.
+
+    **Không** xoá job đang chạy/xếp hàng, **không** xoá file JSON hỏng
+    (chỉ đánh dấu ``skipped``). Trả ``{"removed": [...], "removed_count": int,
+    "skipped": [...], "freed_bytes": int}``."""
 ```
+
+**Job định dạng cũ** (không có khoá `state`) ⇒ `Job.from_dict` gán
+`state = "unknown"`. `"unknown"` là **terminal**: không giữ slot, `roff wait`
+trả về **ngay** (exit 1, `reason="unknown_state"`), `roff jobs` hiện nó là
+`"unknown"`, và `roff gc` xoá file đó.
 
 **Quy tắc nhận diện mất job** (dùng trong `remote_state`):
 - `exit` file tồn tại → `exited`, đọc exit code
@@ -442,6 +499,27 @@ def tunnel_start(host: str, lport: int, rport: int) -> Tunnel:
 
 def tunnel_stop(host: str, lport: int) -> dict
 def tunnel_list() -> list[Tunnel]
+
+# --- W4: link phối hợp giữa 2 máy (xem §15m) --------------------------------
+LINK_VIA_PORT_MIN = 18500
+LINK_VIA_PORT_MAX = 18599
+
+def tunnel_link(from_alias: str, to_alias: str, rport: int,
+                via_lport: int | None = None,
+                to_port: int | None = None) -> dict:
+    """Mở link A ↔ B **qua máy local** (host↔host không nối thẳng trên fleet).
+
+    A :rport ──(ssh -R rport:127.0.0.1:via)──▶ local :via
+    local :via ──(ssh -L via:127.0.0.1:to_port)──▶ B :to_port
+
+    Kiểm tra LISTEN ở **cả hai** đầu trước khi báo thành công; cổng trung
+    gian được chọn bằng cách **bind thật** (SO_REUSEADDR rồi đóng)."""
+
+def tunnel_stop_link(from_alias: str, rport: int) -> dict:
+    """Dọn **cả hai** nhánh của link (huỷ `-R` trên A và `-L` qua B)."""
+
+def link_list() -> list[dict]:
+    """Các link đang ghi nhận (đọc state local, không gọi ssh)."""
 ```
 
 ## 13. `cli.py` — khung lệnh
@@ -654,9 +732,17 @@ một job đang poll sẽ chen lên trước job đã chờ lâu hơn.
 | `slot_host` | host mà job sẽ xin slot (watcher dùng khi failover cần xin lại) |
 | `slot_ticket` | ticket hiện đang giữ (bằng rỗng nếu chưa có) |
 | `input_specs` | `[{kind: "path"\|"git"\|"http"\|"job", value: "<url hoặc path hoặc job id>"}, …]` — **mọi** input, để watcher dựng lại được sau failover |
+| `project_root` | thư mục làm việc lúc gọi `roff do` — gốc để hiểu `--sync-back` (B26) |
+| `sync_back` | các path `--sync-back` người dùng đã yêu cầu (nguyên văn) |
+| `sync_back_local` | **đích local** của từng path, **cùng thứ tự** với `sync_back_remote` — watcher kéo về đúng chỗ (B26) |
+| `sync_back_remote` | đường dẫn **trên host** của từng path: `<workdir>/<rel>` (path tương đối trong project) hoặc path trong **kho input dùng chung** (path nằm trong một `--in`) |
+| `sync_back_error` | mô tả lỗi khi kéo `--sync-back` hỏng; **xoá** khi kéo lại thành công (B26) |
 
 Không có `input_specs` thì failover sang host mới sẽ chạy với `$ROFF_IN` trỏ
 tới path không tồn tại ⇒ job chết ngay mà ledger vẫn báo "launch thành công".
+
+Không có `sync_back_local` (job cũ) thì watcher **không đoán** ⇒ bỏ qua phần
+sync-back; `roff pull` kéo các path vào thư mục `--local` như trước.
 
 ### 15h. `cli.py` — lỗi `no_host` phải kèm `jobs`
 
@@ -776,17 +862,52 @@ def gc_shared_store(host: str, layout_root: str, keep_keys=(),
     thêm cơ chế khoá mới. Không xoá entry đang được job chạy dùng
     (``keep_keys``) và không xoá entry còn mới."""
 
+    **B22 — dọn lock mồ côi.** Thư mục ``<key>.lock`` quá hạn mà chủ đã chết
+    (không có file ``owner``, hoặc chủ không còn sống) cũng bị xoá — nếu
+    không, lock tích tụ mãi trên host. Dùng lại **đúng** ngưỡng của đường
+    **đẩy** (``_lock_is_stale``: :data:`LOCK_STALE_S` / :data:`LOCK_HARD_STALE_S`)
+    ⇒ không phát minh cơ chế khoá mới.
+
+    Trả về (ngoài các khoá cũ): ``removed_locks`` — **key** của lock mồ côi đã
+    dọn; ``skipped_locks`` — ``{"key", "reason"}`` cho lock **giữ lại**, reason:
+    ``in_use`` (job đang dùng) | ``locked`` (còn chủ) | ``host_unreachable``
+    (không biết ⇒ giữ) | ``remove_failed`` (xoá xong kiểm lại vẫn còn).
+
 # sshx.py
 def ssh_config_path() -> str: ...
 def ssh_config_args() -> list[str]:
-    """Tham số `-F <path>` cho ssh (rỗng nếu không có config thay thế).
+    """Tham số `-F <path>` cho ssh.
 
-    Bắt buộc: `fleet.parse_ssh_config()` đọc `$ROFF_SSH_CONFIG` — nếu ssh thật
-    không đọc file đó thì alias trùng tên trỏ sang **máy khác**."""
+    **B25 — `ssh_config_path()` đã đổi ngữ nghĩa**: trước đây trả về đường dẫn
+    **chỉ** khi có `$ROFF_SSH_CONFIG`; nay trả đường dẫn của file config mà roff
+    dùng (mặc định `$HOME/.ssh/config`). Rỗng khi **không có file config nào**
+    (khi đó ssh tự lo, như trước).
 
-# fleet.py
+    Bắt buộc: `fleet.parse_ssh_config()` đọc cùng file đó — nếu ssh thật không
+    đọc file đó thì alias trùng tên trỏ sang **máy khác**."""
+
+# fleet.py — **nguồn sự thật duy nhất** cho file ssh-config (B25)
+def ssh_config_file() -> str:
+    """File ssh config roff dùng: `$ROFF_SSH_CONFIG` nếu có, else `$HOME/.ssh/config`.
+
+    Luôn trả một **đường dẫn** (kể cả khi file không tồn tại) — fingerprint
+    (B14) phải ổn định: đổi file ⇒ đổi fingerprint ⇒ đổi socket ControlMaster."""
+
+def ssh_config_path() -> str:
+    """Đường dẫn ssh-config phải truyền cho ssh bằng `-F` (rỗng nếu không có)."""
+
+def ssh_config_args() -> list[str]:
+    """`["-F", <path>]` — mọi nơi dựng argv ssh của roff đều phải đi qua đây."""
+
 def env_fleet_aliases(cfg: Config) -> list[str]:
     """Alias của fleet theo `$ROFF_SSH_CONFIG` (seam cho test)."""
+
+# fleet.py — luật mở rộng `Include` **phải khớp ssh thật** (B25)
+#: `Include` **tương đối** resolve theo `$HOME/.ssh`, KHÔNG theo thư mục file
+#: config (đo bằng `strace` trên OpenSSH 8.9p1: `Include inc.conf` với
+#: `-F /tmp/x/config` ⇒ ssh mở `$HOME/.ssh/inc.conf`).
+#: Áp cho **cả** `parse_ssh_config()` (danh sách alias) và `ssh_host_params()`
+#: (tham số dùng để **fingerprint**) — lệch một bên ⇒ nối nhầm máy.
 
 # job.py — mọi hàm ledger nhận `state_dir` tuỳ chọn
 def ledger_dir(state_dir: str | None = None) -> str: ...
@@ -800,6 +921,126 @@ def save_job(job: Job, state_dir: str | None = None) -> None: ...
 `state_dir` mặc định là `$ROFF_STATE_DIR` (hoặc `~/.local/state/roff`).
 **Nguyên tắc**: nếu một lớp nhận `state_dir` thì mọi lớp dưới nó phải dùng
 **đúng** thư mục đó — đọc ledger ở thư mục khác là bug (xem §15i).
+
+
+### 15m. API mới của wave W4/W5 — link phối hợp, `doctor`, B13/B14
+
+#### 15m.1 `tunnel link` — nối 2 máy qua máy local (W4)
+
+Host ↔ host **không** nối thẳng trên fleet này (bridge chết ở bước SSH
+banner) ⇒ tiến trình ở máy A muốn nói chuyện với dịch vụ ở máy B thì phải
+đi vòng qua máy local:
+
+```
+A :rport  ──(ssh -R rport:127.0.0.1:via)──▶  local :via
+local :via ──(ssh -L via:127.0.0.1:to_port)──▶  B :to_port
+```
+
+Hai tiến trình ssh nền (`-f -N`), dùng **đúng** cơ chế ControlMaster sẵn có
+(`ControlPath` riêng của roff, `ssh -O forward` / `ssh -O cancel`) — không
+phát minh cơ chế ssh mới.
+
+```bash
+roff tunnel link --from <aliasA> --to <aliasB> --rport <port> \
+                 [--via-lport <port>] [--to-port <port>]
+```
+
+JSON (thành công):
+
+```json
+{"ok": true, "exit_code": 0, "from": "muse-pmb333", "to": "muse-tampt",
+ "rport": 19000, "to_port": 18899, "via_lport": 18500,
+ "a_listening": true, "b_listening": true, "note": "a_listening=True; b_listening=True"}
+```
+
+* `via_lport` — cổng trung gian trên máy local; mặc định tự chọn trong dải
+  **18500–18599** bằng cách **bind thật** (SO_REUSEADDR rồi đóng), không đoán
+  bừa; `--via-lport` chỉ định tay ⇒ nếu cổng đang bị chiếm thì lỗi
+  `local_port_busy`.
+* `a_listening` / `b_listening` — đã kiểm tra LISTEN ở **cả hai** đầu chưa.
+  `null` = **không kiểm tra được** (máy remote thiếu cả `ss`, `netstat` và
+  `/proc/net/tcp`) — khác hẳn `false`.
+* `note` — chuỗi tóm tắt; lỗi thì mang `reason` + `error` (tiếng Việt) và
+  `detail` nguyên văn lỗi ssh (exit 255 khi host không với được).
+
+`roff tunnel stop --from <aliasA> --rport <port>` dọn **cả hai** nhánh
+(huỷ `-R` trên A, huỷ `-L` qua B) và đóng master nếu không còn forward nào
+khác. `roff tunnel list` trả kèm mảng `links`.
+
+Lỗi (xem bảng `reason` ở §17): `invalid_host`, `same_host`,
+`remote_not_listening` (máy B không có gì LISTEN ⇒ **không** mở gì),
+`local_port_busy`, `no_free_port`, `forward_failed` (đã mở forward nhưng máy
+A không LISTEN ⇒ **dọn cả hai nhánh** rồi báo lỗi), `control_master_failed`,
+`host_unreachable`.
+
+An toàn: chỉ huỷ forward qua `ssh -O cancel` của **master của roff**
+(`ControlPath` riêng) — **không** `kill`/`pkill` tiến trình nào; không huỷ
+toàn bộ forward của master nếu máy đó còn tunnel khác của roff.
+
+#### 15m.2 `doctor` — chẩn đoán, **chỉ báo** (W5a)
+
+```bash
+roff doctor [--probe]
+```
+
+```json
+{"ok": false, "exit_code": 1, "problems": 2,
+ "checks": [{"name": "config", "ok": true, "detail": "/home/x/.config/roff/config.ini"}, ...]}
+```
+
+* Mỗi check có **`name`**, **`ok`**, **`detail`**. `problems` = số check có
+  `ok: false`; `ok` = (`problems == 0`); exit code = **1** khi có vấn đề, **0**
+  khi sạch.
+* Check lỗi **không** làm hỏng lệnh: exception bị bọc, check đó thành
+  `ok: false` với `detail` kiểu `"lỗi khi kiểm tra: ..."`.
+* Mặc định **không** probe mạng (đọc cache `probes.json` + kiểm tra local)
+  ⇒ chạy < 1 s. `--probe` mới probe thật host.
+* `doctor` **không ghi, không sửa, không đổi quyền** gì — kể cả bước chuẩn
+  hoá quyền file state (bước đó bị bỏ qua khi lệnh là `doctor`).
+
+Các check: `config`, `wrapper`, `hook`, `fleet`, `state_perms`,
+`orphan_jobs`, `disk_local`.
+
+#### 15m.3 B13 — job định dạng cũ (`unknown`) và `roff gc` (W5b)
+
+* Job file **không có khoá `state`** ⇒ `state = "unknown"` (không phải mặc
+  định `"queued"` ⇒ treo tới hết timeout).
+* `"unknown"` là **terminal**: không giữ slot, `roff wait` trả về **ngay**
+  (exit 1, `reason="unknown_state"`), `roff jobs` hiện `"unknown"`.
+* `roff gc` xoá: file định dạng cũ, job terminal quá `--job-max-age-days`
+  (mặc định **30** ngày), file phụ `.heartbeat`/`.env` mồ côi. **Không** xoá
+  job đang chạy/xếp hàng, **không** xoá file JSON hỏng.
+* JSON của `roff gc` có thêm `removed_jobs` (mảng id), `removed_jobs_count`,
+  `skipped_jobs`, `freed_jobs_mb`; `freed_mb` = tổng (cache + job).
+
+Đo thật trên máy người dùng (23/11/2026): ledger có **1009** file job, trong
+đó **951** file không có khoá `state` ⇒ `roff gc` xoá đúng **951** file, còn
+lại 58 job (`exited` 47, `queued` 9, `lost` 1, `launched` 1) được giữ nguyên.
+
+#### 15m.4 B14 — fingerprint ssh trong `ControlPath` + cache probe (W5c)
+
+* `fleet.ssh_host_params(alias)` / `fleet.ssh_fingerprint(alias)`: tham số
+  ssh **đã resolve** của alias (`HostName`, `Port`, `User`, `IdentityFile`,
+  `ProxyCommand`, `ProxyJump`) đọc từ `~/.ssh/config` (hoặc
+  `$ROFF_SSH_CONFIG`) — **không** gọi ssh, không tốn round-trip.
+* `sshx.control_path(alias)` = `<state>/cm/<alias>-<8 hex sha256>.sock` ⇒
+  **đổi config ⇒ socket mới ⇒ master mới**; cùng alias + cùng config ⇒ cùng
+  socket (tái dùng master vẫn chạy). Đường dẫn luôn ≤ 88 byte (giới hạn
+  `sun_path` 108 byte + hậu tố ngẫu nhiên 17 byte của OpenSSH).
+* `sshx.clean_stale_socket(alias)` xoá socket **cũ fingerprint** (và socket
+  chết) — chỉ trong `<state>/cm/` của roff.
+* Cache probe (`probes.json`) lưu kèm `fingerprint`; đổi config ⇒ mismatch ⇒
+  entry đó **hết hạn** ⇒ probe lại (không xoá cả cache).
+
+Đo thật (23/11/2026, fleet Muse, cùng alias `roff-b14-probe`):
+
+| config | fingerprint | `control_path` | `roff probe` |
+|---|---|---|---|
+| `Port 2222` (cổng thật) | `3fb7ad22` | `.../cm/roff-b14-probe-3fb7ad22.sock` | `reachable: true`, exit 0 |
+| `Port 9` (cổng chết) | `4fa7e32e` | `.../cm/roff-b14-probe-4fa7e32e.sock` | `reachable: false`, exit 255 (`Connection refused`) |
+
+⇒ đổi `~/.ssh/config` **không** còn tái dùng master cũ (trước B14, lần
+probe thứ hai vẫn trả về thông tin của máy cũ).
 
 
 ## 16. Định dạng JSON (chuẩn hoá cho mọi lệnh)
@@ -820,3 +1061,180 @@ def save_job(job: Job, state_dir: str | None = None) -> None: ...
 
 Khoá không có giá trị thì **bỏ hẳn** khỏi JSON (không trả `null` thừa), trừ `reason`/`error`/
 `detail` ở trên.
+
+### 16.1 Cờ cảnh báo fleet (B27)
+
+Khi fleet **không** bị giới hạn (config không có `[fleet] include`, hoặc
+`include = *`), JSON của `roff hosts` và `roff do` mang **thêm** 2 khoá:
+
+```json
+{"ok": true, "exit_code": 0,
+ "fleet_unrestricted": true,
+ "fleet_warning": "config không giới hạn fleet ⇒ mọi host trong ~/.ssh/config đều được chọn, gồm cả host bạn không muốn dùng"}
+```
+
+Khi fleet **có** giới hạn ⇒ **không** có 2 khoá này (payload giữ nguyên như
+trước). Agent **phải** đọc `fleet_unrestricted` trước khi gửi job: đó là tín
+hiệu **máy đọc được** rằng job có thể chạy trên **bất kỳ** host nào trong
+`~/.ssh/config`, kể cả host người dùng đã `exclude`.
+
+> Kèm theo: `ROFF_CONFIG` trỏ tới file **không tồn tại** ⇒ `roff` **dừng**
+> (exit 3, `config_missing`) thay vì im lặng nới fleet. Không có
+> `ROFF_CONFIG` **và** không có config mặc định ⇒ vẫn chạy, fleet = mọi host
+> (hành vi mặc định "chạy được ngay khi mới cài").
+
+## 17. Bảng `reason` đầy đủ
+
+Agent **phải** bóc theo `reason`, không theo `error` (tiếng Việt). Bảng này là
+danh mục **đóng** — code mới phải được thêm vào đây cùng lúc với lệnh sinh ra nó.
+
+| `reason` | exit | Nghĩa | Agent nên làm gì |
+|---|---|---|---|
+| `missing_cmd` | 2 | `--cmd` rỗng | hỏi lại người dùng cần chạy gì |
+| `invalid_option` | 2 | option sai kiểu/giá trị | sửa lệnh, không phải chờ |
+| `invalid_timeout` | 2 | `--timeout` ≤ 0 | sửa lệnh |
+| `invalid_priority` | 2 | `--priority` không phải `high`/`normal` | sửa lệnh |
+| `invalid_size` | 2 | `--mem`/`--disk`/`--cpus` sai định dạng | sửa lệnh |
+| `invalid_env` | 2 | `--env` không phải `KEY=VALUE` | sửa lệnh |
+| `invalid_input` | 2 | `--in` sai dạng (vd `job:` thiếu id) | sửa lệnh |
+| `invalid_after` | 2 | `--after` sai dạng | sửa lệnh |
+| `invalid_job` | 2 | job id không tồn tại trong ledger | kiểm tra `roff jobs` |
+| `invalid_tunnel_action` | 2 | `tunnel` cần `start`/`stop`/`list` | sửa lệnh |
+| `invalid_host` | 2 | `tunnel link`: `--from`/`--to` rỗng hoặc không phải alias | sửa lệnh |
+| `same_host` | 2 | `tunnel link`: `--from` và `--to` là **cùng** một máy | sửa lệnh |
+| `doctor_unavailable` | 2 | module `roffkit.doctor` không có trong bản cài đặt | cài lại skill |
+| `config_missing` | 3 | `ROFF_CONFIG` trỏ tới file config **không tồn tại** ⇒ bỏ qua nó im lặng sẽ khiến fleet lấy **MỌI** host trong `~/.ssh/config` (kể cả host đã `exclude`) ⇒ **từ chối** (B27) | tạo file config, hoặc bỏ `ROFF_CONFIG` (không có config ⇒ fleet = mọi host, như thiết kế mặc định) |
+| `no_items` | 2 | `--each` không khớp item nào | sửa glob |
+| `input_not_found` | 2 **hoặc** 69 | path local của `--in` không tồn tại — **2** = bị chặn ngay trước khi chạy; **69** = file biến mất *giữa lúc chạy* ⇒ job `lost` | sửa đường dẫn; **không** gửi lại cùng lệnh (máy khác cũng không có file đó) |
+| `missing_local` | 2 | `pull` thiếu `--local` | sửa lệnh |
+| `missing_name` | 2 | `push`/`ensure` thiếu `--name` | sửa lệnh |
+| `missing_setup` | 2 | `ensure` thiếu `--setup` | sửa lệnh |
+| `setup_not_found` | 2 | script `--setup` không tồn tại | sửa đường dẫn |
+| `tunnel_unavailable` | 2 | không dựng được tunnel (cổng bận, thiếu quyền) | thử cổng khác, báo lại |
+| `empty_path` | 2 | đường dẫn remote rỗng | sửa tham số |
+| `relative_remote_path` | 2 | đường dẫn remote phải **absolute** (không gửi `~` qua ssh) | sửa tham số |
+| `local_dir_not_found` | 2 | thư mục local nguồn không tồn tại (`push`) | sửa đường dẫn |
+| `download_failed` | 2 | tải `--in http(s)://…` thất bại (URL sai/hỏng) | sửa URL — **không** phải lỗi host |
+| `invalid_port` | 2 | `--lport`/`--rport` không phải số, hoặc ngoài 1..65535 | sửa cổng |
+| `job_not_found` | 2 | không có job id đó trong ledger | kiểm tra `roff jobs` |
+| `job_unreadable` | 2 | file ledger của job hỏng (JSON không đọc được) | `roff gc` dọn job đó |
+| `missing_out_remote` | 2 | ledger job chưa có `out_remote` | job chưa được launch lần nào |
+| `bad_out_remote` | 2 | `out_remote` của job không kết thúc bằng `/out` | ledger hỏng ⇒ `roff gc` |
+| `missing_project` | 2 | ledger job không có `project` ⇒ không xác định được thư mục làm việc | ledger hỏng ⇒ `roff gc` |
+| `input_not_recreatable` | 2 | input kiểu `job:` **không** dựng lại được trên host mới (failover) | dữ liệu nằm trên host của job nguồn ⇒ chạy lại từ job nguồn, **không** failover tiếp |
+| `empty_fleet` | 10 | **config ssh không có alias nào khớp fleet** — không phải "máy chết" | báo người dùng: cấu hình fleet sai, **không** phải fleet hỏng |
+| `no_host` | 10 | fleet có nhưng **không còn host nào dùng được** (hết RAM, hết slot, chết) | xem `rejected` để biết vì sao |
+| `no slot on <host>` | 10 | hết slot trên host đó (hàng đợi slot đầy) | đợi job khác xong, hoặc `--host` máy khác |
+| `flock không khả dụng trên nền tảng này` | 10 | nền tảng không có `fcntl.flock` ⇒ không khoá được slot | lỗi môi trường, báo người dùng |
+| `job_failed` | 1 | job chạy xong nhưng exit ≠ 0 | đọc `roff logs <job>` |
+| `unknown_state` | 1 | job ở **định dạng cũ** (ledger không có khoá `state`) ⇒ không biết kết quả | `roff gc` để dọn; job này **không** phải job đang chạy |
+| `setup_failed` | 1 | script setup hỏng trên host | xem `detail` |
+| `launch_failed` | 1 | không launch được job (mất kết nối lúc launch) | `roff wait` job đó để biết kết cục |
+| `remote_not_listening` | 1 | `tunnel link`: máy `--to` không có gì đang LISTEN ở `--to-port` | **không** mở link; kiểm tra dịch vụ trên máy đó |
+| `local_port_busy` | 1 | `tunnel link`: cổng trung gian đang bị chiếm | thử cổng khác (`--via-lport`) |
+| `no_free_port` | 1 | `tunnel link`: hết cổng trống trong dải 18500–18599 | đợi có chỗ, hoặc dùng `--via-lport` |
+| `forward_failed` | 1 | `tunnel link`: đã mở forward nhưng máy `--from` không LISTEN | link **đã được dọn**; thử lại |
+| `remote_listening` | 1 | máy đích **không** có gì đang LISTEN ở `rport` | bật dịch vụ ở máy đích rồi mở tunnel |
+| `stale_forward` | 1 | không huỷ được forward cũ **của roff** trên cổng (`master pid` còn sống) | `roff tunnel stop` rồi thử lại |
+| `internal_error` | 1 | lỗi nội bộ roff | báo lại, kèm `detail` |
+| `cancel_failed` | 255 | không huỷ được job | kiểm tra host còn sống không |
+| `host_unreachable` | 255 | ssh không với được host (bắt buộc có `detail`) | thử lại, hoặc đổi host |
+| `unknown_host` | 255 | alias không có trong config | kiểm tra `~/.ssh/config` |
+| `control_master_failed` | 255 | không dựng được ControlMaster của roff (socket không bind được) | xem `detail`; thường là thư mục state chưa tồn tại hoặc socket sót |
+| `push_failed` | 255 | đẩy input lên host thất bại | xem `detail` |
+| `shared_push_failed` | 255 | đẩy input vào **kho dùng chung** của host thất bại | xem `detail` |
+| `shared_input_busy` | 255 | kho dùng chung của host đang bị khoá (tiến trình khác đang đẩy) | chờ rồi thử lại; nếu kéo dài ⇒ host đó kẹt |
+| `shared_marker_failed` | 255 | không ghi được marker `.complete` trên host | xem `detail`; host có thể đang chết |
+| `pull_failed` | 255 **hoặc** 74 | kéo artifact về local thất bại — **255** = `roff pull` không với được host (xem `detail`); **74** = job **đã chạy xong** (`exit`=0) nhưng artifact **chưa về** local (`pulled=false`, có `pull_error`) | 255: thử lại / đổi máy. 74: **kéo lại** bằng `roff pull <job> --local <dir>` — **đừng** chạy lại job |
+| `sync_back_failed` | 74 | job **đã chạy xong** (`exit`=0) và artifact **đã** về (`pulled=true`), nhưng path `--sync-back` **chưa** về local (`sync_back_error` khác rỗng) — B26 | **kéo lại** bằng `roff pull <job> --local <dir>` (kéo cả path `--sync-back`); **đừng** chạy lại job |
+| `sync_back_outside_project` | 2 | path `--sync-back` nằm ngoài project root **và** ngoài mọi `--in` ⇒ không có nơi nào trên host để tìm file đó — **từ chối lúc gửi job** (B26) | sửa đường dẫn (tương đối so với thư mục làm việc) hoặc thêm `--in` |
+| `timeout` | 124 | hết thời gian chờ — **không phải lỗi** | xem `state` trong JSON rồi quyết định |
+| `host_restarted` | 69 | host restart giữa lúc chạy | job đã được failover (trừ `--side-effects`) |
+| `host_wiped` | 69 | host bị wipe (instance_token đổi) | failover sang host khác |
+| `oom_killed` | 69 | host OOM giữa lúc chạy | failover; cân nhắc giảm `--mem` |
+| `vanished` | 69 | host biến mất khỏi fleet (tunnel chết, alias bị gỡ) | failover sang host khác |
+| `input_push_failed` | 69 | **không đẩy được input** lên host (kho input dùng chung bị kẹt, host flap) — lỗi **hạ tầng** | đã failover sang host khác (trừ job ghim `--host`); nếu hết lượt thì job `lost` với lý do này |
+| `workdir_missing` | 69 | host không tạo được thư mục làm việc (disk/host flap) — lỗi **hạ tầng** | đã failover; nếu hết lượt thì job `lost` với lý do này |
+| `cancelled` | 130 | job đã bị huỷ | không làm gì thêm |
+
+
+---
+
+## 18. B17 — kho input dùng chung không được **kẹt vĩnh viễn** (watcher W7)
+
+> Sự cố đo thật trên fleet Muse 23/11/2026 (job `261123-141011-5884`): kho input
+> dùng chung bị kẹt vì thư mục `<key>.lock` **mồ côi** còn lại mà `<key>.complete`
+> **không có** ⇒ mọi lần đẩy sau đó đều fail `shared_input_busy` ⇒ watcher
+> quay vòng **mãi** trên cùng host ⇒ job treo tới hết `timeout`
+> (7200 + 600 = **2 giờ 10 phút**), không failover.
+
+### 18.1 `shared.py` — lock không được bỏ lại, lock mồ côi phải dọn nhanh
+
+```python
+MARKER_WAIT_S    = 60.0    # chờ marker khi người khác đang đẩy
+LOCK_STALE_S     = 30.0    # lock quá hạn ⇒ coi là chết ⇒ dọn rồi chiếm lại
+LOCK_HARD_STALE_S= 900.0   # quá hạn cứng ⇒ dọn luôn (chủ lock bị kẹt)
+LOCK_HEARTBEAT_S = 10.0    # nhịp "chạm" lock trong lúc đang đẩy
+RELEASE_ATTEMPTS = 3       # số lần thử nhả lock
+```
+
+Bất biến bắt buộc:
+
+* **`LOCK_STALE_S < MARKER_WAIT_S`** — nếu không, nhánh "lock chết" không bao
+  giờ kịp chạy trong 1 lần chờ ⇒ phải quay vòng ~30 lần (≈ 30 phút) mới dọn
+  được 1 lock mồ côi (đo thật: job kẹt **28,5 phút**).
+* **Nhả lock dùng `rm -rf`**, không dùng `rmdir` — lock có file `owner` bên
+  trong nên `rmdir` **luôn** fail và bỏ lại lock mồ côi. Lệnh nhả lock phải
+  **kiểm tra lại** (`test ! -e`) và **thử lại** `RELEASE_ATTEMPTS` lần (host
+  flap ⇒ lệnh ssh hỏng ⇒ lệnh xoá không hề chạy). Lock còn lại sau mọi lần
+  thử ⇒ **ghi ra stderr** (không im lặng) và ghi vào lỗi đang bay
+  (`lock_release_failed`).
+* **Nhả lock phải chạy cả khi tiến trình sắp chết**: `try/finally` +
+  `atexit` + (lần cuối) lệnh **tách tiến trình** trên host (`nohup`), có điều
+  kiện "lock vẫn của mình" (token owner khớp) để không xoá nhầm.
+* **Lock ghi chủ**: `{lock}/owner` = JSON `{id, pid, host, started}`. Lock của
+  tiến trình **còn sống** không được xoá (trừ khi quá `LOCK_HARD_STALE_S`).
+* **Nhịp chạm lock** (`LOCK_HEARTBEAT_S`): một lần đẩy có thể kéo dài **vài
+  giờ** (băng thông local→host 0,5–1 MB/s) ⇒ không chạm lock thì mtime đứng
+  yên ⇒ sau `LOCK_STALE_S` người khác tưởng lock mồ côi và xoá ⇒ **đẩy
+  trùng**. Nhịp chạm (10 s) nhanh hơn ngưỡng stale (30 s) nên lock còn sống
+  không bao giờ bị tưởng là mồ côi.
+
+### 18.2 `watcher.py` — không được quay vòng vô hạn trên cùng host
+
+```python
+REASON_INPUT_PUSH_FAILED = "input_push_failed"   # LỖI HẠ TẦNG ⇒ được failover
+MAX_START_FAILURES = 3                           # số lần hỏng liên tiếp trên 1 host
+```
+
+* `INFRASTRUCTURE_REASONS` **có thêm** `input_push_failed` ⇒ được failover/retry
+  (tôn trọng `--side-effects` (`job.needs_retry`) và `--retry`).
+* `_start()` thất bại ⇒ ghi **`start_error`** vào ledger (kèm event
+  `start_failed`) ⇒ watcher biết đây là lỗi hạ tầng hay lỗi của job.
+* Sau `MAX_START_FAILURES` lần hỏng **liên tiếp trên cùng host**:
+
+  | lỗi | host | hành động |
+  |---|---|---|
+  | `input_push_failed` (hạ tầng) | không ghim | **failover** sang host khác (push lại input, launch lại) |
+  | `input_push_failed` (hạ tầng) | **ghim** (`--host`) | `state=lost`, `reason=input_push_failed` |
+  | lỗi của **job** (vd `input_not_found`) | bất kỳ | `state=lost`, `reason` đúng ngay lập tức (**không** failover) |
+
+* Job **ghim host** (`--host <alias>` ⇒ `host_reasons` có
+  `host bị ép qua --host <alias>`) **không được** failover — người dùng đã ép
+  host ⇒ khi host đó hỏng thì job phải `lost` với reason rõ ràng.
+* Bộ đếm lỗi nằm trong ledger (`start_failures`, `start_fail_host`) ⇒ watcher
+  được gia hạn (spawn lại) vẫn nhớ ⇒ không quay vòng vô hạn qua nhiều đời
+  watcher. Bộ đếm **tính theo host** ⇒ đổi host là về 0.
+
+### 18.3 Reason mới — phân loại
+
+| reason | loại | failover? | nguồn |
+|---|---|---|---|
+| `input_push_failed` | **hạ tầng** | có (trừ host ghim) | kho input kẹt / host flap / không với được host |
+| `input_not_found` | **của job** | **không** | file input local không tồn tại (exit 2 khi bị chặn ngay, exit 69 khi mất giữa lúc chạy) |
+| `workdir_missing` | của job/host | không | không tạo được thư mục làm việc |
+| `launch_failed` | hỗn hợp | không | launch lỗi (không phải workdir/input) |
+
+`input_not_found` **không** được đưa vào `INFRASTRUCTURE_REASONS`: file local
+đã mất thì máy khác cũng không có ⇒ failover chỉ là đốt thêm thời gian rồi
+cuối cùng cũng `lost` với lý do **sai**.

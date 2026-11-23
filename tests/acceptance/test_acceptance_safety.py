@@ -1,13 +1,17 @@
-import atexit
 import json
 import os
-import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _common as common  # noqa: E402
+_DEFAULT_STATE = common.DEFAULT_STATE  # dùng chung (xem _common.py)
+
+from _common import pick_live  # noqa: E402
+from _common import wait_or_skip  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 SKILL = REPO / "skill"
@@ -24,16 +28,10 @@ SECRET = "s3cr3t-value-xyz"
 
 #: State dir **riêng cho test** — test KHÔNG được ghi vào ledger thật của
 #: người dùng (``~/.local/state/roff``). Nếu không, mỗi lần chạy nghiệm thu lại
-#: đẩy hàng chục job record vào ledger thật (và tạo cả bản ghi tunnel ma).
-_DEFAULT_STATE = tempfile.mkdtemp(prefix="roff-acceptance-state-")
-atexit.register(shutil.rmtree, _DEFAULT_STATE, True)
 
 
 def roff(args, timeout=300, env=None):
-    e = dict(os.environ)
-    e.setdefault("ROFF_STATE_DIR", _DEFAULT_STATE)
-    if env:
-        e.update(env)
+    e = common.roff_env(env)
     p = subprocess.run([sys.executable, str(LAUNCHER)] + list(args),
                        capture_output=True, text=True, timeout=timeout, env=e)
     return p
@@ -57,10 +55,19 @@ def ssh_ok(alias, timeout=20):
 
 
 def ssh_out(alias, script, timeout=60):
-    """Chạy script trên host, trả (rc, stdout)."""
-    r = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", alias, script],
-        capture_output=True, text=True, timeout=timeout)
+    """Chạy script trên host, trả (rc, stdout).
+
+    Timeout của ssh ⇒ **không** phải lỗi của `roff` (máy đang flap) ⇒
+    trả ``rc=255`` kèm lỗi, để test gọi ``common.is_host_down`` rồi
+    ``pytest.skip`` thay vì để lỗi TimeoutExpired làm test **ERROR**
+    (đo thật 23/11/2026: S12 vừa vặp đúng lần đó).
+    """
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", alias, script],
+            capture_output=True, text=True, timeout=timeout)
+    except subprocess.SubprocessError as exc:
+        return 255, "", str(exc)
     return r.returncode, r.stdout, r.stderr
 
 
@@ -106,12 +113,18 @@ def test_s14_secret_never_leaks(fleet, cfg, tmp_path):
       * file env trên host có mode 600;
       * audit log vẫn ghi ``--cmd`` nguyên văn và tên các key của --env.
     """
-    host = fleet[0]
+    host = pick_live(fleet)
+
+    if host is None:
+
+        pytest.skip("mọi máy muse đã chết — sự cố hạ tầng")
     # Job chạy đủ lâu để ta kịp soi `ps` trên host.
     rc, obj, err = roff_json(
         ["do", "--host", host, "--cmd", "sleep 45", "--env", f"MY_SECRET={SECRET}"],
         timeout=180, env=cfg["env"],
     )
+    if common.is_host_down(rc, obj, err):
+        pytest.skip(f"host {host} chết lúc gửi job — sự cố hạ tầng: {err[-200:]}")
     assert rc == 0, f"roff do thất bại: rc={rc} err={err} obj={obj}"
     job_id = obj["job"]
 
@@ -122,6 +135,8 @@ def test_s14_secret_never_leaks(fleet, cfg, tmp_path):
             host,
             "ps -eo args 2>/dev/null | grep -F '" + SECRET + "' | grep -v grep || true",
         )
+        if rc2 != 0 and not ssh_ok(host):
+            pytest.skip(f"host {host} chết lúc soi ps — sự cố hạ tầng")
         assert rc2 == 0, "không chạy được ps trên host"
         assert SECRET not in out, (
             "secret lộ trong argv của tiến trình trên host:\n" + out
@@ -133,6 +148,8 @@ def test_s14_secret_never_leaks(fleet, cfg, tmp_path):
             "find \"$HOME/.roff\" -path '*/jobs/*/env' -printf '%m\\n' 2>/dev/null "
             "| sort -u | tr '\\n' ' '",
         )
+        if rc3 != 0 and not ssh_ok(host):
+            pytest.skip(f"host {host} chết lúc đo mode — sự cố hạ tầng")
         assert rc3 == 0
         modes = [m for m in mode_out.split() if m]
         if not modes:
@@ -147,7 +164,10 @@ def test_s14_secret_never_leaks(fleet, cfg, tmp_path):
         for mode in modes:
             assert mode == "600", f"file env trên host có mode {mode}, phải là 600"
     finally:
-        roff(["cancel", job_id], timeout=60, env=cfg["env"])
+        try:
+            roff(["cancel", job_id], timeout=60, env=cfg["env"])
+        except (subprocess.SubprocessError, OSError):
+            pass
 
     # 3) audit log local không chứa secret, nhưng vẫn có cmd + tên key
     audit = cfg["state"] / "audit.jsonl"
@@ -219,15 +239,25 @@ def test_s12_tunnel_serves_and_stops_cleanly(fleet):
       * sau ``tunnel stop`` không còn tiến trình ssh nào của roff;
       * không kill nhầm tiến trình ssh khác của người dùng.
     """
-    host = fleet[0]
+    host = pick_live(fleet)
+
+    if host is None:
+
+        pytest.skip("mọi máy muse đã chết — sự cố hạ tầng")
     # Dựng 1 HTTP server tĩnh trên host (không cần internet).
+    #
+    # `</dev/null` cho tiến trình nền là **bắt buộc**: nếu không, nó giữ mở
+    # stdin của kênh ssh ⇒ ssh chờ EOF mãi ⇒ lệnh `ssh` treo tới timeout
+    # (đo thật 23/11/2026: `subprocess.TimeoutExpired` sau 60 s).
     rc, out, err = ssh_out(
         host,
         "d=$(mktemp -d); printf 'hello-remote' > \"$d/index.html\"; "
         "cd \"$d\" && nohup python3 -m http.server 8731 "
-        f"--bind 127.0.0.1 >/dev/null 2>&1 & echo $! > /tmp/roff-s12-http.pid; "
+        "--bind 127.0.0.1 </dev/null >/dev/null 2>&1 & echo $! > /tmp/roff-s12-http.pid; "
         "sleep 2; cat /tmp/roff-s12-http.pid",
     )
+    if common.is_host_down(rc, {}, err):
+        pytest.skip(f"host {host} chết lúc dựng HTTP server — sự cố hạ tầng: {err[-200:]}")
     assert rc == 0, f"không dựng được HTTP server trên host: {err}"
     remote_pid = out.strip().splitlines()[-1] if out.strip() else ""
 
@@ -238,6 +268,8 @@ def test_s12_tunnel_serves_and_stops_cleanly(fleet):
              "--lport", str(local_port), "--rport", "8731"],
             timeout=120,
         )
+        if common.is_host_down(rc2, obj, err2):
+            pytest.skip(f"host {host} chết lúc mở tunnel — sự cố hạ tầng: {err2[-200:]}")
         assert rc2 == 0, f"tunnel start thất bại: rc={rc2} err={err2} obj={obj}"
 
         body = ""
@@ -254,6 +286,8 @@ def test_s12_tunnel_serves_and_stops_cleanly(fleet):
             except subprocess.SubprocessError:
                 pass
             time.sleep(2)
+        if not body and not ssh_ok(host):
+            pytest.skip(f"host {host} chết giữa lúc tunnel — sự cố hạ tầng")
         assert "hello-remote" in body, (
             f"không gọi được qua tunnel (body={body!r})"
         )
@@ -267,6 +301,8 @@ def test_s12_tunnel_serves_and_stops_cleanly(fleet):
             ["tunnel", "stop", "--host", host, "--lport", str(local_port)],
             timeout=120,
         )
+        if common.is_host_down(rc3, obj3, err3):
+            pytest.skip(f"host {host} chết lúc đóng tunnel — sự cố hạ tầng: {err3[-200:]}")
         assert rc3 == 0, f"tunnel stop thất bại: rc={rc3} err={err3} obj={obj3}"
 
         # sau stop: không còn tiến trình ssh nào thuộc roff (control path của roff)
@@ -286,8 +322,13 @@ def test_s12_tunnel_serves_and_stops_cleanly(fleet):
             f"số tiến trình ssh giảm nhiều ({before} -> {now}): có thể đã kill nhầm"
         )
     finally:
-        roff(["tunnel", "stop", "--host", host, "--lport", str(local_port)],
-             timeout=60)
+        # Dọn dẹp **không** được ném lỗi ra — nếu nó ném, lỗi gốc của test
+        # bị che mất và ta mất thông tin quan trọng nhất.
+        try:
+            roff(["tunnel", "stop", "--host", host, "--lport", str(local_port)],
+                 timeout=60)
+        except (subprocess.SubprocessError, OSError):
+            pass
         if remote_pid:
             ssh_out(host, f"kill {remote_pid} 2>/dev/null || true")
             ssh_out(host, "rm -f /tmp/roff-s12-http.pid")
@@ -333,7 +374,6 @@ def test_s19_three_sessions_share_the_fleet(fleet, cfg, tmp_path):
 
     # Theo dõi lease trong lúc chạy: không host nào vượt slots.
     max_leases: dict[str, int] = {}
-    jobs: list[str] = []
     deadline = time.time() + 420
     while time.time() < deadline:
         for p in procs:
@@ -373,8 +413,7 @@ def test_s19_three_sessions_share_the_fleet(fleet, cfg, tmp_path):
 
     # Chờ mọi job tới trạng thái cuối.
     for jid in all_jobs:
-        rc, obj, err = roff_json(["wait", jid, "--timeout", "600"],
-                                  timeout=700, env=cfg["env"])
+        rc, obj, err = wait_or_skip(jid, timeout=700, env=cfg["env"], wait_timeout=600)
         assert rc == 0, f"job {jid} không hoàn tất: rc={rc} obj={obj} err={err}"
         assert obj.get("exit") == 0, f"job {jid} exit={obj.get('exit')}"
 

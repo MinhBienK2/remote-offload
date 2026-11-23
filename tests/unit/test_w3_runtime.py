@@ -24,7 +24,6 @@ Test chạy **không cần mạng**: dùng ssh giả (fixture ``fake_ssh``) và 
 
 from __future__ import annotations
 
-import json
 import os
 import stat
 import sys
@@ -37,7 +36,6 @@ _SKILL = os.path.join(_REPO, "skill")
 if _SKILL not in sys.path:
     sys.path.insert(0, _SKILL)
 
-from conftest import parse_json, run_cli, write_config  # noqa: E402
 
 from roffkit import cli as cli_mod  # noqa: E402
 from roffkit import inputs as inputs_mod  # noqa: E402
@@ -53,7 +51,6 @@ from roffkit import watcher as watcher_mod  # noqa: E402
 from roffkit.errors import (  # noqa: E402
     EXIT_INPUT,
     EXIT_JOB_FAILED,
-    EXIT_NO_HOST,
     EXIT_UNREACHABLE,
     RoffError,
 )
@@ -815,8 +812,35 @@ def test_ssh_base_uses_replacement_config(monkeypatch, tmp_path):
     assert argv[argv.index("-F") + 1] == str(cfg)
 
 
-def test_ssh_base_without_replacement_config_has_no_F(monkeypatch):
-    """Không có env ⇒ không thêm ``-F`` (ssh tự dùng ~/.ssh/config)."""
+def test_ssh_base_without_replacement_config_has_no_F(monkeypatch, tmp_path):
+    """Không có env **và không có file config nào** ⇒ không thêm ``-F``.
+
+    B25: nếu file config **có** thì ``-F`` luôn được truyền — xem test kế.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("ROFF_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.delenv("ROFF_SSH_CONFIG", raising=False)
     argv = sshx.ssh_base("muse-a")
     assert "-F" not in argv
+
+
+def test_ssh_base_uses_default_config(monkeypatch, tmp_path):
+    """Không có env nhưng có ``$HOME/.ssh/config`` ⇒ ``-F`` trỏ đúng file đó.
+
+    B25: ssh mặc định đọc ``~/.ssh/config`` theo **passwd home** (``getpwuid``)
+    chứ không theo ``$HOME`` ⇒ phải truyền ``-F`` tường minh, nếu không roff
+    fingerprint một file còn ssh đọc file khác (⇒ nói chuyện nhầm máy).
+    """
+    home = tmp_path / "home"
+    (home / ".ssh").mkdir(parents=True)
+    cfg = home / ".ssh" / "config"
+    cfg.write_text("Host muse-a\n  HostName 10.0.0.1\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("ROFF_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.delenv("ROFF_SSH_CONFIG", raising=False)
+
+    argv = sshx.ssh_base("muse-a")
+    assert "-F" in argv
+    assert argv[argv.index("-F") + 1] == str(cfg)

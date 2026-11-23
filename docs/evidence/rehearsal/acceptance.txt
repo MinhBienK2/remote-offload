@@ -1,0 +1,400 @@
+_s11_shards_spread_over_hosts(fleet, cfg, tmp_path):
+        """S11: ``--in job:<A>`` + ``--shards N`` ⇒ dữ liệu không ghi xuống đĩa
+        local, các shard nằm trên ≥ 2 máy, ``$ROFF_SHARD``/``$ROFF_SHARDS`` đúng."""
+        if len(fleet) < 2:
+            pytest.skip(f"cần ≥ 2 máy để test sharding, đang có {len(fleet)}")
+    
+        env = cfg["env"]
+    
+        # Job A: sinh ra nhiều file
+        gen = tmp_path / "gen"
+        rc, obj, err = roff_json([
+            "do", "--cmd",
+            'for i in 1 2 3 4 5 6; do echo "data-$i" > "$ROFF_OUT/f$i.txt"; done',
+            "--out", str(gen),
+        ], timeout=300, env=env)
+        assert rc == 0, f"job A thất bại: {rc} {json.dumps(obj)} {err[-300:]}"
+        jid_a = obj["job"]
+        rc2, _, err2 = wait_or_skip(jid_a, timeout=360, env=env, wait_timeout=300)
+        assert rc2 == 0, f"job A không thành công: {rc2} {err2[-300:]}"
+    
+        # Job B: dùng --in job:A --shards 3
+        before = subprocess.run(["du", "-sk", str(Path.home() / ".local/state/roff")],
+                                capture_output=True, text=True).stdout.split()[0]
+        out = tmp_path / "outb"
+        rc3, obj3, err3 = roff_json([
+            "do", "--cmd",
+            'echo "shard=$ROFF_SHARD of $ROFF_SHARDS item=$ROFF_ITEM" '
+>           '> "$ROFF_OUT/s$ROFF_SHARD.txt"',
+            "--in", f"job:{jid_a}", "--shards", "3", "--out", str(out),
+        ], timeout=300, env=env)
+E       AssertionError: job B thất bại: 255 {"ok": false, "exit_code": 255, "detail": "ssh: connect to host 127.0.0.1 port 2226: Connection refused\n", "jobs": [{"job": "261123-140914-eaf4", "host": "muse-phamminhbien3333"}, {"job": "261123-140918-220f", "host": "muse-bienpm333"}]} 
+E       assert 255 == 0
+
+tests/acceptance/test_acceptance_resilience.py:284: AssertionError
+__________________________ test_s18_parallel_speedup ___________________________
+
+fleet = ['muse-pmb333', 'muse-tampt', 'muse-bienpm333', 'muse-phamminhbien3333']
+cfg = {'env': {'ROFF_CONFIG': '/tmp/pytest-of-minhbien/pytest-1119/test_s18_parallel_speedup0/config.ini'}, 'live': ['muse-p...use-phamminhbien3333'], 'path': PosixPath('/tmp/pytest-of-minhbien/pytest-1119/test_s18_parallel_speedup0/config.ini')}
+tmp_path = PosixPath('/tmp/pytest-of-minhbien/pytest-1119/test_s18_parallel_speedup0')
+
+    
+    
+    def test_s18_parallel_speedup(fleet, cfg, tmp_path):
+        """S18: N video chạy trên cả fleet.
+    
+        Đạt khi:
+          * tăng tốc **tính toán** ≥ 0,6 × N;
+          * tăng tốc **toàn cục** ≥ 1,3× (N=2) / ≥ 1,8× (N=4);
+          * mọi output có sha256 đúng, không trùng lặp.
+        """
+        n = min(4, len(fleet))
+        if n < 2:
+            pytest.skip(f"cần ≥ 2 máy để đo tăng tốc, đang có {len(fleet)}")
+    
+        vids = _make_videos(tmp_path, n)
+        cmd = ('ffmpeg -y -i "$ROFF_ITEM" -vf scale=640:-2 -c:v libx264 '
+               '-preset veryfast -pix_fmt yuv420p "$ROFF_OUT/$(basename "$ROFF_ITEM")"')
+    
+        # --- 1 máy: cùng lệnh, cùng `--each`, nhưng ghim một host ---
+        # (dùng `--each` cho cả hai phía để lệnh và đường truyền là như nhau —
+        #  khác lệnh thì so sánh tăng tốc vô nghĩa).
+        t0 = time.time()
+        out1 = tmp_path / "seq"
+        rc, obj, err = roff_json([
+            "do", "--cmd", cmd, "--each", str(tmp_path / "v*.mp4"),
+            "--host", fleet[0], "--out", str(out1), "--need", "ffmpeg",
+        ], timeout=1800, env=cfg["env"])
+        assert rc == 0, f"job tuần tự thất bại: {rc} {json.dumps(obj)} {err[-300:]}"
+        seq_ids = [j for j in (obj.get("jobs") or [obj.get("job")]) if j]
+        assert len(seq_ids) == n, f"phải có {n} job tuần tự: {json.dumps(obj)}"
+        for jid in seq_ids:
+>           rcw, res, errw = wait_or_skip(jid, timeout=960, env=cfg["env"], wait_timeout=900)
+E           AssertionError: job tuần tự 261123-141011-5884 không xong: 124 {"ok": true, "exit_code": 124, "job": "261123-141011-5884", "state": "queued", "reason": "timeout"}
+E           assert 124 == 0
+
+tests/acceptance/test_acceptance_resilience.py:364: AssertionError
+_________________________ test_s14_secret_never_leaks __________________________
+
+fleet = ['muse-bienpm333', 'muse-phamminhbien3333']
+cfg = {'env': {'ROFF_CONFIG': '/tmp/pytest-of-minhbien/pytest-1119/test_s14_secret_never_leaks0/config.ini', 'ROFF_STATE_DIR...ever_leaks0/config.ini'), 'state': PosixPath('/tmp/pytest-of-minhbien/pytest-1119/test_s14_secret_never_leaks0/state')}
+tmp_path = PosixPath('/tmp/pytest-of-minhbien/pytest-1119/test_s14_secret_never_leaks0')
+
+    # ------------------------------------------------------------------ S14
+    def test_s14_secret_never_leaks(fleet, cfg, tmp_path):
+        """S14: secret trong --env không lộ ở argv, không lộ trong audit log.
+    
+        Đạt khi:
+          * ``ps`` trên host (lúc job đang chạy) không chứa giá trị secret;
+          * audit log local không chứa giá trị secret;
+          * file env trên host có mode 600;
+          * audit log vẫn ghi ``--cmd`` nguyên văn và tên các key của --env.
+        """
+        host = fleet[0]
+        # Job chạy đủ lâu để ta kịp soi `ps` trên host.
+        rc, obj, err = roff_json(
+            ["do", "--host", host, "--cmd", "sleep 45", "--env", f"MY_SECRET={SECRET}"],
+            timeout=180, env=cfg["env"],
+>       )
+E       AssertionError: roff do thất bại: rc=255 err= obj={'ok': False, 'exit_code': 255, 'reason': 'host_unreachable', 'error': 'không với được host muse-bienpm333', 'detail': 'timeout sau 30s', 'host': 'muse-bienpm333'}
+E       assert 255 == 0
+
+tests/acceptance/test_acceptance_safety.py:117: AssertionError
+___________________ test_s12_tunnel_serves_and_stops_cleanly ___________________
+
+fleet = ['muse-bienpm333', 'muse-phamminhbien3333']
+
+    # ------------------------------------------------------------------ S12
+    def test_s12_tunnel_serves_and_stops_cleanly(fleet):
+        """S12: tunnel tới host hoạt động; ``tunnel stop`` không để lại tiến trình.
+    
+        Đạt khi:
+          * gọi được http://127.0.0.1:<L> và nhận nội dung đúng;
+          * sau ``tunnel stop`` không còn tiến trình ssh nào của roff;
+          * không kill nhầm tiến trình ssh khác của người dùng.
+        """
+        host = fleet[0]
+        # Dựng 1 HTTP server tĩnh trên host (không cần internet).
+        rc, out, err = ssh_out(
+            host,
+            "d=$(mktemp -d); printf 'hello-remote' > \"$d/index.html\"; "
+            "cd \"$d\" && nohup python3 -m http.server 8731 "
+            f"--bind 127.0.0.1 >/dev/null 2>&1 & echo $! > /tmp/roff-s12-http.pid; "
+            "sleep 2; cat /tmp/roff-s12-http.pid",
+>       )
+E       AssertionError: không dựng được HTTP server trên host: Connection timed out during banner exchange
+E         
+E       assert 255 == 0
+
+tests/acceptance/test_acceptance_safety.py:233: AssertionError
+______________ test_s26_queued_job_auto_launches_when_slot_frees _______________
+
+fleet = ['muse-pmb333', 'muse-tampt', 'muse-bienpm333']
+cfg = {'env': {'ROFF_CONFIG': '/tmp/pytest-of-minhbien/pytest-1119/test_s26_queued_job_auto_launc0/config.ini', 'ROFF_SLOT_W...o_launc0/config.ini'), 'state': PosixPath('/tmp/pytest-of-minhbien/pytest-1119/test_s26_queued_job_auto_launc0/state')}
+tmp_path = PosixPath('/tmp/pytest-of-minhbien/pytest-1119/test_s26_queued_job_auto_launc0')
+
+            f"host bị kẹt vĩnh viễn bởi slot rò: job3 state={obj3.get('state')!r} "
+            f"({obj3}) — reconcile phải thu hồi slot của watcher đã chết")
+        job3 = obj3.get("job")
+        assert job3
+    
+        # job3 phải thật sự chạy xong
+        rc, res, err = wait_or_skip(job3, timeout=360, env=cfg["env"], wait_timeout=300)
+        assert rc == 0, f"job3 không hoàn tất: rc={rc} res={res} err={err[-300:]}"
+        assert (tmp_path / "out" / "ok.txt").exists(), "job3 không sinh output"
+    
+    
+    # ------------------------------------------------------------------ S26
+    def test_s26_queued_job_auto_launches_when_slot_frees(fleet, cfg, tmp_path):
+        """S26: job xếp hàng **tự chạy** khi slot trống.
+    
+        ``queued`` không phải "trả về exit 0 rồi quên" — watcher phải tự xin
+        slot, launch, và job phải **thoát với exit 0** mà không ai canh nó.
+>   
+        Đạt khi: job1 (giữ slot) và job2 (xếp hàng) **cùng** về exit 0, và
+        output của job2 có mặt trên máy local.
+        """
+E       AssertionError: job1 lỗi: rc=255 obj={'ok': False, 'exit_code': 255, 'reason': 'host_unreachable', 'error': 'không với được host muse-pmb333', 'detail': 'ssh: connect to host 127.0.0.1 port 2222: Connection refused\n', 'host': 'muse-pmb333'} err=
+E       assert 255 == 0
+
+tests/acceptance/test_acceptance_w3_resilience.py:330: AssertionError
+___________ test_s28_gc_cleans_host_input_store_but_not_running_jobs ___________
+
+fleet = ['muse-pmb333', 'muse-tampt', 'muse-bienpm333']
+cfg = {'env': {'ROFF_CONFIG': '/tmp/pytest-of-minhbien/pytest-1119/test_s28_gc_cleans_host_input_0/config.ini', 'ROFF_SLOT_W..._input_0/config.ini'), 'state': PosixPath('/tmp/pytest-of-minhbien/pytest-1119/test_s28_gc_cleans_host_input_0/state')}
+tmp_path = PosixPath('/tmp/pytest-of-minhbien/pytest-1119/test_s28_gc_cleans_host_input_0')
+
+            if ".tmp." in path.name:
+                continue
+            m = path.stat().st_mode & 0o777
+            if m & 0o077:
+                offenders.append((str(path.relative_to(state)), oct(m), "file"))
+        assert not offenders, (
+            "file/thư mục state đọc được của user khác: "
+            + ", ".join(f"{n} ({m})" for n, m, _ in offenders))
+    
+    
+    # ------------------------------------------------------------------ S28
+    def test_s28_gc_cleans_host_input_store_but_not_running_jobs(fleet, cfg, tmp_path):
+        """S28: `roff gc` dọn kho input **phía host**, nhưng **không** dọn kho
+        mà job đang chạy còn dùng.
+    
+        Đo thật: kho input trên host (``<layout_root>/inputs/<key>/``) trước đây
+        **không có đường dọn** ⇒ phình vô hạn theo thời gian.
+    
+        Đạt khi:
+          * sau khi job chạy xong, ``roff gc`` xoá được kho input của job đó;
+          * khi job **đang chạy**, ``roff gc`` **không** được xoá kho đó.
+        """
+        alias = fleet[0]
+        pin_host(cfg, alias, slots=1)
+    
+        src = tmp_path / "data"
+        src.mkdir()
+        (src / "payload.bin").write_bytes(b"s28" * 4096)
+        out = tmp_path / "out"
+    
+        rc, obj, err = do_on(alias, [
+            "--in", str(src),
+            "--cmd", "sleep 45; cp \"$ROFF_IN/payload.bin\" \"$ROFF_OUT/payload.bin\"",
+            "--out", str(out),
+            "--name", "s28-gc",
+        ], cfg)
+        assert rc == 0, f"roff do lỗi: rc={rc} obj={obj} err={err[-300:]}"
+        job = obj.get("job")
+        assert job
+    
+        led = ledger(cfg["state"], job)
+        root = layout_root_of(led)
+        key = str((led.get("_roff") or {}).get("input_shared_key") or "")
+        assert key, f"job không ghi input_shared_key: {led.get('_roff')}"
+        store = f"{root}/inputs/{key}"
+    
+        # kho input phải tồn tại trên host
+        rc2, out2, err2 = ssh_out(alias, f"test -d {store} && echo yes || echo no")
+        assert out2.strip() == "yes", (
+            f"không thấy kho input {store} trên {alias}: {err2[-200:]}")
+    
+        # gc KHI job đang chạy ⇒ không được xoá
+        rc3, _, err3 = roff_json(["gc"], timeout=600, env=cfg["env"])
+        assert rc3 == 0, f"roff gc lỗi: rc={rc3} err={err3[-300:]}"
+        rc4, out4, _ = ssh_out(alias, f"test -d {store} && echo yes || echo no")
+        assert out4.strip() == "yes", (
+            f"roff gc đã xoá kho input của job **đang chạy** ({store}) — "
+>           f"không được xoá khi job còn dùng")
+E           AssertionError: roff gc không dọn được kho input đã hết dùng (/home/hatch/.roff/inputs/fa353d79a569c499) trên muse-pmb333 — kho input phía host phình vô hạn
+E           assert 'yes' == 'no'
+E             
+E             - no
+E             + yes
+
+tests/acceptance/test_acceptance_w3_resilience.py:460: AssertionError
+_________________ test_s02b_job_failure_exit_code_on_real_host _________________
+
+host_and_profile = ('muse-pmb333', Profile(alias='muse-pmb333', reachable=True, error=None, detail=None, hostname='htch-runtime', boot_id... 'x3dvv43', 'x3dvv44', 'x3dvv45a', 'x3dvv46', 'x3dwip'], toolchains=['bin', 'node'], uptime_s=2067.22, restarts_24h=1))
+ledger = PosixPath('/tmp/pytest-of-minhbien/pytest-1119/test_s02b_job_failure_exit_cod0/state')
+
+    def test_s02b_job_failure_exit_code_on_real_host(host_and_profile, ledger):
+        """S2b: job tự fail (exit 3) → phải báo đúng exit code, KHÔNG retry."""
+        alias, prof = host_and_profile
+        from roffkit import job as job_mod
+    
+        layout_root = prof.layout_root or "/root/.local/share/roff"
+        project = "acceptance-smoke"
+        workdir = f"{layout_root}/projects/{project}"
+        ssh_run(alias, f"mkdir -p '{workdir}'")
+    
+        jid = job_mod.new_job_id()
+        j = job_mod.Job(id=jid, cmd="exit 3", host=alias, project=project)
+        j.out_remote = f"{layout_root}/jobs/{jid}/out"
+        job_mod.save_job(j)
+        job_mod.set_job_options(jid, workdir=workdir, layout_root=layout_root)
+    
+>       job_mod.launch(alias, j, cpus=1, mem_mb=64)
+
+tests/acceptance/test_lifecycle_real.py:165: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+host = 'muse-pmb333'
+job = Job(id='261123-143857-6be0', cmd='exit 3', host='muse-pmb333', project='acceptance-smoke', created_at=1795419537.90257...roff/jobs/261123-143857-6be0/out', out_local=None, shard=None, shards=None, item=None, needs_retry=True, heartbeat=0.0)
+env = None, cpus = 1, mem_mb = 64
+
+    def launch(
+        host: str,
+        job: Job,
+        env: dict[str, str] | None = None,
+        cpus: int = 0,
+        mem_mb: int = 0,
+    ) -> None:
+        """Khởi chạy job trên host (1 round-trip ssh).
+    
+        Trên host: tạo ``<jobdir>``, ghi ``env`` (mode **600**), ``cmd``,
+        ``run.sh``, ``meta.json``; khởi chạy bằng ``setsid nohup`` để **sống sót
+        khi ssh rớt**; ghi ``pid`` + ``boot_id`` + ``instance_token`` vào
+        ``meta.json`` ngay lúc launch (cần để sau này biết host có restart/wipe
+        không, và để huỷ đúng process).
+    
+        Args:
+            host: alias host.
+            job: job cần chạy (``out_remote`` phải trỏ tới ``<jobdir>/out``).
+            env: biến môi trường cho job (secret **không** nằm trong argv).
+            cpus: số core cấp cho job (``$ROFF_CPUS``).
+            mem_mb: ngân sách RAM (``$ROFF_MEM_MB``).
+    
+        Raises:
+            RoffError: ``EXIT_NO_WORKDIR`` (97) nếu thư mục làm việc không có;
+                ``EXIT_UNREACHABLE`` (255) nếu ssh lỗi.
+        """
+        job_dir = remote_job_dir(job)
+        out_dir = str(job.out_remote).rstrip("/")
+        work_dir = remote_workdir(job)
+        layout_root = os.path.dirname(os.path.dirname(job_dir))
+    
+        meta = {
+            "job_id": job.id,
+            "cmd": job.cmd,
+            "host": host,
+            "pid": PID_PLACEHOLDER,
+            "boot_id": BOOT_ID_PLACEHOLDER,
+            "instance_token": INSTANCE_TOKEN_PLACEHOLDER,
+            "started": time.time(),
+            "cpus": int(cpus),
+            "mem_mb": int(mem_mb),
+            "project": job.project,
+            "workdir": work_dir,
+            "out": out_dir,
+            "shard": job.shard,
+            "shards": job.shards,
+            "item": job.item,
+        }
+        members = {
+            "env": (_env_file(env), 0o600),
+            "cmd": (str(job.cmd).encode("utf-8"), 0o600),
+            "run.sh": (_RUN_SH.encode("utf-8"), 0o700),
+            "launch.sh": (
+                _build_launch_script(out_dir, work_dir, job, cpus, mem_mb, layout_root).encode(
+                    "utf-8"
+                ),
+                0o700,
+            ),
+            "meta.json": (json.dumps(meta, ensure_ascii=False).encode("utf-8"), 0o644),
+        }
+        payload = _tar_bytes(members)
+    
+        script = (
+            f"mkdir -p {shlex.quote(job_dir)} "
+            f"&& tar xpf - -C {shlex.quote(job_dir)} "
+            f"&& sh {shlex.quote(os.path.join(job_dir, 'launch.sh'))}"
+        )
+        rc, out, err = _run_ssh(host, script, LAUNCH_TIMEOUT, stdin=payload)
+        if rc != 0:
+            if "ROFF_ERR=workdir_missing" in out:
+                raise RoffError(
+                    EXIT_NO_WORKDIR,
+                    "workdir_missing",
+                    error=f"thư mục làm việc không tồn tại trên host: {work_dir}",
+                    job=job.id,
+                    host=host,
+                    workdir=work_dir,
+                )
+>           raise RoffError(
+                EXIT_UNREACHABLE,
+                detail=(err or out or f"rc={rc} khi launch job trên {host}").strip(),
+                job=job.id,
+                host=host,
+            )
+E           roffkit.errors.RoffError: exit 255
+
+skill/roffkit/job.py:866: RoffError
+________________ test_s06_resume_partial_transfer_on_real_host _________________
+
+host_and_profile = ('muse-pmb333', Profile(alias='muse-pmb333', reachable=True, error=None, detail=None, hostname='htch-runtime', boot_id... 'x3dvv43', 'x3dvv44', 'x3dvv45a', 'x3dvv46', 'x3dwip'], toolchains=['bin', 'node'], uptime_s=2067.22, restarts_24h=1))
+ledger = PosixPath('/tmp/pytest-of-minhbien/pytest-1119/test_s06_resume_partial_transf0/state')
+tmp_path = PosixPath('/tmp/pytest-of-minhbien/pytest-1119/test_s06_resume_partial_transf0')
+
+    def test_s06_resume_partial_transfer_on_real_host(host_and_profile, ledger, tmp_path):
+        """S6: transfer bị ngắt giữa chừng → lần sau phải TIẾP TỤC, không truyền lại
+        từ đầu (rsync --partial)."""
+        alias, prof = host_and_profile
+        from roffkit import transfer as tr
+    
+        src = tmp_path / "big"
+        src.mkdir()
+        # 8 MB — đủ để lần truyền bị ngắt giữa chừng
+        (src / "blob.bin").write_bytes(os.urandom(8 * 1024 * 1024))
+    
+        remote = f"{prof.layout_root or '/root/.local/share/roff'}/acceptance-resume"
+        ssh_run(alias, f"rm -rf '{remote}'; mkdir -p '{remote}'")
+    
+        # Cắt ngang: timeout rất ngắn buộc phải dở dang.
+        import roffkit.transfer as tr_mod
+    
+        real_timeout = tr_mod.push.__defaults__
+        try:
+            tr.push(alias, str(src), remote, timeout=2)
+        except Exception:
+            pass
+    
+        # Lần 2: phải thành công, và byte truyền lần 2 phải ÍT hơn tổng (đã truyền
+        # được một phần lần 1).
+        r = tr.push(alias, str(src), remote, timeout=300)
+>       assert r.ok, f"lần 2 push thất bại: {r.error}"
+E       AssertionError: lần 2 push thất bại: ssh: connect to host 127.0.0.1 port 2222: Connection refused
+E       assert False
+E        +  where False = TransferResult(ok=False, bytes_transferred=0, files=[], resumed=False, error='ssh: connect to host 127.0.0.1 port 2222: Connection refused').ok
+
+tests/acceptance/test_lifecycle_real.py:209: AssertionError
+=========================== short test summary info ============================
+FAILED tests/acceptance/test_acceptance_resilience.py::test_s07_tunnel_drop_does_not_failover
+FAILED tests/acceptance/test_acceptance_resilience.py::test_s10_job_survives_agent_death
+FAILED tests/acceptance/test_acceptance_resilience.py::test_s11_shards_spread_over_hosts
+FAILED tests/acceptance/test_acceptance_resilience.py::test_s18_parallel_speedup
+FAILED tests/acceptance/test_acceptance_safety.py::test_s14_secret_never_leaks
+FAILED tests/acceptance/test_acceptance_safety.py::test_s12_tunnel_serves_and_stops_cleanly
+FAILED tests/acceptance/test_acceptance_w3_resilience.py::test_s26_queued_job_auto_launches_when_slot_frees
+FAILED tests/acceptance/test_acceptance_w3_resilience.py::test_s28_gc_cleans_host_input_store_but_not_running_jobs
+FAILED tests/acceptance/test_lifecycle_real.py::test_s02b_job_failure_exit_code_on_real_host
+FAILED tests/acceptance/test_lifecycle_real.py::test_s06_resume_partial_transfer_on_real_host
+10 failed, 19 passed in 3059.90s (0:50:59)
+
+----- stderr -----

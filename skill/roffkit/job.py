@@ -70,6 +70,11 @@ try:  # lớp ssh trung tâm (ControlMaster) — không định nghĩa lại opt
 except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi sshx merge
     sshx = None  # type: ignore[assignment]
 
+try:  # B25: nguồn sự thật cho tham số ``-F`` (dùng khi rơi vào fallback)
+    from . import fleet
+except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi sshx merge
+    fleet = None  # type: ignore[assignment]
+
 
 try:
     from . import perm
@@ -85,6 +90,8 @@ except ImportError:  # pragma: no cover - chạy module lẻ
 __all__ = [
     "JOB_STATES",
     "TERMINAL_STATES",
+    "UNKNOWN_STATE",
+    "gc_jobs",
     "Job",
     "new_job_id",
     "ledger_dir",
@@ -116,11 +123,25 @@ JOB_STATES: tuple[str, ...] = (
     "exited",
     "lost",
     "cancelled",
+    "unknown",
 )
 """Trạng thái job (hợp đồng API §10)."""
 
-TERMINAL_STATES: tuple[str, ...] = ("exited", "lost", "cancelled")
+TERMINAL_STATES: tuple[str, ...] = ("exited", "lost", "cancelled", "unknown")
 """Trạng thái kết thúc — watcher dừng, ``roff wait`` trả về."""
+
+UNKNOWN_STATE = "unknown"
+"""Trạng thái của job **định dạng cũ** (file ledger không có khoá ``state``).
+
+Bug **B13** (đo thật 23/11/2026): 951/997 file job trong ledger của người
+dùng là định dạng cũ ⇒ ``Job.from_dict`` lấy default của dataclass ⇒
+``state == "queued"`` ⇒ job **không bao giờ** terminal ⇒ ``roff wait`` treo
+hết timeout (exit 124) và ``reconcile_slots`` giữ slot của ticket không ai
+theo dõi.
+
+``unknown`` là trạng thái **terminal**: không giữ slot, ``roff wait`` trả về
+ngay với lý do rõ, ``roff jobs`` hiển thị ``"unknown"`` (không ẩn đi — xem
+``docs/SPEC-CLI.md`` §7)."""
 
 #: Khoá chứa tuỳ chọn phụ của job trong file ledger.
 OPTIONS_KEY = "_roff"
@@ -169,7 +190,13 @@ class Job:
 
     @staticmethod
     def from_dict(d: dict) -> "Job":
-        """Dựng Job từ dict (bỏ qua khoá lạ, thiếu khoá thì dùng default)."""
+        """Dựng Job từ dict (bỏ qua khoá lạ, thiếu khoá thì dùng default).
+
+        **B13**: dict **không có khoá ``state``** ⇒ ``state = "unknown"``,
+        KHÔNG phải ``"queued"``. Không được dựa vào mặc định của dataclass cho
+        trường "thiếu = giá trị nào đó": job định dạng cũ bị coi là *đang xếp
+        hàng* mãi mãi ⇒ ``roff wait`` treo hết timeout.
+        """
         known = {f.name for f in fields(Job)}
         kwargs = {k: v for k, v in (d or {}).items() if k in known}
         kwargs.setdefault("id", "")
@@ -177,6 +204,8 @@ class Job:
         kwargs.setdefault("host", "")
         kwargs.setdefault("project", "")
         kwargs.setdefault("created_at", 0.0)
+        if not kwargs.get("state"):
+            kwargs["state"] = UNKNOWN_STATE
         job = Job(**kwargs)
         job.attempts = [a for a in (job.attempts or []) if isinstance(a, dict)]
         return job
@@ -324,6 +353,99 @@ def list_jobs(state: str | None = None, state_dir: str | None = None) -> list[Jo
 
 
 # --------------------------------------------------------------------------
+# dọn ledger (B13)
+# --------------------------------------------------------------------------
+#: Số ngày mặc định để coi 1 job terminal là "cũ" ⇒ xoá.
+DEFAULT_GC_MAX_AGE_DAYS = 30.0
+
+
+def gc_jobs(
+    state_dir: str | None = None,
+    max_age_days: float = DEFAULT_GC_MAX_AGE_DAYS,
+) -> dict:
+    """Dọn ledger job: xoá job **rác** + job terminal đã cũ (W5b).
+
+    Luật:
+
+    * file job **không có khoá ``state``** (định dạng cũ) ⇒ **rác** ⇒ xoá
+      (đó là 951 job ma của bug B13);
+    * job **terminal** đã cũ hơn ``max_age_days`` (mặc định 30) ⇒ xoá;
+    * job **đang chạy / xếp hàng** ⇒ **giữ**;
+    * file **không đọc được** (JSON hỏng) ⇒ **giữ** và báo ``skipped`` —
+      không xoá thứ mình không hiểu.
+
+    Xoá luôn file phụ của job bị xoá (``<id>.heartbeat``, ``<id>.env``) — file
+    ``.env`` chứa secret, giữ lại là rác.
+
+    Returns:
+        ``{"removed": [job_id...], "removed_count": N, "skipped": [...],
+        "freed_bytes": N}``.
+    """
+    directory = ledger_dir(state_dir)
+    result: dict[str, Any] = {
+        "removed": [],
+        "removed_count": 0,
+        "skipped": [],
+        "freed_bytes": 0,
+    }
+    if not os.path.isdir(directory):
+        return result
+
+    try:
+        days = float(max_age_days)
+    except (TypeError, ValueError):
+        days = DEFAULT_GC_MAX_AGE_DAYS
+    cutoff = time.time() - max(0.0, days) * 86400.0
+
+    removed: list[str] = []
+    skipped: list[str] = []
+    freed = 0
+    for name in sorted(os.listdir(directory)):
+        if not name.endswith(".json"):
+            continue
+        job_id = name[: -len(".json")]
+        path = os.path.join(directory, name)
+        data = _read_json(path)
+        if not data:
+            # JSON hỏng / rỗng ⇒ KHÔNG xoá (không xoá thứ mình không hiểu).
+            skipped.append(job_id)
+            continue
+        legacy = "state" not in data
+        state = str(data.get("state") or "")
+        if not legacy and state not in TERMINAL_STATES:
+            continue  # đang chạy / xếp hàng ⇒ giữ
+        created = 0.0
+        try:
+            created = float(data.get("created_at") or 0.0)
+        except (TypeError, ValueError):
+            created = 0.0
+        if created <= 0.0:
+            try:
+                created = os.path.getmtime(path)
+            except OSError:
+                created = 0.0
+        if not legacy and created > cutoff:
+            continue  # terminal nhưng còn mới ⇒ giữ
+
+        size = 0
+        for suffix in (".json", ".heartbeat", ".env"):
+            side = os.path.join(directory, f"{job_id}{suffix}")
+            try:
+                size += os.path.getsize(side)
+                os.unlink(side)
+            except OSError:
+                pass
+        freed += size
+        removed.append(job_id)
+
+    result["removed"] = removed
+    result["removed_count"] = len(removed)
+    result["skipped"] = skipped
+    result["freed_bytes"] = freed
+    return result
+
+
+# --------------------------------------------------------------------------
 # tuỳ chọn phụ + secret
 # --------------------------------------------------------------------------
 def job_options(job_id: str, state_dir: str | None = None) -> dict:
@@ -459,6 +581,18 @@ def _prefix_nice() -> list[str]:
     return parts
 
 
+def _config_args() -> list[str]:
+    """Tham số ``-F`` — **cùng nguồn** với :mod:`roffkit.fleet` (B25).
+
+    Chỉ dùng ở nhánh fallback (khi ``sshx`` không import được). Quy tắc y
+    hệt mọi lệnh ssh khác: ssh phải đọc **đúng** file mà roff đã
+    fingerprint, nếu không có thể nối **nhầm máy** (B14/B25).
+    """
+    if fleet is None:
+        return []
+    return fleet.ssh_config_args()
+
+
 def _ssh_base(alias: str) -> list[str]:
     """Argv ssh cho 1 alias — **tái sử dụng** của :mod:`roffkit.sshx`.
 
@@ -468,7 +602,8 @@ def _ssh_base(alias: str) -> list[str]:
     """
     if sshx is not None:
         return sshx.ssh_base(alias)
-    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", alias]
+    return ["ssh", *_config_args(),
+            "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", alias]
 
 
 def _run_ssh(

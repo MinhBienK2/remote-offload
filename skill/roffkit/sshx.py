@@ -26,6 +26,11 @@ try:
 except ImportError:  # pragma: no cover
     from .errors import EXIT_UNREACHABLE, RoffError
 
+try:  # B25: nguồn sự thật duy nhất cho đường dẫn ssh-config
+    from roffkit import fleet  # type: ignore
+except ImportError:  # pragma: no cover - chạy module lẻ
+    from . import fleet  # type: ignore
+
 DEFAULT_TIMEOUT = 60.0
 CONNECT_TIMEOUT = 15
 SERVER_ALIVE_INTERVAL = 30
@@ -68,8 +73,32 @@ def _short_alias(alias: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in alias)
 
 
+def _fingerprint(alias: str) -> str:
+    """Fingerprint tham số ssh của alias (8 hex) — xem :func:`fleet.ssh_fingerprint`.
+
+    Lỗi đọc config ⇒ fallback về hash của chính alias (vẫn tất định, và
+    **không** làm mất khả năng phân biệt hai alias khác nhau).
+    """
+    try:
+        try:
+            from roffkit import fleet  # type: ignore
+        except ImportError:  # pragma: no cover - chạy module lẻ
+            from . import fleet  # type: ignore
+        return fleet.ssh_fingerprint(alias)
+    except Exception:  # pragma: no cover - config hỏng thì vẫn phải chạy được
+        return hashlib.sha256(str(alias).encode("utf-8")).hexdigest()[:8]
+
+
 def control_path(alias: str) -> Path:
     """Đường dẫn socket ControlMaster cho một alias.
+
+    Tên socket **chứa fingerprint** của tham số ssh đã resolve
+    (``<alias>-<8 hex>.sock``) — sửa bug **B14**: trước đây socket khoá theo
+    *alias* ⇒ đổi ``~/.ssh/config`` (đổi port, thay máy) vẫn tái dùng master
+    cũ ⇒ roff nói chuyện với **máy cũ**. Đổi config ⇒ fingerprint đổi ⇒
+    socket khác ⇒ master mới.
+
+    Cùng alias + cùng config ⇒ cùng socket (tái dùng master vẫn hoạt động).
 
     Luôn trả về đường dẫn **≤ :data:`UNIX_SOCKET_MAX_PATH` byte**. Nếu đường
     dẫn tự nhiên quá dài (ví dụ ``$ROFF_STATE_DIR`` nằm sâu trong ``/tmp``),
@@ -77,13 +106,13 @@ def control_path(alias: str) -> Path:
     state dir luôn dùng chung một socket, không mất khả năng tái dùng master.
     """
     safe = _short_alias(alias)
-    natural = cm_dir() / f"{safe}.sock"
+    natural = cm_dir() / f"{safe}-{_fingerprint(alias)}.sock"
     if len(str(natural)) <= UNIX_SOCKET_MAX_PATH:
         return natural
 
     digest = hashlib.sha256(str(natural).encode("utf-8")).hexdigest()[:12]
-    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/roff-{os.getuid()}"
-    fallback = Path(runtime) / f"cm-{digest}-{safe}.sock"
+    runtime = _runtime_dir()
+    fallback = runtime / f"cm-{digest}-{safe}.sock"
     if len(str(fallback)) <= UNIX_SOCKET_MAX_PATH:
         return fallback
 
@@ -92,32 +121,83 @@ def control_path(alias: str) -> Path:
     return Path(runtime) / f"cm-{digest}-{safe[:max(1, keep)]}.sock"
 
 
-def ensure_cm_dir() -> None:
-    """Tạo thư mục chứa socket (ssh sẽ không tự tạo)."""
-    path = control_path("x").parent
+def ensure_cm_dir(alias: str | None = None) -> None:
+    """Tạo thư mục chứa socket — ``ssh`` **không** tự tạo.
+
+    Thiếu thư mục thì ``ssh`` chết ngay với
+    ``unix_listener: cannot bind to path ...: No such file or directory``
+    ⇒ **mọi** nơi dựng argv có ``ControlPath`` đều phải gọi hàm này trước.
+
+    Args:
+        alias: alias sắp dùng — khi state dir quá sâu, đường dẫn socket rơi về
+            thư mục runtime, nên cần tạo thêm thư mục đó.
+    """
+    paths = {cm_dir(), control_path(alias or "x").parent}
+    for path in paths:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            os.chmod(path, 0o700)
+        except OSError:
+            pass
+
+
+def _runtime_dir() -> Path:
+    """Thư mục runtime dùng cho socket khi state dir quá sâu."""
+    return Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/roff-{os.getuid()}")
+
+
+def _fallback_suffix(alias: str) -> str:
+    """Hậu tố tên socket khi phải dùng đường dẫn ngắn (thư mục runtime).
+
+    Hậu tố **không** đổi theo fingerprint ⇒ vẫn nhận ra được socket của
+    fingerprint cũ của cùng alias.
+    """
+    safe = _short_alias(alias)
+    runtime = _runtime_dir()
+    keep = UNIX_SOCKET_MAX_PATH - len(str(runtime / f"cm-{'0' * 12}-")) - len(".sock")
+    return f"-{safe[:max(1, keep)]}.sock"
+
+
+def _socket_candidates(alias: str) -> list[Path]:
+    """Socket ControlMaster của **alias** này (chỉ trong thư mục của roff).
+
+    Gồm socket hiện tại (``<alias>-<fingerprint>.sock``), socket của
+    fingerprint **cũ** (``<alias>-<hex cũ>.sock``), socket kiểu cũ
+    (``<alias>.sock``) và bản rút gọn trong thư mục runtime (khi state dir quá
+    sâu). Socket của alias **khác** không bao giờ bị đụng.
+    """
+    safe = _short_alias(alias)
+    out: list[Path] = []
+
+    directory = cm_dir()
     try:
-        path.mkdir(parents=True, exist_ok=True)
-        os.chmod(path, 0o700)
+        names = os.listdir(directory)
     except OSError:
-        pass
+        names = []
+    for name in names:
+        if not name.endswith(".sock"):
+            continue
+        if name == f"{safe}.sock" or name.startswith(f"{safe}-"):
+            out.append(directory / name)
+
+    runtime = _runtime_dir()
+    suffix = _fallback_suffix(alias)
+    try:
+        runtime_names = os.listdir(runtime)
+    except OSError:
+        runtime_names = []
+    for name in runtime_names:
+        if name.startswith("cm-") and name.endswith(suffix):
+            out.append(runtime / name)
+
+    return out
 
 
-def clean_stale_socket(alias: str) -> bool:
-    """Xoá socket ControlMaster còn sót nếu master đã chết.
-
-    OpenSSH **không** xoá socket cũ trước khi bind. Socket sót lại (agent bị
-    kill giữa lúc dựng master) làm ssh thử bind lại với hậu tố ngẫu nhiên —
-    và nếu đường dẫn sát giới hạn 108 byte thì ssh chết với thông báo
-    "unix_listener: path ... too long" dù đường dẫn gốc vẫn vừa.
+def _remove_if_dead(path: Path, alias: str) -> bool:
+    """Xoá socket nếu **không còn master nào sống** trên nó.
 
     ``ssh -O check`` chỉ nối socket **local** (không đi qua mạng) nên rẻ.
-    Trả ``True`` nếu đã xoá.
-
-    Không bao giờ đụng vào socket của tiến trình khác: chỉ xoá socket **của
-    roff** (trong thư mục cm của roff) và **chỉ khi** không còn master nào
-    sống trên nó.
     """
-    path = Path(control_path(alias))
     try:
         if not path.exists():
             return False
@@ -127,7 +207,8 @@ def clean_stale_socket(alias: str) -> bool:
     # Master còn sống không? (nối socket local, ~vài ms)
     try:
         check = subprocess.run(
-            ["ssh", "-o", f"ControlPath={path}", "-O", "check", alias],
+            ["ssh", *ssh_config_args(),
+             "-o", f"ControlPath={path}", "-O", "check", alias],
             capture_output=True, text=True, timeout=10,
         )
         if check.returncode == 0:
@@ -140,6 +221,35 @@ def clean_stale_socket(alias: str) -> bool:
         return True
     except OSError:
         return False
+
+
+def clean_stale_socket(alias: str) -> bool:
+    """Xoá socket ControlMaster còn sót nếu master đã chết.
+
+    OpenSSH **không** xoá socket cũ trước khi bind. Socket sót lại (agent bị
+    kill giữa lúc dựng master) làm ssh thử bind lại với hậu tố ngẫu nhiên —
+    và nếu đường dẫn sát giới hạn 108 byte thì ssh chết với thông báo
+    "unix_listener: path ... too long" dù đường dẫn gốc vẫn vừa.
+
+    **W5c (B14)**: dọn luôn socket của **fingerprint cũ** (đổi
+    ``~/.ssh/config`` ⇒ socket mới khác tên) — nếu không, socket cũ nằm lại
+    trong thư mục cm và làm rối. Chỉ dọn socket **của roff** (trong
+    ``<state>/cm/``) và **chỉ khi** không còn master nào sống trên nó.
+
+    Trả ``True`` nếu đã xoá ít nhất một socket.
+    """
+    removed = False
+    # Socket hiện tại (có thể nằm ở thư mục runtime khi state dir quá sâu —
+    # xem control_path) + các socket cũ còn nằm trong thư mục cm của roff.
+    current = Path(control_path(alias))
+    if _remove_if_dead(current, alias):
+        removed = True
+    for path in _socket_candidates(alias):
+        if path == current:
+            continue
+        if _remove_if_dead(path, alias):
+            removed = True
+    return removed
 
 
 class RunResult(NamedTuple):
@@ -198,24 +308,34 @@ def classify_ssh_error(stderr: str, rc: int) -> str:
 
 
 def ssh_config_path() -> str:
-    """Đường dẫn ``~/.ssh/config`` **thay thế** (``$ROFF_SSH_CONFIG``), hoặc "".
+    """Đường dẫn ssh-config mà roff truyền cho ssh (``-F``), hoặc "".
 
-    Rỗng ⇒ dùng config mặc định của ssh (``~/.ssh/config``).
+    Nguồn sự thật duy nhất: :func:`roffkit.fleet.ssh_config_path` (⇒
+    :func:`roffkit.fleet.ssh_config_file`). Cùng một đường dẫn mà
+    ``fleet`` dùng để *fingerprint* ⇒ ssh đọc **đúng** file roff đã đọc.
 
-    Cần thiết vì ``fleet.parse_ssh_config()`` đọc file thay thế này: nếu ssh
-    thật vẫn đọc ``~/.ssh/config`` thì alias trùng tên sẽ trỏ sang **máy
-    khác** — roff lên kế hoạch trên máy A nhưng lệnh chạy trên máy B.
+    Vì sao phải truyền ``-F`` **tường minh** (B25): OpenSSH mở rộng ``~`` theo
+    **passwd entry** (``getpwuid``), **KHÔNG** theo ``$HOME`` — ssh mặc định
+    đọc ``~/.ssh/config`` của *passwd home*, còn roff fingerprint
+    ``$HOME/.ssh/config``. Nếu hai file khác nhau: ssh đọc **file A**, roff
+    fingerprint **file B** ⇒ đổi config không đổi fingerprint ⇒ tái dùng
+    ControlMaster cũ ⇒ roff nói chuyện với **máy cũ** (bug B14).
+
+    Rỗng ⇒ không có file config nào để truyền (ssh tự lo, như cũ).
     """
-    env = os.environ.get("ROFF_SSH_CONFIG")
-    if not env:
-        return ""
-    return os.path.abspath(os.path.expanduser(env))
+    return fleet.ssh_config_path()
 
 
 def ssh_config_args() -> list[str]:
-    """Tham số ``-F <path>`` cho ssh (rỗng nếu không có config thay thế)."""
-    path = ssh_config_path()
-    return ["-F", path] if path else []
+    """Tham số ``-F <path>`` cho ssh (rỗng nếu không có config nào).
+
+    Luôn truyền ``-F`` khi có đường dẫn — xem :func:`ssh_config_path` để biết
+    vì sao phải truyền tường minh (OpenSSH đọc ``~/.ssh/config`` theo *passwd
+    home*, không theo ``$HOME``).
+
+    Nguồn sự thật duy nhất: :func:`roffkit.fleet.ssh_config_args`.
+    """
+    return fleet.ssh_config_args()
 
 
 def ssh_base(alias: str, timeout: float = DEFAULT_TIMEOUT) -> list[str]:
@@ -224,7 +344,7 @@ def ssh_base(alias: str, timeout: float = DEFAULT_TIMEOUT) -> list[str]:
     Luôn có ``BatchMode=yes`` — host cần mật khẩu sẽ **fail** thay vì treo chờ
     nhập tay. Có ``ControlMaster=auto`` để các lệnh sau tái dùng kết nối.
     """
-    ensure_cm_dir()
+    ensure_cm_dir(alias)
     # Socket master còn sót (agent bị kill giữa lúc dựng master) làm ssh thử
     # bind lại với hậu tố ngẫu nhiên và chết với thông báo sai lệch.
     # `ssh -O check` chỉ nối socket local nên rẻ, và chỉ chạy khi socket tồn tại.
@@ -321,7 +441,8 @@ def run_argv(host: str, argv: list[str], timeout: float = DEFAULT_TIMEOUT,
 def master_alive(alias: str) -> bool:
     """ControlMaster của alias còn sống không."""
     proc = subprocess.run(
-        ["ssh", "-o", f"ControlPath={control_path(alias)}", "-O", "check", alias],
+        ["ssh", *ssh_config_args(),
+         "-o", f"ControlPath={control_path(alias)}", "-O", "check", alias],
         capture_output=True, text=True, timeout=15)
     return proc.returncode == 0
 
@@ -329,7 +450,8 @@ def master_alive(alias: str) -> bool:
 def close_master(alias: str) -> bool:
     """Đóng ControlMaster của alias (dùng khi cần dọn)."""
     proc = subprocess.run(
-        ["ssh", "-o", f"ControlPath={control_path(alias)}", "-O", "exit", alias],
+        ["ssh", *ssh_config_args(),
+         "-o", f"ControlPath={control_path(alias)}", "-O", "exit", alias],
         capture_output=True, text=True, timeout=15)
     return proc.returncode == 0
 

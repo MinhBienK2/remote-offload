@@ -13,9 +13,10 @@ Trọng tâm:
 
 from __future__ import annotations
 
-import json
 import os
+import stat
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -290,10 +291,25 @@ def test_control_path_is_per_alias_and_private(state_dir, monkeypatch):
 
     tunnel.tunnel_start(ALIAS, LPORT, RPORT)
 
-    path = tunnel.control_path(ALIAS)
-    assert path.endswith(f"{ALIAS}.sock")
+    path = Path(tunnel.control_path(ALIAS))
+    name = path.name
+    # Tên socket **gắn fingerprint** tham số ssh đã resolve (sửa B14):
+    # `<alias>-<8 hex>.sock` — đổi `~/.ssh/config` ⇒ socket khác ⇒ master khác.
+    #
+    # Nhưng đường dẫn **phải** ≤ 88 byte (`sun_path` của Unix socket) ⇒ khi
+    # `$ROFF_STATE_DIR` nằm sâu trong `/tmp` (đúng trường hợp của pytest
+    # `tmp_path`), `control_path` **rút gọn** thành `cm-<hash>-<alias>.sock`.
+    # ⇒ kiểm tra **hợp đồng** (có alias, đủ dài, ≤ giới hạn socket), **không**
+    # kiểm tra tên cụ thể — nếu không thì test đỏ vì lý do **độ dài đường dẫn**
+    # chứ không phải vì lỗi sản phẩm (đo thật 23/11/2026, sau B25).
+    assert name.endswith(".sock")
+    assert ALIAS in name
+    assert len(name) > len(ALIAS) + len(".sock")
+    assert len(str(path)) <= tunnel.sshx.UNIX_SOCKET_MAX_PATH
     assert "cm" in str(path)
     assert tunnel.control_path("muse-b") != path
+    # Socket phải **riêng tư**: thư mục chứa nó chỉ owner đọc/ghi được.
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
 
 
 # --------------------------------------------------------------------------------------

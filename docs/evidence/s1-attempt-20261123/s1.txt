@@ -1,0 +1,4 @@
+[S1] dự án thử: /tmp/roff-s1-8i3heuzh/s1-project
+[S1] FAIL: phiên Claude Code quá thời gian
+
+----- stderr -----

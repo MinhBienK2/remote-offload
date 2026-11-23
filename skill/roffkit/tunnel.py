@@ -24,10 +24,12 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 try:  # pragma: no cover - hai cách import đều phải chạy được
     from roffkit.errors import EXIT_INPUT, EXIT_JOB_FAILED, EXIT_UNREACHABLE, RoffError
@@ -40,6 +42,11 @@ except ImportError:  # pragma: no cover
     from . import sshx
 
 try:  # pragma: no cover
+    from roffkit import perm
+except ImportError:  # pragma: no cover
+    from . import perm
+
+try:  # pragma: no cover
     from roffkit.sshx import ssh_config_args
 except ImportError:  # pragma: no cover
     from .sshx import ssh_config_args
@@ -47,6 +54,8 @@ except ImportError:  # pragma: no cover
 log = logging.getLogger("roff.tunnel")
 
 CONTROL_PERSIST = 300
+LINK_VIA_PORT_MIN = 18500
+LINK_VIA_PORT_MAX = 18599
 """Giây giữ ControlMaster sau khi lệnh cuối cùng kết thúc."""
 
 CONNECT_TIMEOUT = 15
@@ -59,6 +68,9 @@ __all__ = [
     "tunnel_start",
     "tunnel_stop",
     "tunnel_list",
+    "tunnel_link",
+    "tunnel_stop_link",
+    "link_list",
     "state_dir",
     "cm_dir",
     "control_path",
@@ -130,11 +142,15 @@ def _load_state() -> list[dict]:
 
 
 def _save_state(records: list[dict]) -> None:
+    """Ghi state tunnel (file 0600, thu muc 0700 - xem roffkit.perm)."""
     path = _state_file()
     path.parent.mkdir(parents=True, exist_ok=True)
+    perm.secure_dir(str(path.parent))
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps({"tunnels": records}, ensure_ascii=False, indent=2))
+    perm.secure_file(str(tmp))
     os.replace(tmp, path)
+    perm.secure_file(str(path))
 
 
 # --------------------------------------------------------------------------------------
@@ -167,13 +183,19 @@ def _run(argv: list[str], timeout: float = DEFAULT_TIMEOUT) -> tuple[int, str, s
     return proc.returncode, proc.stdout or "", proc.stderr or ""
 
 
-def _ssh_opts(alias: str) -> list[str]:
+def _ssh_opts(alias: str, extra: Sequence[str] = ()) -> list[str]:
     """Option ssh chung: ControlMaster của roff + không bao giờ hỏi mật khẩu.
 
-    Có ``-F <$ROFF_SSH_CONFIG>`` nếu được set — tunnel phải nối **đúng** máy
-    mà ``fleet`` đã liệt kê (xem :func:`roffkit.sshx.ssh_config_args`).
+    Luôn có ``-F <path>`` khi có file config — tunnel phải nối **đúng** máy
+    mà ``fleet`` đã liệt kê và **fingerprint** (xem
+    :func:`roffkit.sshx.ssh_config_args`).
+
+    Luôn gọi :func:`roffkit.sshx.ensure_cm_dir` trước: ``ssh`` không tự tạo
+    thư mục của ``ControlPath`` ⇒ thiếu ``<state>/cm/`` thì ssh chết với
+    ``unix_listener: cannot bind to path ...``.
     """
-    return [
+    sshx.ensure_cm_dir(alias)
+    opts = [
         "ssh",
         *ssh_config_args(),
         "-o", "BatchMode=yes",
@@ -185,16 +207,28 @@ def _ssh_opts(alias: str) -> list[str]:
         "-o", f"ControlPersist={CONTROL_PERSIST}",
         "-o", "LogLevel=ERROR",
     ]
+    for item in extra:
+        opts += ["-o", str(item)]
+    return opts
 
 
 def _ssh_run(alias: str, remote_cmd: str, timeout: float = DEFAULT_TIMEOUT) -> tuple[int, str, str]:
     """Chạy một script trên host (một round-trip)."""
+    sshx.clean_stale_socket(alias)
     return _run(_ssh_opts(alias) + [alias, remote_cmd], timeout=timeout)
 
 
-def _ssh_mux(alias: str, args: list[str], timeout: float = DEFAULT_TIMEOUT) -> tuple[int, str, str]:
+def _ssh_mux(
+    alias: str,
+    args: list[str],
+    timeout: float = DEFAULT_TIMEOUT,
+    extra: Sequence[str] = (),
+) -> tuple[int, str, str]:
     """Lệnh ssh dạng mux (``-O check/cancel/forward/exit``) hoặc mở master."""
-    return _run(_ssh_opts(alias) + list(args) + [alias], timeout=timeout)
+    # Socket master chết sót lại ⇒ OpenSSH thử bind lại với hậu tố ngẫu nhiên
+    # (và `ssh -O ...` chết với "read from master failed"). Dọn trước.
+    sshx.clean_stale_socket(alias)
+    return _run(_ssh_opts(alias, extra) + list(args) + [alias], timeout=timeout)
 
 
 # --------------------------------------------------------------------------------------
@@ -355,25 +389,61 @@ def _is_own_master(pid: int, alias: str) -> bool:
     return False
 
 
-def _has_other_tunnels(alias: str, exclude_lport: int) -> bool:
-    return any(
-        rec.get("alias") == alias and int(rec.get("lport", -1)) != exclude_lport
-        for rec in _load_state()
-    )
+def _record_key(rec: dict) -> tuple:
+    """Khoá định danh của 1 bản ghi state (tunnel hay link).
+
+    ``("tunnel", alias, lport)`` cho tunnel đơn, ``("link", from, rport)`` cho
+    link phối hợp. Bản ghi cũ (không có khoá ``kind``) = tunnel.
+    """
+    if str(rec.get("kind") or "tunnel") == "link":
+        return ("link", str(rec.get("from") or ""), int(rec.get("rport", -1)))
+    return ("tunnel", str(rec.get("alias") or ""), int(rec.get("lport", -1)))
 
 
-def _cancel_forward(alias: str, lport: int, rport: int) -> bool:
+def _record_aliases(rec: dict) -> set[str]:
+    """Các alias mà bản ghi này dùng (master ssh của chúng)."""
+    if str(rec.get("kind") or "tunnel") == "link":
+        return {str(rec.get("from") or ""), str(rec.get("to") or "")} - {""}
+    alias = str(rec.get("alias") or "")
+    return {alias} if alias else set()
+
+
+def _has_other_tunnels(alias: str, exclude: tuple | None = None) -> bool:
+    """Alias này còn forward nào khác (ngoài ``exclude``) không?
+
+    Dùng để quyết định: đóng master (hết forward) hay chỉ huỷ 1 forward, và
+    có được phép ``ssh -O cancel`` (huỷ **mọi** forward của master) hay không.
+    """
+    for rec in _load_state():
+        if alias not in _record_aliases(rec):
+            continue
+        if exclude is not None and _record_key(rec) == exclude:
+            continue
+        return True
+    return False
+
+
+def _cancel_forward(
+    alias: str,
+    lport: int,
+    rport: int,
+    remote: bool = False,
+    exclude: tuple | None = None,
+) -> bool:
     """Huỷ forward của master roff trên cổng ``lport``.
 
-    Chỉ đụng vào master của roff (ControlPath riêng). Không bao giờ kill pid.
+    ``remote=False`` → forward ``-L`` (local nghe); ``remote=True`` → ``-R``
+    (remote nghe). Chỉ đụng vào master của roff (ControlPath riêng). Không
+    bao giờ kill pid.
     """
     spec = f"127.0.0.1:{lport}:127.0.0.1:{rport}"
-    rc, _out, _err = _ssh_mux(alias, ["-O", "cancel", "-L", spec])
+    flag = "-R" if remote else "-L"
+    rc, _out, _err = _ssh_mux(alias, ["-O", "cancel", flag, spec])
     if rc == 0:
         return True
     # OpenSSH không huỷ được từng forward → huỷ toàn bộ forward của master này,
     # nhưng chỉ khi không còn tunnel nào khác của cùng host.
-    if not _has_other_tunnels(alias, lport):
+    if not _has_other_tunnels(alias, exclude):
         rc, _out, _err = _ssh_mux(alias, ["-O", "cancel"])
         if rc == 0:
             return True
@@ -398,14 +468,14 @@ def _parse_master_pid(text: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def _ensure_master(alias: str) -> int | None:
+def _ensure_master(alias: str, extra: Sequence[str] = ()) -> int | None:
     """Đảm bảo có ControlMaster của roff cho alias; trả pid của master."""
     rc, out, _err = _ssh_mux(alias, ["-O", "check"])
     pid = _parse_master_pid(out)
     if rc == 0 and pid:
         return pid
     # Chưa có master → mở một master nền (ControlPersist=300 giữ kết nối).
-    rc, out, err = _ssh_mux(alias, ["-f", "-N"], timeout=90)
+    rc, out, err = _ssh_mux(alias, ["-f", "-N"], timeout=90, extra=extra)
     if rc != 0:
         raise RoffError(
             EXIT_UNREACHABLE,
@@ -417,14 +487,30 @@ def _ensure_master(alias: str) -> int | None:
     return _parse_master_pid(out)
 
 
-def _add_forward(alias: str, lport: int, rport: int) -> None:
-    """Mở forward ``127.0.0.1:lport`` → ``127.0.0.1:rport`` trên remote."""
+def _add_forward(
+    alias: str,
+    lport: int,
+    rport: int,
+    remote: bool = False,
+    extra: Sequence[str] = (),
+) -> None:
+    """Mở forward trên master của roff.
+
+    ``remote=False`` → ``-L 127.0.0.1:lport:127.0.0.1:rport``: local nghe ở
+    ``lport``, ssh dịch tới ``rport`` **trên remote**.
+
+    ``remote=True`` → ``-R 127.0.0.1:lport:127.0.0.1:rport``: remote nghe ở
+    ``lport``, ssh (chạy ở máy local) dịch tới ``rport`` **trên local**.
+    """
     spec = f"127.0.0.1:{lport}:127.0.0.1:{rport}"
-    rc, _out, _err = _ssh_mux(alias, ["-O", "forward", "-L", spec])
+    flag = "-R" if remote else "-L"
+    rc, _out, _err = _ssh_mux(alias, ["-O", "forward", flag, spec], extra=extra)
     if rc == 0:
         return
     # OpenSSH cũ không có lệnh mux `forward` → mở client riêng, master giữ forward.
-    rc, out, err = _ssh_mux(alias, ["-f", "-N", "-L", spec], timeout=60)
+    rc, out, err = _ssh_mux(
+        alias, ["-f", "-N", flag, spec], timeout=60, extra=extra
+    )
     if rc != 0:
         raise RoffError(
             EXIT_JOB_FAILED,
@@ -433,6 +519,7 @@ def _add_forward(alias: str, lport: int, rport: int) -> None:
             alias=alias,
             lport=lport,
             rport=rport,
+            remote=remote,
         )
 
 
@@ -488,7 +575,9 @@ def tunnel_start(host: str, lport: int, rport: int) -> Tunnel:
     occupied, pid = _local_port_state(lport)
     if occupied:
         if pid is not None and _is_own_master(pid, alias):
-            if not _cancel_forward(alias, lport, rport):
+            if not _cancel_forward(
+                alias, lport, rport, exclude=("tunnel", alias, lport)
+            ):
                 raise RoffError(
                     EXIT_JOB_FAILED,
                     "stale_forward",
@@ -579,9 +668,10 @@ def tunnel_stop(host: str, lport: int) -> dict:
         }
 
     rport = int(record.get("rport", 0))
-    stopped = _cancel_forward(alias, lport, rport)
+    key = ("tunnel", alias, lport)
+    stopped = _cancel_forward(alias, lport, rport, exclude=key)
     master_stopped = False
-    if not _has_other_tunnels(alias, lport):
+    if not _has_other_tunnels(alias, key):
         rc, _out, _err = _ssh_mux(alias, ["-O", "exit"])
         master_stopped = rc == 0
         try:
@@ -626,3 +716,309 @@ def tunnel_list() -> list[Tunnel]:
             )
         )
     return tunnels
+
+
+# --------------------------------------------------------------------------------------
+# W4 — link phối hợp giữa 2 máy
+# --------------------------------------------------------------------------------------
+LINK_SSH_OPTS: tuple[str, ...] = (
+    "ExitOnForwardFailure=yes",
+    "TCPKeepAlive=yes",
+)
+"""Option bắt buộc cho link: một đầu chết ⇒ forward chết theo (không treo)."""
+
+
+def _port_free(port: int) -> bool:
+    """Cổng local có trống không? **Thử bind thật** (SO_REUSEADDR rồi đóng).
+
+    Không đoán bừa: cổng "trống" theo ``ss`` vẫn có thể bị chiếm giữa lúc đo
+    và lúc dùng — bind thật mới là phép thử đáng tin.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", int(port)))
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def _pick_free_port(start: int, end: int) -> int | None:
+    """Cổng trống đầu tiên trong ``[start, end]`` (``None`` = hết cổng)."""
+    for port in range(int(start), int(end) + 1):
+        if _port_free(port):
+            return port
+    return None
+
+
+def _flag_text(value: bool | None) -> str:
+    """``True`` / ``False`` / ``unknown`` — dùng cho ``note``."""
+    if value is None:
+        return "unknown"
+    return "True" if value else "False"
+
+
+def tunnel_link(
+    from_alias: str,
+    to_alias: str,
+    rport: int,
+    via_lport: int | None = None,
+    to_port: int | None = None,
+) -> dict:
+    """Mở **link phối hợp** giữa 2 máy (W4a).
+
+    Cơ chế (đo thật 23/11/2026 trên fleet ``muse-*``)::
+
+        A :rport  ──(ssh -R rport:127.0.0.1:via)──▶  local :via
+        local :via ──(ssh -L via:127.0.0.1:to_port)──▶  B :to_port
+
+    Tiến trình trên A gọi ``127.0.0.1:rport`` là nói chuyện với dịch vụ đang
+    LISTEN trên B. Host ↔ host **không** nối thẳng trên fleet này (bridge chết
+    ở bước SSH banner) ⇒ phải đi vòng qua máy local.
+
+    Args:
+        from_alias: máy **nhận** kết nối (listener ở ``127.0.0.1:rport``).
+        to_alias: máy **phục vụ** (dịch vụ đang LISTEN ở ``to_port``).
+        rport: cổng listener trên máy ``from_alias``.
+        via_lport: cổng trung gian trên máy local (mặc định: tự chọn cổng
+            trống trong dải ``18500-18599``).
+        to_port: cổng dịch vụ trên máy ``to_alias`` (mặc định = ``rport``).
+
+    Raises:
+        RoffError: ``EXIT_INPUT`` (port/alias sai), ``EXIT_JOB_FAILED``
+            (``remote_not_listening`` / ``local_port_busy`` / ``no_free_port`` /
+            ``forward_failed``), ``EXIT_UNREACHABLE`` (host không với được,
+            kèm ``detail`` nguyên văn lỗi ssh).
+    """
+    a = (from_alias or "").strip()
+    b = (to_alias or "").strip()
+    if not a:
+        raise RoffError(EXIT_INPUT, "invalid_host", error="--from rỗng")
+    if not b:
+        raise RoffError(EXIT_INPUT, "invalid_host", error="--to rỗng")
+    if a == b:
+        raise RoffError(
+            EXIT_INPUT,
+            "same_host",
+            error="--from và --to phải là 2 máy khác nhau",
+        )
+    rport = _as_port(rport, "--rport")
+    to_port = _as_port(to_port if to_port else rport, "--to-port")
+
+    # 1. Máy B có đang LISTEN ở to_port không? (False = lỗi, không mở link;
+    #    None = không kiểm tra được ⇒ vẫn mở nhưng phải ghi rõ).
+    b_listening = _remote_listening(b, to_port)
+    if b_listening is False:
+        raise RoffError(
+            EXIT_JOB_FAILED,
+            "remote_not_listening",
+            remote_listening=False,
+            error=f"{b}:{to_port} không có gì đang LISTEN",
+            from_alias=a,
+            to_alias=b,
+            rport=rport,
+            to_port=to_port,
+        )
+
+    # 2. Cổng trung gian trên máy local (thử bind thật, không đoán bừa).
+    if via_lport is None:
+        via = _pick_free_port(LINK_VIA_PORT_MIN, LINK_VIA_PORT_MAX)
+        if via is None:
+            raise RoffError(
+                EXIT_JOB_FAILED,
+                "no_free_port",
+                error=(
+                    "không có cổng trống nào trong dải "
+                    f"{LINK_VIA_PORT_MIN}-{LINK_VIA_PORT_MAX}"
+                ),
+                from_alias=a,
+                to_alias=b,
+            )
+    else:
+        via = _as_port(via_lport, "--via-lport")
+        if not _port_free(via):
+            raise RoffError(
+                EXIT_JOB_FAILED,
+                "local_port_busy",
+                local_port_busy=True,
+                error=f"cổng trung gian {via} đang bị chiếm",
+                from_alias=a,
+                to_alias=b,
+                via_lport=via,
+            )
+
+    key = ("link", a, rport)
+
+    # 3. Nhánh -L: local :via → B :to_port (master của B).
+    master_to = _ensure_master(b, extra=LINK_SSH_OPTS)
+    try:
+        _add_forward(b, via, to_port, remote=False, extra=LINK_SSH_OPTS)
+    except Exception:
+        raise
+
+    # 4. Nhánh -R: A :rport → local :via (master của A).
+    master_from: int | None = None
+    try:
+        master_from = _ensure_master(a, extra=LINK_SSH_OPTS)
+        _add_forward(a, rport, via, remote=True, extra=LINK_SSH_OPTS)
+    except Exception:
+        # Dọn nhánh đã mở — không để lại listener ngoài ý muốn.
+        _cancel_forward(b, via, to_port, remote=False, exclude=key)
+        raise
+
+    # 5. Kiểm tra cả hai đầu: A có LISTEN ở rport không?
+    a_listening = _remote_listening(a, rport)
+    if a_listening is False:
+        _cancel_forward(a, rport, via, remote=True, exclude=key)
+        _cancel_forward(b, via, to_port, remote=False, exclude=key)
+        raise RoffError(
+            EXIT_JOB_FAILED,
+            "forward_failed",
+            error=f"{a}:{rport} không có gì đang LISTEN sau khi mở forward",
+            from_alias=a,
+            to_alias=b,
+            rport=rport,
+            to_port=to_port,
+            via_lport=via,
+        )
+
+    # 6. Ghi lại state để `tunnel stop` biết phải dọn nhánh nào.
+    note = (
+        f"a_listening={_flag_text(a_listening)}; "
+        f"b_listening={_flag_text(b_listening)}"
+    )
+    records = [rec for rec in _load_state() if _record_key(rec) != key]
+    records.append(
+        {
+            "kind": "link",
+            "from": a,
+            "to": b,
+            "rport": rport,
+            "to_port": to_port,
+            "via_lport": via,
+            "master_pid_from": master_from,
+            "master_pid_to": master_to,
+            "control_path_from": control_path(a),
+            "control_path_to": control_path(b),
+            "created_at": time.time(),
+            "note": note,
+            "a_listening": a_listening,
+            "b_listening": b_listening,
+        }
+    )
+    _save_state(records)
+    log.debug(
+        "link mở: %s:%s → %s:%s (via local :%s)", a, rport, b, to_port, via
+    )
+    return {
+        "ok": True,
+        "from_alias": a,
+        "to_alias": b,
+        "rport": rport,
+        "to_port": to_port,
+        "via_lport": via,
+        "a_listening": a_listening,
+        "b_listening": b_listening,
+        "master_pid_from": master_from,
+        "master_pid_to": master_to,
+        "note": note,
+    }
+
+
+def tunnel_stop_link(from_alias: str, rport: int) -> dict:
+    """Dọn **cả hai** nhánh của 1 link (W4b).
+
+    * huỷ forward ``-R`` trên máy A (listener ở ``rport``);
+    * huỷ forward ``-L`` qua máy B (cổng trung gian trên local);
+    * đóng master tương ứng nếu không còn forward nào khác;
+    * xoá bản ghi khỏi ``tunnels.json``.
+
+    Bỏ sót một nhánh = để lại listener ngoài ý muốn (giống lỗi R3).
+    """
+    a = (from_alias or "").strip()
+    rport = _as_port(rport, "--rport")
+    records = _load_state()
+    key = ("link", a, rport)
+    record = None
+    for rec in records:
+        if _record_key(rec) == key:
+            record = rec
+            break
+    if record is None:
+        return {
+            "ok": True,
+            "from_alias": a,
+            "rport": rport,
+            "stopped": False,
+            "detail": "không có link nào được ghi nhận",
+        }
+
+    b = str(record.get("to") or "")
+    via = int(record.get("via_lport") or 0)
+    to_port = int(record.get("to_port") or 0)
+
+    remote_stopped = False
+    local_stopped = False
+    if via:
+        remote_stopped = _cancel_forward(a, rport, via, remote=True, exclude=key)
+    if b and via and to_port:
+        local_stopped = _cancel_forward(b, via, to_port, remote=False, exclude=key)
+
+    master_stopped = False
+    for alias in (a, b):
+        if not alias or _has_other_tunnels(alias, key):
+            continue
+        rc, _out, _err = _ssh_mux(alias, ["-O", "exit"])
+        if rc == 0:
+            master_stopped = True
+        try:
+            Path(control_path(alias)).unlink()
+        except OSError:
+            pass
+
+    _save_state([rec for rec in records if _record_key(rec) != key])
+    stopped = bool(remote_stopped or local_stopped)
+    return {
+        "ok": True,
+        "from_alias": a,
+        "to_alias": b,
+        "rport": rport,
+        "to_port": to_port,
+        "via_lport": via,
+        "stopped": stopped,
+        "remote_stopped": remote_stopped,
+        "local_stopped": local_stopped,
+        "master_stopped": master_stopped,
+        "detail": (
+            "cả hai nhánh đã dọn"
+            if (remote_stopped and local_stopped)
+            else "chỉ dọn được một nhánh — kiểm tra lại listener"
+        ),
+    }
+
+
+def link_list() -> list[dict]:
+    """Liệt kê các link phối hợp đang ghi nhận (đọc state local, không gọi ssh)."""
+    out: list[dict] = []
+    for rec in _load_state():
+        if str(rec.get("kind") or "tunnel") != "link":
+            continue
+        out.append(
+            {
+                "from": str(rec.get("from") or ""),
+                "to": str(rec.get("to") or ""),
+                "rport": rec.get("rport"),
+                "to_port": rec.get("to_port"),
+                "via_lport": rec.get("via_lport"),
+                "created_at": rec.get("created_at"),
+                "note": rec.get("note"),
+                "a_listening": rec.get("a_listening"),
+                "b_listening": rec.get("b_listening"),
+            }
+        )
+    return out

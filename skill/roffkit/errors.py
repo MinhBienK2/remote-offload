@@ -29,6 +29,16 @@ EXIT_CONFIG = 3
 EXIT_NO_HOST = 10
 """Không còn host nào dùng được (hết slot / hết fleet)."""
 
+EXIT_PULL_FAILED = 74
+"""Job chạy xong (exit 0) nhưng artifact **chưa về** local (B23).
+
+Không dùng lại ``EXIT_JOB_FAILED`` (1) vì agent phải phân biệt rõ:
+
+* ``1``  = **job** fail ⇒ **đừng** chạy lại job (chạy lại cũng fail);
+* ``74`` = job chạy xong nhưng **artifact chưa về** ⇒ kéo lại bằng
+  ``roff pull <job>``, **không** cần chạy lại job.
+"""
+
 EXIT_JOB_LOST = 69
 """Job mất: restart / wipe / OOM / vanished."""
 
@@ -48,6 +58,27 @@ REASON_RESTARTED = "host_restarted"
 REASON_WIPED = "host_wiped"
 REASON_OOM = "oom_killed"
 REASON_VANISHED = "vanished"
+REASON_PULL_FAILED = "pull_failed"
+"""Job chạy xong nhưng artifact không kéo về được local (B23).
+
+Agent phải **kéo lại bằng ``roff pull <job>``** — **không** chạy lại job
+(job remote đã chạy xong thành công).
+"""
+
+REASON_SYNC_BACK_FAILED = "sync_back_failed"
+"""Job chạy xong nhưng path ``--sync-back`` **không về** local (B26).
+
+Cùng họ với :data:`REASON_PULL_FAILED`: job **remote** thành công (``exit``
+= 0) nhưng kết quả **chưa về đủ** ⇒ exit **74** ⇒ agent **kéo lại** bằng
+``roff pull <job>``, **không** chạy lại job.
+"""
+
+REASON_SYNC_BACK_OUTSIDE_PROJECT = "sync_back_outside_project"
+"""Path ``--sync-back`` nằm ngoài project root **và** ngoài mọi input (B26).
+
+Không có nơi nào trên host để tìm file đó ⇒ **từ chối ngay lúc gửi job**
+(exit 2) thay vì im lặng làm cái gì đó vô nghĩa.
+"""
 
 
 class RoffError(Exception):

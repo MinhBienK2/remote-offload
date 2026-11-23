@@ -11,3 +11,6 @@ venv/
 # roff runtime state (không commit)
 .roff/
 *.local-state/
+
+# Claude Code: worktree của subagent (không phải mã nguồn)
+.claude/

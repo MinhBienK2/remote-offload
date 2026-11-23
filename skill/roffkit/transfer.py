@@ -133,6 +133,11 @@ try:  # lớp ssh trung tâm (ControlMaster) — không định nghĩa lại opt
 except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi sshx merge
     sshx = None  # type: ignore[assignment]
 
+try:  # B25: nguồn sự thật cho tham số ``-F`` (dùng khi rơi vào fallback)
+    from . import fleet
+except ImportError:  # pragma: no cover - TODO(claude): hợp nhất sau khi sshx merge
+    fleet = None  # type: ignore[assignment]
+
 
 __all__ = [
     "TransferResult",
@@ -233,9 +238,16 @@ class TransferResult:
 # config / tiền tố nice
 # --------------------------------------------------------------------------
 def _config() -> Any | None:
-    """Config hiện tại, hoặc ``None`` nếu không đọc được."""
+    """Config hiện tại, hoặc ``None`` nếu không đọc được.
+
+    **B27** — ``strict=False`` (cố ý): transfer đọc config **sau khi** job đã
+    được *ghim host* trong ledger. Nếu ở đây ném lỗi (``config_missing``)
+    thì watcher/transfer **chết** ⇒ job mất **im lặng** — tệ hơn hẳn việc
+    dùng cấu hình mặc định. ``roff do`` (điểm vào của người dùng) mới là
+    chỗ phải **fail to** khi ``ROFF_CONFIG`` trỏ tới file không tồn tại.
+    """
     try:
-        return Config.load(os.environ.get("ROFF_CONFIG") or None)
+        return Config.load(os.environ.get("ROFF_CONFIG") or None, strict=False)
     except Exception:
         return None
 
@@ -289,6 +301,18 @@ def _state_dir() -> str:
 # --------------------------------------------------------------------------
 # chạy lệnh con (seam cho test)
 # --------------------------------------------------------------------------
+def _config_args() -> list[str]:
+    """Tham số ``-F`` — **cùng nguồn** với :mod:`roffkit.fleet` (B25).
+
+    Chỉ dùng ở nhánh fallback (khi ``sshx`` không import được). Quy tắc y
+    hệt mọi lệnh ssh khác: ssh phải đọc **đúng** file mà roff đã
+    fingerprint, nếu không có thể nối **nhầm máy** (B14/B25).
+    """
+    if fleet is None:
+        return []
+    return fleet.ssh_config_args()
+
+
 def _ssh_base(alias: str) -> list[str]:
     """Argv ssh cho 1 alias — **tái sử dụng** của :mod:`roffkit.sshx`.
 
@@ -298,7 +322,8 @@ def _ssh_base(alias: str) -> list[str]:
     """
     if sshx is not None:
         return sshx.ssh_base(alias)
-    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", alias]
+    return ["ssh", *_config_args(),
+            "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", alias]
 
 
 def _ssh_argv(alias: str, script: str) -> list[str]:

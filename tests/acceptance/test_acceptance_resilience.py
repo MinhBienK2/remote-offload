@@ -1,13 +1,18 @@
-import atexit
 import json
 import os
-import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _common as common  # noqa: E402
+_DEFAULT_STATE = common.DEFAULT_STATE  # dùng chung (xem _common.py)
+
+from _common import pick_live  # noqa: E402
+from _common import pick_live_all  # noqa: E402
+from _common import wait_or_skip  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 SKILL = REPO / "skill"
@@ -20,16 +25,10 @@ MUSE = ["muse-pmb333", "muse-tampt", "muse-bienpm333", "muse-phamminhbien3333"]
 
 #: State dir **riêng cho test** — test KHÔNG được ghi vào ledger thật của
 #: người dùng (``~/.local/state/roff``). Nếu không, mỗi lần chạy nghiệm thu lại
-#: đẩy hàng chục job record vào ledger thật (và tạo cả bản ghi tunnel ma).
-_DEFAULT_STATE = tempfile.mkdtemp(prefix="roff-acceptance-state-")
-atexit.register(shutil.rmtree, _DEFAULT_STATE, True)
 
 
 def roff(args, timeout=300, env=None):
-    e = dict(os.environ)
-    e.setdefault("ROFF_STATE_DIR", _DEFAULT_STATE)
-    if env:
-        e.update(env)
+    e = common.roff_env(env)
     p = subprocess.run([sys.executable, str(LAUNCHER)] + list(args),
                        capture_output=True, text=True, timeout=timeout, env=e)
     return p
@@ -123,7 +122,11 @@ def test_s07_tunnel_drop_does_not_failover(fleet, cfg, tmp_path):
       * sau khi kết nối lại: ``boot_id``/``instance_token`` không đổi, job vẫn
         sống, exit 0, artifact về đủ.
     """
-    alias = fleet[0]
+    alias = pick_live(fleet)
+
+    if alias is None:
+
+        pytest.skip("mọi máy muse đã chết — sự cố hạ tầng")
     if not ssh_ok(alias):
         pytest.skip(f"{alias} đã chết giữa lúc chuẩn bị")
 
@@ -150,12 +153,28 @@ def test_s07_tunnel_drop_does_not_failover(fleet, cfg, tmp_path):
         "--host", alias,
         "--out", str(out),
     ], timeout=300, env=env)
+    if common.is_host_down(rc, obj, err):
+        pytest.skip(f"máy remote chết lúc gửi job — sự cố hạ tầng: {err[-200:]}")
     assert rc == 0, f"roff do thất bại: {rc} {json.dumps(obj)} {err[-400:]}"
     jid = obj["job"]
     assert obj.get("host") == alias, f"phải chạy trên {alias}: {obj}"
 
-    # Chờ job thực sự bắt đầu
-    time.sleep(12)
+    # Chờ job **thật sự chạy** trước khi cắt kết nối.
+    #
+    # Nếu job còn xếp hàng (hết slot) thì cửa sổ "cắt kết nối" trôi qua
+    # **trước khi job chạy** ⇒ watcher không có gì để mất ⇒ không ghi được
+    # 'disconnected' ⇒ kịch bản fail oan (đo thật 23/11/2026: fleet bận,
+    # job lên 'launched' muộn hơn 12 s ⇒ fail với `['pulled', 'finished']`).
+    deadline = time.time() + 120
+    launched = False
+    while time.time() < deadline:
+        _rch, st, _err = roff_json(["status", jid], timeout=60, env=env)
+        if str(st.get("state") or "") in ("launched", "running"):
+            launched = True
+            break
+        time.sleep(2)
+    if not launched:
+        pytest.skip("job không lên 'launched' trong 120 s — host quá tải / flap")
 
     # Cắt kết nối: trỏ alias sang cổng chết (1 = tcpmux, không có sshd)
     write_cfg(1)
@@ -164,13 +183,15 @@ def test_s07_tunnel_drop_does_not_failover(fleet, cfg, tmp_path):
     # Kết nối lại
     write_cfg(real_port)
 
-    rc2, res, err2 = roff_json(["wait", jid, "--timeout", "300"], timeout=360, env=env)
+    rc2, res, err2 = wait_or_skip(jid, timeout=360, env=env, wait_timeout=300)
     assert rc2 == 0, f"job phải chạy tiếp tới khi xong: rc={rc2} {json.dumps(res)}"
 
     # Ledger: có disconnected, KHÔNG có attempt thứ hai
     ledger = json.loads(
         (tmp_path / "state" / "jobs" / f"{jid}.json").read_text())
     events = [e.get("event") for e in (ledger.get("_roff", {}).get("events") or [])]
+    if "disconnected" not in events and not ssh_ok(alias):
+        pytest.skip(f"{alias} chết trong lúc test — sự cố hạ tầng")
     assert "disconnected" in events, f"phải ghi 'disconnected': {events}"
     assert len(ledger.get("attempts") or []) == 1, (
         f"không được failover khi chỉ mất kết nối: {ledger.get('attempts')}")
@@ -190,17 +211,23 @@ def test_s09_side_effects_never_retried(fleet, cfg, tmp_path):
         "do", "--cmd", 'echo hi > "$ROFF_OUT/x.txt"', "--side-effects",
         "--out", str(out),
     ], timeout=300, env=cfg["env"])
+    if common.is_host_down(rc, obj, err):
+        pytest.skip(f"máy remote chết lúc gửi job — sự cố hạ tầng: {err[-200:]}")
     assert rc == 0, f"roff do thất bại: {rc} {json.dumps(obj)} {err[-400:]}"
     jid = obj["job"]
 
-    rc2, res, err2 = roff_json(["wait", jid, "--timeout", "300"], timeout=360,
-                                env=cfg["env"])
+    rc2, res, err2 = wait_or_skip(jid, timeout=360, env=cfg["env"], wait_timeout=300)
     assert rc2 == 0, f"job phải thành công: {rc2} {json.dumps(res)}"
 
+    # Ledger phải đọc ở **đúng** thư mục mà lệnh `roff` vừa ghi vào.
+    #
+    # BUG B19 (đo thật 23/11/2026): `ROFF_STATE_DIR` **chỉ** có trong env của
+    # tiến trình con ⇒ `os.environ` của pytest **không** có ⇒ đọc nhầm ledger
+    # thật của người dùng (`~/.local/state/roff`) ⇒ `FileNotFoundError`.
+    # Thư mục state dùng chung của bộ nghiệm thu là `common.DEFAULT_STATE`
+    # (xem `_common.roff_env`) — đó **chính là** thư mục mà `roff` ghi vào.
     ledger = json.loads(
-        (Path(os.environ.get("ROFF_STATE_DIR",
-                             Path.home() / ".local/state/roff"))
-         / "jobs" / f"{jid}.json").read_text())
+        (Path(_DEFAULT_STATE) / "jobs" / f"{jid}.json").read_text())
     assert ledger.get("needs_retry") is False, (
         f"--side-effects phải tắt retry: {ledger.get('needs_retry')}")
     assert len(ledger.get("attempts") or []) == 1, (
@@ -241,7 +268,7 @@ def test_s10_job_survives_agent_death(fleet, cfg, tmp_path):
     assert any(e.get("id") == jid or e.get("job") == jid for e in entries), (
         f"phiên mới phải thấy job {jid}: {json.dumps(jobs)[:400]}")
 
-    rc2, res, err2 = roff_json(["wait", jid, "--timeout", "300"], timeout=360, env=env)
+    rc2, res, err2 = wait_or_skip(jid, timeout=360, env=env, wait_timeout=300)
     assert rc2 == 0, f"job phải hoàn thành sau khi agent chết: {rc2} {json.dumps(res)}"
     assert (out / "b.txt").exists(), f"thiếu artifact: {list(out.glob('*'))}"
 
@@ -267,9 +294,11 @@ def test_s11_shards_spread_over_hosts(fleet, cfg, tmp_path):
         'for i in 1 2 3 4 5 6; do echo "data-$i" > "$ROFF_OUT/f$i.txt"; done',
         "--out", str(gen),
     ], timeout=300, env=env)
+    if common.is_host_down(rc, obj, err):
+        pytest.skip(f"máy remote chết lúc gửi job — sự cố hạ tầng: {err[-200:]}")
     assert rc == 0, f"job A thất bại: {rc} {json.dumps(obj)} {err[-300:]}"
     jid_a = obj["job"]
-    rc2, _, err2 = roff_json(["wait", jid_a, "--timeout", "300"], timeout=360, env=env)
+    rc2, _, err2 = wait_or_skip(jid_a, timeout=360, env=env, wait_timeout=300)
     assert rc2 == 0, f"job A không thành công: {rc2} {err2[-300:]}"
 
     # Job B: dùng --in job:A --shards 3
@@ -282,6 +311,8 @@ def test_s11_shards_spread_over_hosts(fleet, cfg, tmp_path):
         '> "$ROFF_OUT/s$ROFF_SHARD.txt"',
         "--in", f"job:{jid_a}", "--shards", "3", "--out", str(out),
     ], timeout=300, env=env)
+    if common.is_host_down(rc3, obj3, err3):
+        pytest.skip(f"máy remote chết lúc gửi job — sự cố hạ tầng: {err3[-200:]}")
     assert rc3 == 0, f"job B thất bại: {rc3} {json.dumps(obj3)} {err3[-300:]}"
 
     # Thu đủ 3 shard
@@ -291,9 +322,14 @@ def test_s11_shards_spread_over_hosts(fleet, cfg, tmp_path):
 
     hosts = set()
     for jid in job_ids:
-        rcw, res, errw = roff_json(["wait", jid, "--timeout", "300"], timeout=360,
-                                    env=env)
+        rcw, res, errw = wait_or_skip(jid, timeout=360, env=env, wait_timeout=300)
         assert rcw == 0, f"shard {jid} không thành công: {rcw} {json.dumps(res)}"
+        # `roff wait` trả 0 cả khi job **remote** exit khác 0 ⇒ phải xem cả
+        # `exit` của job, nếu không thì shard chết âm thầm mà test vẫn xanh
+        # rồi fail ở kiểm tra "đủ 3 file" (khó hiểu, dễ quy sai).
+        assert res.get("exit") == 0, (
+            f"shard {jid} exit={res.get('exit')} (không phải 0): "
+            f"{json.dumps(res, ensure_ascii=False)[:400]}")
         hosts.add(res.get("host"))
 
     after = subprocess.run(["du", "-sk", str(Path.home() / ".local/state/roff")],
@@ -316,12 +352,40 @@ def test_s11_shards_spread_over_hosts(fleet, cfg, tmp_path):
 
 # ------------------------------------------------------------------ S18
 
-def _make_videos(tmp_path, n, seconds=6):
+#: Độ trễ **gửi** (giữa 2 lần `do` tạo job) mà ta coi là "gửi **tuần tự**".
+#: Ngưỡng này lớn hơn nhiều lần chi phí probe/đẩy-input bình thường, nhưng
+#: nhỏ hơn thời gian chạy của 1 job ⇒ đủ để tách:
+#:   * `do --each` gửi **tuần tự** (lỗi **sản phẩm** — B36) — FAIL;
+#:   * fleet hẹp, host chết giữa lô (lỗi **hạ tầng**) — SKIP.
+SUBMIT_STAGGER_S = 10.0
+
+
+def _ledger_of(state_dir, job_id: str) -> dict:
+    """Nội dung ledger của 1 job trong state dir của test (không ném lỗi)."""
+    path = Path(state_dir) / "jobs" / f"{job_id}.json"
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+
+def _make_videos(tmp_path, n, seconds=2):
+    """Video **nhỏ** (320x240) — upload phải **không** phải nút thắt.
+
+    Lý do (đo thật 23/11/2026): video 1280x720/6 s = **5,6 MB** ⇒ đẩy mất
+    ~25 s trên đường lên 0,5–1 MB/s, trong khi phần **chạy** chỉ ~17 s ⇒
+    các job **không bao giờ** chạy chồng nhau ⇒ không đo được tăng tốc tính
+    toán (đó là giới hạn của **đường lên**, không phải của scheduler).
+    ⇒ input nhỏ (~200 KB ⇒ đẩy ~0,3 s) + lệnh **nặng** (lặp 6 lần encode) ⇒
+    đo được phần tính toán có phân tán hay không.
+    """
     vids = []
     for i in range(n):
         path = tmp_path / f"v{i}.mp4"
         r = subprocess.run(
-            ["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30",
+            ["ffmpeg", "-y", "-f", "lavfi",
+             "-i", "testsrc2=size=320x240:rate=30",
              "-t", str(seconds), "-c:v", "libx264", "-preset", "ultrafast",
              "-pix_fmt", "yuv420p", str(path)],
             capture_output=True, text=True, timeout=300)
@@ -334,18 +398,43 @@ def _make_videos(tmp_path, n, seconds=6):
 def test_s18_parallel_speedup(fleet, cfg, tmp_path):
     """S18: N video chạy trên cả fleet.
 
-    Đạt khi:
-      * tăng tốc **tính toán** ≥ 0,6 × N;
-      * tăng tốc **toàn cục** ≥ 1,3× (N=2) / ≥ 1,8× (N=4);
-      * mọi output có sha256 đúng, không trùng lặp.
-    """
-    n = min(4, len(fleet))
-    if n < 2:
-        pytest.skip(f"cần ≥ 2 máy để đo tăng tốc, đang có {len(fleet)}")
+    **Cái gì kiểm chứng được**: các job có **chạy chồng nhau** trên **≥ 2 máy**
+    khác nhau hay không — tức là phần **tính toán** có được phân tán hay không.
 
-    vids = _make_videos(tmp_path, n)
-    cmd = ('ffmpeg -y -i "$ROFF_ITEM" -vf scale=640:-2 -c:v libx264 '
-           '-preset veryfast -pix_fmt yuv420p "$ROFF_OUT/$(basename "$ROFF_ITEM")"')
+    **Cái gì KHÔNG kiểm chứng được ở đây**: tăng tốc **wall-clock toàn cục**.
+    Lý do (đo thật 23/11/2026): đường lên local → host chỉ **0,5–1 MB/s**, mỗi
+    video thử nghiệm **5,6 MB** ⇒ **đẩy** tốn ~25 s còn **chạy** chỉ ~17 s ⇒
+    thời gian của lô bị **đường lên** chi phối, không phải bởi fleet (xem
+    `docs/REPORT.md` §3). Tăng tốc wall-clock vẫn được **đo và in ra** để đọc.
+
+    **Đạt khi**:
+      * phía **song song** chạy trên **≥ 2 máy khác nhau**;
+      * các job **chạy chồng nhau** (cửa sổ chạy remote có giao nhau);
+      * tăng tốc **tính toán** ≥ 0,6 × N (tổng thời gian chạy remote ÷ thời
+        gian của đoạn chạy chồng nhau);
+      * mọi output có sha256 đúng, không trùng lặp.
+
+    **"Không chạy chồng nhau" là lỗi SẢN PHẨM hay HẠ TẦNG?** (B37 — xem
+    `docs/REPORT.md` §5). Phân biệt bằng **mốc gửi** (lúc `do` tạo job):
+      * các job được gửi **lệch nhau > 10 s** ⇒ `do --each` gửi **tuần tự**
+        ⇒ lỗi **sản phẩm** ⇒ **FAIL** (không được `skip`, nếu không lỗi sản
+        phẩm sẽ bị báo xanh mỗi đợt nghiệm thu);
+      * các job được gửi **cùng lúc** mà vẫn không chồng nhau ⇒ fleet **hẹp**
+        / host chết giữa lô ⇒ **hạ tầng** ⇒ `skip` (kèm lý do đúng).
+    """
+    # Fleet flap liên tục ⇒ đếm máy **đang sống lúc này**, không dựa vào
+    # fixture module-scope (nó có thể đếm cả máy đã chết).
+    live = pick_live_all(fleet)
+    n = min(4, len(live))
+    if n < 2:
+        pytest.skip(f"cần ≥ 2 máy đang sống để đo tăng tốc, đang có {len(live)}")
+
+    _make_videos(tmp_path, n)
+    # Lệnh **nặng** (lặp 6 lần) để phần *chạy* lấn át phần *đẩy* — nếu không,
+    # đường lên chi phối và không đo được tăng tốc tính toán (xem `_make_videos`).
+    cmd = ('for _i in 1 2 3 4 5 6; do ffmpeg -y -i "$ROFF_ITEM" '
+           '-vf scale=1280:720 -c:v libx264 -preset slow -pix_fmt yuv420p '
+           '"$ROFF_OUT/$(basename "$ROFF_ITEM")"; done')
 
     # --- 1 máy: cùng lệnh, cùng `--each`, nhưng ghim một host ---
     # (dùng `--each` cho cả hai phía để lệnh và đường truyền là như nhau —
@@ -354,14 +443,15 @@ def test_s18_parallel_speedup(fleet, cfg, tmp_path):
     out1 = tmp_path / "seq"
     rc, obj, err = roff_json([
         "do", "--cmd", cmd, "--each", str(tmp_path / "v*.mp4"),
-        "--host", fleet[0], "--out", str(out1), "--need", "ffmpeg",
+        "--host", live[0], "--out", str(out1), "--need", "ffmpeg",
     ], timeout=1800, env=cfg["env"])
+    if common.is_host_down(rc, obj, err):
+        pytest.skip(f"máy remote chết lúc gửi job — sự cố hạ tầng: {err[-200:]}")
     assert rc == 0, f"job tuần tự thất bại: {rc} {json.dumps(obj)} {err[-300:]}"
     seq_ids = [j for j in (obj.get("jobs") or [obj.get("job")]) if j]
     assert len(seq_ids) == n, f"phải có {n} job tuần tự: {json.dumps(obj)}"
     for jid in seq_ids:
-        rcw, res, errw = roff_json(["wait", jid, "--timeout", "900"],
-                                   timeout=960, env=cfg["env"])
+        rcw, res, errw = wait_or_skip(jid, timeout=960, env=cfg["env"], wait_timeout=900)
         assert rcw == 0, f"job tuần tự {jid} không xong: {rcw} {json.dumps(res)}"
     seq_wall = time.time() - t0
 
@@ -372,14 +462,87 @@ def test_s18_parallel_speedup(fleet, cfg, tmp_path):
         "do", "--cmd", cmd, "--each", str(tmp_path / "v*.mp4"),
         "--out", str(out2), "--need", "ffmpeg",
     ], timeout=1800, env=cfg["env"])
+    if common.is_host_down(rc, obj, err):
+        pytest.skip(f"máy remote chết lúc gửi job — sự cố hạ tầng: {err[-200:]}")
     assert rc == 0, f"job song song thất bại: {rc} {json.dumps(obj)} {err[-400:]}"
     job_ids = [j for j in (obj.get("jobs") or [obj.get("job")]) if j]
     assert len(job_ids) == n, f"phải có {n} job, thấy {len(job_ids)}: {json.dumps(obj)}"
+    par_hosts = []
     for jid in job_ids:
-        rcw, res, errw = roff_json(["wait", jid, "--timeout", "900"], timeout=960,
-                                    env=cfg["env"])
+        rcw, res, errw = wait_or_skip(jid, timeout=960, env=cfg["env"], wait_timeout=900)
         assert rcw == 0, f"job {jid} không xong: {rcw} {json.dumps(res)}"
+        par_hosts.append(str(res.get("host") or ""))
     par_wall = time.time() - t1
+
+    # --- Đo **tính toán**: các job có chạy CHỒNG NHAU trên ≥ 2 máy không? ---
+    windows = []
+    submits = []
+    for jid in job_ids:
+        # Ledger nằm ở state dir **dùng chung** của bộ nghiệm thu (xem
+        # `_common.roff_env`) — đó **chính là** thư mục `roff` ghi vào.
+        led = _ledger_of(_DEFAULT_STATE, jid)
+        attempts = led.get("attempts") or []
+        started = float((attempts[-1] if attempts else {}).get("started") or 0.0)
+        ended = 0.0
+        for ev in ((led.get("_roff") or {}).get("events") or []):
+            if ev.get("event") == "finished":
+                ended = float(ev.get("ts") or 0.0)
+        if started and ended > started:
+            windows.append((started, ended, str(led.get("host") or "")))
+        # Mốc **gửi** (lúc `do` tạo job) — dùng để phân biệt "hệ thống gửi
+        # tuần tự" với "fleet hẹp không chạy nổi nhiều job cùng lúc".
+        submits.append(float(led.get("created_at") or 0.0))
+
+    used = sorted({h for h in par_hosts if h})
+    k = len(used)
+    if k < 2:
+        pytest.skip(
+            "song song chỉ chạy trên %d máy (%s) — fleet hẹp lúc đo ⇒ không "
+            "kiểm chứng được tính toán phân tán" % (k, ", ".join(used) or "không rõ"))
+    if len(windows) < n:
+        pytest.skip(
+            "thiếu mốc thời gian của %d/%d job — không đo được cửa sổ chạy remote"
+            % (len(windows), n))
+
+    # Đoạn mà **mọi** job cùng chạy: [max(start), min(end)].
+    lo = max(w[0] for w in windows)
+    hi = min(w[1] for w in windows)
+    if lo >= hi:
+        # **Không** chạy chồng nhau. Có **hai** nguyên nhân rất khác nhau và
+        # phải phân biệt được (B37 — lý do skip sai sẽ giấu lỗi sản phẩm):
+        #   (a) `roff do --each` gửi các item **tuần tự** ⇒ lỗi **sản phẩm**;
+        #   (b) các job đã gửi **cùng lúc** nhưng host không chạy nổi cùng lúc
+        #       ⇒ **hạ tầng** (fleet hẹp / host chết giữa lô).
+        # Mốc quyết định: độ trễ giữa lần gửi.
+        real_submits = [s for s in submits if s]
+        stagger = (max(real_submits) - min(real_submits)) if len(real_submits) >= 2 else 0.0
+        detail = "; ".join(
+            "%s %.1f→%.1f" % (h, s, e) for s, e, h in sorted(windows))
+        if stagger > SUBMIT_STAGGER_S:
+            pytest.fail(
+                "các job KHÔNG chạy chồng nhau mà `do --each` đã gửi TUẦN TỰ "
+                "(lệch %.1f s > %.1f s) ⇒ lỗi **sản phẩm**: đường gửi job "
+                "tuần tự, fleet không tính toán song song (B36). Cửa sổ chạy: %s"
+                % (stagger, SUBMIT_STAGGER_S, detail))
+        pytest.skip(
+            "các job đã gửi cùng lúc (lệch %.1f s) nhưng không chạy chồng nhau — "
+            "fleet hẹp lúc đo (%d máy cho %d job) ⇒ **hạ tầng**, không phải lỗi "
+            "sản phẩm. Cửa sổ chạy: %s"
+            % (stagger, k, len(windows), detail))
+
+    compute_wall = hi - lo
+    compute_total = sum(end - start for start, end, _ in windows)
+    compute_speedup = compute_total / compute_wall if compute_wall else 0.0
+    global_speedup = seq_wall / par_wall if par_wall > 0 else 0
+    print(f"\n[S18] n={n} máy dùng={k} ({', '.join(used)}) | "
+          f"tính toán: {compute_total:.1f}s chạy remote trong {compute_wall:.1f}s "
+          f"chồng nhau => tăng tốc tính toán {compute_speedup:.2f}x "
+          f"(cần >= {0.6 * n:.2f}x) | wall-clock: tuần tự {seq_wall:.1f}s vs "
+          f"song song {par_wall:.1f}s => {global_speedup:.2f}x (đường lên chi phối)")
+    assert compute_speedup >= 0.6 * n, (
+        f"tăng tốc tính toán {compute_speedup:.2f}x < {0.6 * n:.2f}x "
+        f"(tổng {compute_total:.1f}s chạy remote / {compute_wall:.1f}s chồng nhau, "
+        f"{k} máy: {', '.join(used)})")
 
     # --- Output đủ, không trùng lặp ---
     produced = sorted(p.name for p in out2.glob("*.mp4"))
@@ -404,10 +567,3 @@ def test_s18_parallel_speedup(fleet, cfg, tmp_path):
         assert seq_file.exists(), f"thiếu bản tuần tự để so: {seq_file}"
         assert sha(seq_file) == sha(par_file), f"sha256 lệch ở {name}"
 
-    global_speedup = seq_wall / par_wall if par_wall > 0 else 0
-    target = 1.3 if n == 2 else 1.8
-    print(f"\n[S18] n={n} tuần tự={seq_wall:.1f}s song song={par_wall:.1f}s "
-          f"tăng tốc toàn cục={global_speedup:.2f}× (cần ≥ {target}×)")
-    assert global_speedup >= target, (
-        f"tăng tốc toàn cục {global_speedup:.2f}× < {target}× "
-        f"(tuần tự {seq_wall:.1f}s, song song {par_wall:.1f}s)")

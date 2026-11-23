@@ -60,12 +60,34 @@ except ImportError:  # pragma: no cover - chạy module lẻ
 # --------------------------------------------------------------------------
 
 #: Danh sách tool roff quan tâm. Script probe chỉ ghi tool **có thật**.
+#:
+#: Thứ tự của phần cũ **giữ nguyên** (cache probe cũ vẫn đọc được — chỉ hết
+#: hạn bình thường); tool mới (W8a) chèn **cạnh nhóm** để đọc dễ.
+#:
+#: Nhóm "kiểm tra/lint" (``pytest``, ``mypy``, ``ruff``, ``eslint``, ``tsc``,
+#: ``jest``) và nhóm "xử lý ảnh" (``convert``, ``magick``) là loại việc
+#: người dùng hay chạy — trước đó chúng **không** được dò ⇒ host nào cũng
+#: không khớp ⇒ ưu tiên "host có tool" rơi vào no-op (bug B18).
 DEFAULT_TOOLS: tuple[str, ...] = (
-    "ffmpeg", "ffprobe", "node", "npm", "python3", "pip3", "git", "rsync",
-    "tar", "curl", "wget", "gcc", "make", "cmake", "go", "cargo", "rustc",
-    "java", "mvn", "gradle", "docker", "podman", "deno", "bun", "pnpm",
-    "yarn", "uv", "poetry", "dotnet", "playwright", "chromium",
-    "google-chrome",
+    # media / ảnh
+    "ffmpeg", "ffprobe", "convert", "magick",
+    # JS / TS
+    "node", "npm", "eslint", "tsc", "jest",
+    # Python
+    "python3", "pip3", "pytest", "mypy", "ruff",
+    # VCS / mạng / đóng gói
+    "git", "rsync", "tar", "curl", "wget",
+    # biên dịch / build
+    "gcc", "make", "cmake",
+    # ngôn ngữ khác
+    "go", "cargo", "rustc",
+    "java", "mvn", "gradle",
+    "docker", "podman",
+    "deno", "bun", "pnpm", "yarn",
+    "uv", "poetry",
+    "dotnet",
+    # trình duyệt
+    "playwright", "chromium", "google-chrome",
 )
 
 #: Ứng viên layout bền vững (mount riêng, không bị xoá khi restart).
@@ -348,10 +370,28 @@ def _prefix_nice() -> list[str]:
     return parts
 
 
+def _config_args() -> list[str]:
+    """Tham số ``-F`` cho ssh — **cùng nguồn** với ``fleet``/``sshx`` (B25).
+
+    Probe phải đọc **đúng** file mà ``fleet`` đã fingerprint: nếu không,
+    probe hỏi một máy còn job chạy ở máy khác.
+    """
+    try:
+        from roffkit import fleet  # type: ignore
+    except ImportError:  # pragma: no cover - chạy module lẻ
+        from . import fleet  # type: ignore
+    return fleet.ssh_config_args()
+
+
 def ssh_command(alias: str) -> list[str]:
-    """Lệnh ssh dùng để probe (script được gửi qua stdin)."""
+    """Lệnh ssh dùng để probe (script được gửi qua stdin).
+
+    Có ``-F <path>`` khi có file config — ssh phải đọc **đúng** file mà
+    ``fleet`` đã fingerprint (B25), nếu không probe sẽ hỏi **nhầm máy**.
+    """
     return [
         "ssh",
+        *_config_args(),
         "-o", "BatchMode=yes",
         "-o", "ConnectTimeout=15",
         alias,
@@ -738,6 +778,31 @@ def _write_cache(path: str, data: dict) -> None:
             pass
 
 
+def _fingerprint(alias: str) -> str:
+    """Fingerprint tham số ssh của alias (xem :func:`fleet.ssh_fingerprint`).
+
+    Dùng để phát hiện "``~/.ssh/config`` đã đổi" ⇒ cache probe cũ **hết
+    hạn** (bug B14: profile của máy cũ vẫn được dùng sau khi config đổi).
+    """
+    try:
+        try:
+            from roffkit import fleet  # type: ignore
+        except ImportError:  # pragma: no cover - chạy module lẻ
+            from . import fleet  # type: ignore
+        return fleet.ssh_fingerprint(alias)
+    except Exception:  # pragma: no cover - config hỏng thì coi như không có
+        return ""
+
+
+def cache_entries(state_dir: str | None = None) -> dict:
+    """Đọc **nguyên văn** cache probe (``probes.json``) — không probe mạng.
+
+    Dùng cho ``roff doctor`` (mặc định KHÔNG probe) và cho việc kiểm tra
+    fingerprint mà không đụng tới host.
+    """
+    return _read_cache(_cache_path(state_dir))
+
+
 def _profile_from_cache(entry: dict, alias: str) -> Profile | None:
     """Profile từ 1 entry cache; ``None`` nếu entry **hỏng**.
 
@@ -791,8 +856,12 @@ def cached_profiles(
         fresh = False
         if alias not in forced and isinstance(entry, dict):
             ts = entry.get("ts")
+            # B14: config đổi ⇒ fingerprint đổi ⇒ cache cũ **hết hạn**,
+            # phải probe lại (entry không có fingerprint ⇒ cache kiểu cũ ⇒
+            # cũng coi như hết hạn).
             if isinstance(ts, (int, float)) and (now - ts) < ttl:
-                fresh = True
+                if entry.get("fingerprint") == _fingerprint(alias):
+                    fresh = True
         if fresh:
             profile = _profile_from_cache(entry, alias)
             if profile is not None:
@@ -805,7 +874,11 @@ def cached_profiles(
         # Khoá cache = alias **thực tế** của profile (giữ đúng tên alias đã
         # biết) ⇒ entry luôn tự nhất quán với profile bên trong nó.
         cache_key = profile.alias or alias
-        cache[cache_key] = {"ts": time.time(), "profile": profile.to_dict()}
+        cache[cache_key] = {
+            "ts": time.time(),
+            "fingerprint": _fingerprint(alias),
+            "profile": profile.to_dict(),
+        }
         dirty = True
 
     if dirty:

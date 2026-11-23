@@ -1,7 +1,6 @@
 """Hạ tầng test dùng chung: ssh giả, rsync giả, tiện ích gọi CLI."""
 import json
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -58,16 +57,34 @@ def fake_ssh(tmp_path, monkeypatch):
 
 @pytest.fixture
 def cli_env(monkeypatch, tmp_path):
-    """Env cô lập cho CLI: state dir và config dir riêng, không đụng ~/.claude."""
+    """Env cô lập cho CLI: state dir và config dir riêng, không đụng ~/.claude.
+
+    **B27**: ``ROFF_CONFIG`` phải trỏ tới file **có thật** — CLI ``fail to``
+    (exit 3, ``config_missing``) khi config bị chỉ định mà không tồn tại.
+    Fixture này trước B27 trỏ tới file **chưa tạo** ⇒ mọi test viết sau này
+    chạy lệnh nạp config dưới fixture này sẽ nhận exit 3 (quả mìn).
+
+    Nội dung ``[fleet] include = *`` giữ **đúng** ngữ nghĩa cũ: trước B27,
+    config thiếu ⇒ ``Config.load`` trả config mặc định ⇒ ``fleet_include =
+    ["*"]`` ⇒ fleet = **mọi** host trong ssh config của test. Không có
+    ``exclude`` ⇒ không đổi gì so với trước.
+    """
     state = tmp_path / "state"
     cfgdir = tmp_path / "config"
     state.mkdir()
     cfgdir.mkdir()
+    config = cfgdir / "config.ini"
+    config.write_text("[fleet]\ninclude = *\n", encoding="utf-8")
     monkeypatch.setenv("ROFF_STATE_DIR", str(state))
-    monkeypatch.setenv("ROFF_CONFIG", str(cfgdir / "config.ini"))
+    monkeypatch.setenv("ROFF_CONFIG", str(config))
     monkeypatch.setenv("ROFF_HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
-    return {"state": state, "config": cfgdir, "home": tmp_path / "home"}
+    return {
+        "state": state,
+        "config": cfgdir,
+        "config_file": config,
+        "home": tmp_path / "home",
+    }
 
 
 def run_cli(args, env=None, timeout=60):

@@ -90,9 +90,18 @@ agent can pass it straight to `roff do --cmd`.
 | Group | Commands |
 |---|---|
 | media | `ffmpeg` (with an output), `ffprobe` on a file ≥ 50 MB, `blender`, `magick`/`convert` on images, `sox` |
-| build | `cargo build/test`, `go build/test`, `mvn`, `gradle`, `make` (but not `make -n`), `cmake --build`, `npm/pnpm/yarn/bun run build`, `npm test`, `npm ci`, `npm install`, `tsc` (whole project), `next build`, `vite build`, `webpack`, `pip install` (requirements file or many packages), `docker build` |
-| test | `pytest`, `jest`, `vitest`, `playwright test`, `cypress run`, `tox`, `nox`, `rspec` |
+| build | `cargo build/test`, `go build/test`, `mvn`, `gradle`, `make` (but not `make -n`), `cmake --build`, `npm/pnpm/yarn/bun run build`, `npm test`, `npm ci`, `npm install`, `tsc` (whole project), `next build`, `vite build`, `webpack`, `pip install` (requirements file or many packages), `docker build`, `dotnet build/publish/restore/msbuild`, `swift build`, `bazel build`, `ninja`, `meson compile`, `sbt compile/package/assembly`, `mix compile`, `deno compile`, `python -m build` |
+| test | `pytest`, `jest`, `vitest`, `playwright test`, `cypress run`, `tox`, `nox`, `rspec`, `python -m unittest`, `dotnet test`, `swift test`, `bazel test`, `meson test`, `sbt test`, `mix test`, `deno test`, `deno task test`, `phpunit`, `php artisan test` |
 | ml | `python train*.py`, `accelerate launch`, `torchrun`, `python -m torch.distributed.run` |
+
+Flags that only print information or run a dry pass never count: `--help`,
+`-h`, `--version`, `-v`, `-V`, `--dry-run`, `-n`, `--just-print`, `--recon`.
+A test run limited to **one file or one filter** is not heavy either
+(`pytest tests/test_a.py`, `phpunit --filter FooTest`, `sbt 'testOnly …'`).
+
+Dev servers are only **suggested**, never blocked: `npm run dev`, `vite`,
+`dotnet watch`, `dotnet run`, `mix phx.server`, `php artisan serve`,
+`swift run`, `bazel run`, `sbt` (the REPL).
 
 Wrappers are stripped before matching, so `npx vitest run`, `pnpm exec vitest
 run`, `yarn dlx playwright test`, `uv run pytest`, `poetry run pytest`,

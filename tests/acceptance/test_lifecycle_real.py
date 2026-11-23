@@ -6,7 +6,6 @@ lỗi tầng module khỏi lỗi tầng CLI. Chạy được TRƯỚC khi CLI c�
 
 Chạy:  pytest tests/acceptance/test_lifecycle_real.py -q -m acceptance
 """
-import json
 import os
 import subprocess
 import sys
@@ -195,9 +194,7 @@ def test_s06_resume_partial_transfer_on_real_host(host_and_profile, ledger, tmp_
     ssh_run(alias, f"rm -rf '{remote}'; mkdir -p '{remote}'")
 
     # Cắt ngang: timeout rất ngắn buộc phải dở dang.
-    import roffkit.transfer as tr_mod
 
-    real_timeout = tr_mod.push.__defaults__
     try:
         tr.push(alias, str(src), remote, timeout=2)
     except Exception:

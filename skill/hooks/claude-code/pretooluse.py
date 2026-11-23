@@ -12,7 +12,8 @@ Quy tắc (xem `docs/DESIGN.md` §5.11):
 * ``tool_name`` khác ``Bash`` → cho qua, im lặng.
 * Lệnh có ``ROFF_LOCAL=1`` → cho qua (cách thoát của người dùng).
 * Lệnh khớp danh sách **nặng** mặc định (media / build / test / ml) →
-  **chặn**, trả hướng dẫn dùng ``roff do``.
+  **chặn**, trả hướng dẫn dùng ``roff do``. Danh sách phủ nhiều hệ sinh thái:
+  npm/python, go/rust, java, .NET, Swift, Bazel, Elixir, PHP, Deno…
 * Lệnh có file/tham số cụ thể (``pytest path::test_x``, ``vitest run file``)
   → cho qua.
 * Lệnh tương tác / cần server (``npm run dev``, ``vite``, ``http.server``) →
@@ -67,6 +68,16 @@ INTERACTIVE_SCRIPTS = {
     "dev", "start", "serve", "watch", "preview", "storybook", "storybook:dev",
 }
 
+#: Cờ chỉ in thông tin / chạy thử — **không bao giờ chặn** (quy ước sẵn có:
+#: ``mvn -v``, ``gradle -v``, ``blender -v``, ``make -n``… đều được cho qua).
+INFO_FLAGS = {
+    "--help", "-h", "--version", "-v", "-V", "--dry-run", "-n",
+    "--just-print", "--recon",
+}
+
+#: Cờ lọc phạm vi test — chỉ chạy một phần nhỏ nên không chặn cứng.
+FILTER_FLAGS = {"--grep", "-g", "--filter", "--tags", "--tag"}
+
 #: Wrapper: `npx vitest run` → `vitest run`.
 WRAPPER_SINGLE = {"npx", "bunx", "uvx", "pnpx"}
 WRAPPER_PAIRS = {
@@ -92,6 +103,8 @@ FILE_EXT = (
 
 _SPLIT_RE = re.compile(r"\|\||&&|\||;|\n")
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+#: ``python``, ``python3``, ``python3.11``… — đều là wrapper của ``python -m <module>``.
+_PYTHON_RE = re.compile(r"^python(\d+(?:\.\d+)?)?$")
 
 
 # --------------------------------------------------------------------------------------
@@ -278,7 +291,7 @@ def _strip_wrappers(tokens: list[str]) -> list[str]:
             out = out[2:]
             changed = True
             continue
-        if len(out) >= 3 and out[0] in ("python", "python3") and out[1] == "-m":
+        if len(out) >= 3 and _PYTHON_RE.match(out[0]) and out[1] == "-m":
             out = out[2:]
             changed = True
             continue
@@ -306,6 +319,27 @@ def _scoped(args: Iterable[str]) -> bool:
         if _is_file_arg(arg):
             return True
     return False
+
+
+def _has_info_flag(args: Iterable[str]) -> bool:
+    """Lệnh có cờ chỉ-in-thông-tin / chạy-thử không (``--help``, ``-v``, ``-n``…)?"""
+    return any(a in INFO_FLAGS for a in args)
+
+
+def _has_filter_flag(args: Iterable[str]) -> bool:
+    """Lệnh có cờ lọc phạm vi test không (``--filter``, ``--grep``…)?"""
+    return any(a in FILTER_FLAGS or a.startswith("--filter=") for a in args)
+
+
+def _sbt_commands(args: Iterable[str]) -> set[str]:
+    """Lệnh sbt trong tham số (``sbt 'compile test'`` → ``{"compile", "test"}``)."""
+    out: set[str] = set()
+    for arg in args:
+        for part in re.split(r"[;\s]+", arg):
+            part = part.strip().lower()
+            if part:
+                out.add(part)
+    return out
 
 
 def _matches_config(tokens: list[str], entries: Iterable[str]) -> bool:
@@ -490,6 +524,55 @@ def _heavy(tokens: list[str]) -> tuple[str, str] | None:
         if args and args[0] in ("build", "buildx"):
             return ("build", "docker build")
         return None
+    if base == "dotnet" and args and args[0] in ("build", "publish", "restore", "msbuild"):
+        if _has_info_flag(args):
+            return None
+        return ("build", f"dotnet {args[0]}")
+    if base == "swift" and args and args[0] == "build":
+        if _has_info_flag(args):
+            return None
+        return ("build", "swift build")
+    if base in ("bazel", "bazelisk") and args and args[0] == "build":
+        if _has_info_flag(args):
+            return None
+        return ("build", f"{base} build")
+    if base == "ninja":
+        if _has_info_flag(args):
+            return None
+        if "-t" in args:
+            return None  # chế độ truy vấn: `ninja -t targets`
+        if _scoped(args):
+            return None  # `ninja src/main.o` — chỉ một target
+        return ("build", "ninja build toàn dự án")
+    if base == "meson" and args and args[0] == "compile":
+        if _has_info_flag(args):
+            return None
+        return ("build", "meson compile")
+    if base == "sbt":
+        # sbt vừa build vừa test → xử lý một chỗ, nhóm trả về theo lệnh.
+        if _has_info_flag(args):
+            return None
+        cmds = _sbt_commands(args)
+        if "testonly" in cmds:
+            return None  # `sbt "testOnly com.foo.BarTest"` — một test class
+        if "test" in cmds:
+            return ("test", "sbt test")
+        if cmds & {"compile", "package", "assembly"}:
+            return ("build", "sbt compile")
+        return None
+    if base == "mix" and args and args[0] == "compile":
+        if _has_info_flag(args):
+            return None
+        return ("build", "mix compile")
+    if base == "deno" and args and args[0] == "compile":
+        if _has_info_flag(args):
+            return None
+        return ("build", "deno compile")
+    if base == "build":
+        # `python -m build` — frontend PEP 517 (đã bóc wrapper `python -m`).
+        if _has_info_flag(args):
+            return None
+        return ("build", "python -m build (PEP 517)")
 
     # --- test ---
     if base == "pytest":
@@ -520,6 +603,56 @@ def _heavy(tokens: list[str]) -> tuple[str, str] | None:
         if _scoped(args):
             return None
         return ("test", "rspec chạy cả suite")
+    if base == "unittest":
+        # `python -m unittest` / `python -m unittest discover`.
+        if _has_info_flag(args):
+            return None
+        if _scoped(args):
+            return None
+        return ("test", "unittest discover chạy cả suite")
+    if base == "dotnet" and args and args[0] == "test":
+        if _scoped(args[1:]) or _has_filter_flag(args[1:]):
+            return None
+        return ("test", "dotnet test chạy cả suite")
+    if base == "swift" and args and args[0] == "test":
+        if _scoped(args[1:]) or _has_filter_flag(args[1:]):
+            return None
+        return ("test", "swift test chạy cả suite")
+    if base in ("bazel", "bazelisk") and args and args[0] == "test":
+        # Nhãn bazel luôn chứa `/` ⇒ không dùng `_scoped` ở đây.
+        if _has_info_flag(args):
+            return None
+        return ("test", f"{base} test chạy cả suite")
+    if base == "meson" and args and args[0] == "test":
+        if _has_info_flag(args):
+            return None
+        return ("test", "meson test chạy cả suite")
+    if base == "mix" and args and args[0] == "test":
+        if _scoped(args[1:]) or _has_filter_flag(args[1:]):
+            return None
+        return ("test", "mix test chạy cả suite")
+    if base == "deno" and args and args[0] == "test":
+        if _scoped(args[1:]) or _has_filter_flag(args[1:]):
+            return None
+        return ("test", "deno test chạy cả suite")
+    if base == "deno" and args and args[0] == "task" and len(args) > 1:
+        name = args[1].lower()
+        if name in ("test", "tests", "e2e", "bench", "benchmark"):
+            return ("test", f"deno task {name}")
+        if name in HEAVY_SCRIPTS:
+            return ("build", f"deno task {name}")
+        return None
+    if base == "phpunit":
+        if _has_info_flag(args):
+            return None
+        if _scoped(args) or _has_filter_flag(args):
+            return None
+        return ("test", "phpunit chạy cả suite")
+    if base == "php" and args and args[0] == "artisan" and len(args) > 1 \
+            and args[1] == "test":
+        if _scoped(args[2:]) or _has_filter_flag(args[2:]):
+            return None
+        return ("test", "php artisan test chạy cả suite")
 
     # --- ml ---
     if base in ("torchrun", "deepspeed", "horovodrun"):
@@ -568,6 +701,19 @@ def _interactive(tokens: list[str]) -> str | None:
         return "static file server — needs a live process"
     if base == "cargo" and args and args[0] == "run":
         return "long-running process — needs a live process"
+    if base == "dotnet" and args and args[0] in ("watch", "run"):
+        return "dotnet app — needs a live process"
+    if base == "swift" and args and args[0] == "run":
+        return "swift app — needs a live process"
+    if base in ("bazel", "bazelisk") and args and args[0] == "run":
+        return "bazel app — needs a live process"
+    if base == "mix" and args and args[0] == "phx.server":
+        return "dev server — needs a live process"
+    if base == "php" and args and args[0] == "artisan" and len(args) > 1 \
+            and args[1] == "serve":
+        return "dev server — needs a live process"
+    if base == "sbt" and not args:
+        return "sbt shell — needs a live process"
     if base == "docker" and args and args[0] == "compose" and "up" in args:
         return "long-running containers — needs a live process"
     if base == "docker" and args and args[0] == "run":

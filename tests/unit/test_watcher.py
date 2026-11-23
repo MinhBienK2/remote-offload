@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -147,7 +148,12 @@ def test_watch_exited_zero_pulls_artifacts(monkeypatch):
             "workdir_exists": True,
         },
     )
-    monkeypatch.setattr(watcher_mod, "pull", lambda *a, **k: pulled.append(a) or None)
+    def fake_pull(*args, **kwargs):
+        """``transfer.pull`` luôn trả về kết quả (không bao giờ ``None``)."""
+        pulled.append(args)
+        return SimpleNamespace(ok=True, files=[], bytes_transferred=0)
+
+    monkeypatch.setattr(watcher_mod, "pull", fake_pull)
 
     watch(j.id)
 

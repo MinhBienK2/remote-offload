@@ -124,9 +124,20 @@ slots = 1
 ## Phát triển
 
 ```bash
-python3 -m pytest tests/unit -q          # unit + hồi quy (không cần mạng)
-python3 -m pytest tests/acceptance -q -m acceptance   # cần fleet thật
+# Hook của chính skill chặn lệnh nặng (kể cả `pytest`) ⇒ đặt ROFF_LOCAL=1 để chạy local.
+ROFF_LOCAL=1 python3 -m pytest tests/unit tests/regression -q   # unit + hồi quy (không cần mạng)
+
+# Nghiệm thu trên fleet thật: dùng runner (tự cô lập `--basetemp`, ghi bằng chứng vào docs/evidence/)
+python3 tests/acceptance/run_acceptance.py --skip s1
+
+# Sinh lại bảng kết quả §4 của docs/REPORT.md từ bằng chứng
+python3 tests/acceptance/make_report_table.py final --section
 ```
+
+Kịch bản nghiệm thu **tự bỏ qua** (`skip`) khi máy Muse chết giữa lúc chạy — đó là sự cố hạ
+tầng, không phải lỗi của `roff`; lý do cụ thể nằm trong `acceptance.txt` (`pytest -rfEs`).
+Bộ test cũng phải chạy **một mình**: một `pytest` khác chạy song song sẽ xoá thư mục tạm
+của lần đang chạy (`--basetemp` riêng theo tag đã xử lý chuyện này).
 
 Test hồi quy khoá lại các lỗi đã gặp thật trên fleet (tilde không expand, bridge một phiên,
 master ssh cũ giữ port, chown trên durable mount, secret lộ trong argv, job mất khi restart,

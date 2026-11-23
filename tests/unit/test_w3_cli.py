@@ -16,7 +16,6 @@ import json
 import os
 import sys
 
-import pytest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(os.path.dirname(_HERE))
@@ -158,7 +157,7 @@ def test_gc_keeps_ticket_of_queued_job(fake_ssh, tmp_path):
         id="job-queued", cmd="true", host="muse-a", project="demo", state="queued"
     )
     job_mod.save_job(job, state_dir=env["ROFF_STATE_DIR"])
-    ticket = ledger.request_slot("muse-a", 1, owner="job-queued")
+    ledger.request_slot("muse-a", 1, owner="job-queued")
 
     rc, out, _err = run_cli(["gc"], env=env)
 

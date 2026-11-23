@@ -1,13 +1,16 @@
-import atexit
 import json
-import os
-import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _common as common  # noqa: E402
+_DEFAULT_STATE = common.DEFAULT_STATE  # dùng chung (xem _common.py)
+
+from _common import pick_live  # noqa: E402
+from _common import wait_or_skip  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 SKILL = REPO / "skill"
@@ -18,16 +21,10 @@ pytestmark = pytest.mark.acceptance
 
 #: State dir **riêng cho test** — test KHÔNG được ghi vào ledger thật của
 #: người dùng (``~/.local/state/roff``). Nếu không, mỗi lần chạy nghiệm thu lại
-#: đẩy hàng chục job record vào ledger thật (và tạo cả bản ghi tunnel ma).
-_DEFAULT_STATE = tempfile.mkdtemp(prefix="roff-acceptance-state-")
-atexit.register(shutil.rmtree, _DEFAULT_STATE, True)
 
 
 def roff(args, timeout=180, env=None):
-    e = dict(os.environ)
-    e.setdefault("ROFF_STATE_DIR", _DEFAULT_STATE)
-    if env:
-        e.update(env)
+    e = common.roff_env(env)
     p = subprocess.run([sys.executable, str(LAUNCHER)] + list(args),
                        capture_output=True, text=True, timeout=timeout, env=e)
     return p
@@ -88,7 +85,7 @@ def test_s03_ffmpeg_transcode_artifacts(fleet, tmp_path):
 
     jid = obj.get("job")
     assert jid, f"thiếu job id: {obj}"
-    rc2, res, err2 = roff_json(["wait", jid, "--timeout", "900"], timeout=960)
+    rc2, res, err2 = wait_or_skip(jid, timeout=960, wait_timeout=900)
     assert rc2 == 0, f"job không thành công: rc={rc2} {json.dumps(res)}"
 
     produced = out / "out.mp4"
@@ -127,9 +124,11 @@ def test_s04_url_input_prefers_internet_host(fleet, tmp_path):
         "--in", "http://example.com/",
         "--out", str(tmp_path / "out"),
     ], timeout=600)
+    if common.is_host_down(rc, obj, err):
+        pytest.skip(f"máy remote chết lúc gửi job — sự cố hạ tầng: {err[-200:]}")
     assert rc == 0, f"roff do thất bại: {json.dumps(obj)} {err[-400:]}"
     jid = obj.get("job")
-    rc2, res, err2 = roff_json(["wait", jid, "--timeout", "600"], timeout=660)
+    rc2, res, err2 = wait_or_skip(jid, timeout=660, wait_timeout=600)
     # example.com có thể chặn; chấp nhận cả fail nếu không có internet ở đâu cả,
     # nhưng phải là fail có thật (exit 1), không phải treo.
     assert rc2 in (0, 1), f"trạng thái lạ: rc={rc2} {json.dumps(res)}"
@@ -190,6 +189,8 @@ def test_s14_secret_not_in_remote_argv(fleet, tmp_path):
         "do", "--cmd", cmd, "--env", f"MY_SECRET={secret}",
         "--out", str(tmp_path / "out"),
     ], timeout=300)
+    if common.is_host_down(rc, obj, err):
+        pytest.skip(f"máy remote chết lúc gửi job — sự cố hạ tầng: {err[-200:]}")
     assert rc == 0, f"roff do thất bại: {json.dumps(obj)} {err[-400:]}"
     jid = obj.get("job")
     host = obj.get("host")
@@ -207,7 +208,7 @@ def test_s14_secret_not_in_remote_argv(fleet, tmp_path):
             break
         time.sleep(3)
 
-    roff_json(["wait", jid, "--timeout", "300"], timeout=360)
+    wait_or_skip(jid, timeout=360, wait_timeout=300)
     assert not leaked, "SECRET LỘ TRONG ARGV REMOTE (thấy qua ps)"
 
 
@@ -215,13 +216,17 @@ def test_s14_secret_not_in_remote_argv(fleet, tmp_path):
 
 def test_s15_stale_master_does_not_kill_foreign_pid(fleet, tmp_path):
     """S15: master ssh cũ giữ port → roff phải tự xử lý, không kill pid lạ."""
+    alias = pick_live(fleet)
+    if alias is None:
+        pytest.skip("mọi máy muse đã chết — sự cố hạ tầng")
+
     r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
-                        fleet[0], "true"], capture_output=True, text=True, timeout=40)
+                        alias, "true"], capture_output=True, text=True, timeout=40)
     if r.returncode != 0:
         pytest.skip("host không sống")
 
     before = subprocess.run(["pgrep", "-c", "ssh"], capture_output=True, text=True)
-    rc, obj, err = roff_json(["tunnel", "start", fleet[0], "--lport", "18099",
+    rc, obj, err = roff_json(["tunnel", "start", alias, "--lport", "18099",
                                "--rport", "22"], timeout=120)
     after = subprocess.run(["pgrep", "-c", "ssh"], capture_output=True, text=True)
     # Không được giết hàng loạt ssh
@@ -230,4 +235,4 @@ def test_s15_stale_master_does_not_kill_foreign_pid(fleet, tmp_path):
             "số tiến trình ssh tăng bất thường — có thể đã spawn quá nhiều")
     except ValueError:
         pass
-    roff_json(["tunnel", "stop", fleet[0], "--lport", "18099"], timeout=60)
+    roff_json(["tunnel", "stop", alias, "--lport", "18099"], timeout=60)

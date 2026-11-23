@@ -32,7 +32,11 @@ Quy tắc:
   * không có file → :meth:`Config.load` trả config mặc định, ``path=None``;
   * file sai cú pháp INI (hoặc giá trị sai kiểu) → ``RoffError(EXIT_CONFIG)``;
   * khoá lặp lại trong cùng section (``include = ...`` nhiều dòng) được **cộng
-    dồn** thành danh sách; giá trị cũng chấp nhận dạng CSV và dạng nhiều dòng.
+    dồn** thành danh sách; giá trị cũng chấp nhận dạng CSV và dạng nhiều dòng;
+  * **B27**: người dùng **chỉ định** một file config (qua ``ROFF_CONFIG``) mà
+    file đó **không tồn tại** ⇒ ``strict=True`` ném ``RoffError(EXIT_CONFIG,
+    "config_missing")``. Bỏ qua im lặng sẽ **nới rộng fleet** thành MỌI host
+    trong ``~/.ssh/config`` (và làm mất luôn ``exclude`` của người dùng).
 """
 
 from __future__ import annotations
@@ -48,6 +52,12 @@ except ImportError:  # pragma: no cover
     from .errors import EXIT_CONFIG, RoffError
 
 DEFAULT_CONFIG_PATH = os.path.join("~", ".config", "roff", "config.ini")
+
+#: Cảnh báo ngắn (tiếng Việt) khi fleet **không** bị giới hạn (B27).
+FLEET_UNRESTRICTED_WARNING = (
+    "config không giới hạn fleet ⇒ mọi host trong ~/.ssh/config đều được chọn, "
+    "gồm cả host bạn không muốn dùng"
+)
 
 _LIST_OPTION_KEYS = frozenset({"include", "exclude", "add", "allow", "labels"})
 
@@ -93,7 +103,7 @@ class Config:
     hosts: dict[str, HostConfig] = field(default_factory=dict)
 
     @staticmethod
-    def load(path: str | None = None) -> "Config":
+    def load(path: str | None = None, *, strict: bool = False) -> "Config":
         """Nạp config từ ``path`` (INI).
 
         ``path=None`` → ``~/.config/roff/config.ini`` nếu tồn tại, nếu không thì
@@ -101,12 +111,44 @@ class Config:
 
         File tồn tại nhưng sai cú pháp INI (hoặc giá trị sai kiểu) →
         ``raise RoffError(EXIT_CONFIG)`` với text lỗi rõ ràng.
+
+        Args:
+            path: đường dẫn file config; ``None`` ⇒ đường dẫn mặc định.
+            strict: ``True`` ⇒ **file bị chỉ định rõ mà không tồn tại** thì
+                ném ``RoffError(EXIT_CONFIG, "config_missing")``.
+
+        Vì sao có ``strict`` (B27):
+
+        * ``path=None`` (không chỉ định) ⇒ thiếu file **không** phải lỗi:
+          đây là hành vi "cài xong chạy được ngay" ⇒ trả config mặc định.
+        * ``path`` **tường minh** + ``strict=True`` + file không tồn tại ⇒
+          **lỗi**. Người dùng đã chọn một config ⇒ bỏ qua im lặng là sai:
+          config rỗng ⇒ ``fleet_include = ["*"]`` ⇒ fleet lấy **MỌI** host
+          trong ``~/.ssh/config``, kể cả host ngoài ý muốn, và ``exclude``
+          của người dùng bị bỏ qua.
+        * ``strict=False`` (mặc định) ⇒ giữ hành vi cũ (config mặc định) —
+          dùng cho các đường nội bộ đọc config *sau khi* job đã ghim host
+          (watcher/transfer): ném lỗi ở đó sẽ làm watcher chết ⇒ job mất
+          im lặng, tệ hơn hẳn việc dùng cấu hình mặc định.
         """
+        explicit = path is not None
         if path is None:
             path = os.path.expanduser(DEFAULT_CONFIG_PATH)
         else:
             path = os.path.expanduser(path)
         if not os.path.isfile(path):
+            if strict and explicit:
+                raise RoffError(
+                    EXIT_CONFIG,
+                    "config_missing",
+                    error=(
+                        f"không có config tại {path} — ROFF_CONFIG trỏ tới file "
+                        "không tồn tại; nếu bỏ qua, fleet sẽ lấy MỌI host trong "
+                        "~/.ssh/config, gồm cả host bạn không muốn dùng"
+                    ),
+                    detail=f"config không tồn tại: {path}",
+                    path=path,
+                )
             return Config(path=None)
 
         try:
@@ -138,6 +180,41 @@ class Config:
         if found is None:
             return HostConfig(name=name)
         return found
+
+    # ------------------------------------------------------------------
+    # fleet có bị giới hạn không (B27)
+    # ------------------------------------------------------------------
+    def effective_include(self) -> list[str]:
+        """Danh sách ``include`` **hiệu lực** (rỗng ⇒ ``["*"]``).
+
+        Giống hệt cách :func:`roffkit.fleet.fleet_aliases` dùng: ``includes =
+        list(cfg.fleet_include) or ["*"]``.
+        """
+        includes = [str(item).strip() for item in (self.fleet_include or [])]
+        includes = [item for item in includes if item]
+        return includes or ["*"]
+
+    def fleet_unrestricted(self) -> bool:
+        """``True`` khi include hiệu lực là ``["*"]`` ⇒ fleet **không giới hạn**.
+
+        Khi đó :func:`roffkit.fleet.fleet_aliases` chọn **mọi** host trong
+        ``~/.ssh/config`` — kể cả host người dùng không muốn dùng. Đây là
+        trạng thái "fleet đang mở" (B27) và phải **thấy được bằng máy**
+        (cờ JSON ``fleet_unrestricted`` + ``fleet_warning``).
+
+        ``include = muse-*`` ⇒ **giới hạn** ⇒ ``False``.
+        """
+        return any(item == "*" for item in self.effective_include())
+
+    def fleet_warning(self) -> str:
+        """Cảnh báo ngắn (tiếng Việt) khi fleet không giới hạn (B27)."""
+        text = FLEET_UNRESTRICTED_WARNING
+        excludes = [
+            str(item).strip() for item in (self.fleet_exclude or []) if str(item).strip()
+        ]
+        if excludes:
+            text += " (trừ exclude: " + ", ".join(excludes) + ")"
+        return text
 
 
 # ------------------------------------------------------------------ helpers

@@ -53,6 +53,7 @@ from typing import Any, Callable, Iterable, NamedTuple, Sequence
 
 from . import config as config_mod
 from . import fleet as fleet_mod
+from . import infer as infer_mod
 from . import inputs as inputs_mod
 from . import job as job_mod
 from . import layout as layout_mod
@@ -73,8 +74,12 @@ from .errors import (
     EXIT_JOB_LOST,
     EXIT_NO_HOST,
     EXIT_OK,
+    EXIT_PULL_FAILED,
     EXIT_TIMEOUT,
     EXIT_UNREACHABLE,
+    REASON_PULL_FAILED,
+    REASON_SYNC_BACK_FAILED,
+    REASON_SYNC_BACK_OUTSIDE_PROJECT,
     RoffError,
     emit,
 )
@@ -216,6 +221,38 @@ def _int_option(value: Any, option: str, minimum: int = 0) -> int:
     return number
 
 
+def _float_option(
+    value: Any, option: str, minimum: float = 0.0, default: float = 0.0
+) -> float:
+    """Đọc 1 option số thực; sai ⇒ ``RoffError(EXIT_INPUT)``.
+
+    Khác :func:`_int_option` ở chỗ **phân biệt "không truyền" với "truyền 0"**:
+    ``None`` ⇒ lấy ``default``; còn ``0`` là giá trị **hợp lệ** (người dùng
+    gõ rõ ràng) và **không** bị coi là falsy ⇒ không được nuốt.
+    """
+    if value is None:
+        return float(default)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise RoffError(
+            EXIT_INPUT, "invalid_option", error=f"{option} không phải số: {value!r}"
+        ) from None
+    if number < minimum:
+        raise RoffError(
+            EXIT_INPUT,
+            "invalid_option",
+            error=f"{option} phải >= {_fmt_num(minimum)} (nhận {_fmt_num(number)})",
+        )
+    return number
+
+
+def _fmt_num(number: float) -> str:
+    """Số cho người đọc: ``-1`` thay vì ``-1.0`` (``0.0`` ⇒ ``0``)."""
+    value = float(number)
+    return str(int(value)) if value.is_integer() else str(value)
+
+
 def _parse_size(text: str, option: str) -> int:
     """Đọc kích thước (``600M``, ``2G``, ``1024``) → **MB**."""
     match = _SIZE_RE.match(str(text))
@@ -332,8 +369,35 @@ def _audit_do(cmd: str, env: dict[str, str], job_id: str, host: str, project: st
 # config / fleet / probe
 # --------------------------------------------------------------------------
 def _load_config() -> config_mod.Config:
-    """Nạp config INI; sai ⇒ ``RoffError(EXIT_CONFIG)`` do :mod:`config` ném."""
-    return config_mod.Config.load(os.environ.get("ROFF_CONFIG") or None)
+    """Nạp config INI; sai ⇒ ``RoffError(EXIT_CONFIG)`` do :mod:`config` ném.
+
+    **B27**: ``ROFF_CONFIG`` trỏ tới file **không tồn tại** ⇒ exit **3**,
+    ``reason="config_missing"``. Đây là điểm vào nguy hiểm nhất (chỗ gửi
+    job/dữ liệu lên máy khác): bỏ qua im lặng sẽ khiến config rỗng ⇒
+    ``fleet_include = ["*"]`` ⇒ fleet lấy **MỌI** host trong ``~/.ssh/config``
+    (mất luôn ``exclude`` của người dùng).
+
+    Không có ``ROFF_CONFIG`` ⇒ ``~/.config/roff/config.ini``; thiếu file ⇒
+    config mặc định (chạy được ngay khi mới cài) — **không** phải lỗi.
+    """
+    return config_mod.Config.load(
+        os.environ.get("ROFF_CONFIG") or None, strict=True
+    )
+
+
+def _fleet_flags(cfg: config_mod.Config) -> dict:
+    """Cờ JSON báo fleet có bị giới hạn hay không (B27).
+
+    Fleet **có** giới hạn ⇒ trả ``{}`` (payload không đổi).
+    Fleet **không** giới hạn (``include`` hiệu lực là ``["*"]``) ⇒ thêm
+    ``fleet_unrestricted: true`` + ``fleet_warning`` (text tiếng Việt).
+    """
+    if not cfg.fleet_unrestricted():
+        return {}
+    return {
+        "fleet_unrestricted": True,
+        "fleet_warning": cfg.fleet_warning(),
+    }
 
 
 def _fleet_aliases(cfg: config_mod.Config) -> list[str]:
@@ -351,12 +415,11 @@ def _ssh_config_aliases() -> list[str] | None:
     ⇒ không được kết luận ``unknown_host`` (phải probe thật và báo
     ``host_unreachable`` + lỗi ssh gốc).
     """
-    ssh_config = os.environ.get("ROFF_SSH_CONFIG")
     try:
-        if ssh_config:
-            hosts = fleet_mod.parse_ssh_config(ssh_config)
-        else:
-            hosts = fleet_mod.parse_ssh_config()
+        # Một nguồn sự thật duy nhất (B25): ``ssh_config_file()`` là **đúng**
+        # file mà roff fingerprint (và truyền ``-F`` cho ssh) — không đọc
+        # ``$ROFF_SSH_CONFIG`` bằng tay, không lệch với phía ssh.
+        hosts = fleet_mod.parse_ssh_config(fleet_mod.ssh_config_file())
     except Exception:  # config ssh hỏng ⇒ không biết alias nào có thật
         return None
     return [host.alias for host in hosts]
@@ -442,6 +505,28 @@ def _running_map() -> dict[str, int]:
 # --------------------------------------------------------------------------
 # chọn host
 # --------------------------------------------------------------------------
+def _infer_needs(cmd: str) -> list[str]:
+    """Tool **suy ra** từ câu lệnh — tiêu chí **MỀM** (xem S37/S38).
+
+    Chỉ đọc **văn bản** của ``--cmd`` (:func:`roffkit.infer.infer_tools`) ⇒
+    **không** gọi ssh, **không** đọc file ⇒ gọi được ở đường chạy nóng.
+
+    Kết quả dùng để **ưu tiên** host có sẵn tool đó. Suy ra có thể **sai**
+    (``sh build.sh`` không ai biết nó cần gì) ⇒ tool suy ra:
+
+    * **không** được loại host (host thiếu tool vẫn là ứng viên hợp lệ);
+    * **không** được kích hoạt bước *cài* tool — chỉ ``--need`` mới được cài;
+    * ``--need`` vẫn là tiêu chí **cứng** (thiếu tool ⇒ loại host, exit 10).
+
+    Lỗi suy ra (lệnh hỏng, bảng alias hỏng …) ⇒ coi như **không** suy ra gì:
+    suy ra là phỏng đoán, không được làm hỏng việc chạy job.
+    """
+    try:
+        return [str(tool) for tool in (infer_mod.infer_tools(str(cmd or "")) or [])]
+    except Exception:  # pragma: no cover - suy ra hỏng ⇒ coi như không suy ra
+        return []
+
+
 class _HostChoice(NamedTuple):
     """Kết quả chọn host cho 1 job."""
 
@@ -475,6 +560,7 @@ def _select_host(
     ignore_slots: bool = False,
     ignore_busy: bool = False,
     running: dict[str, int] | None = None,
+    inferred_needs: Sequence[str] | None = None,
 ) -> _HostChoice:
     """Chọn host cho job (ép host nếu ``--host``), hoặc ném lỗi exit 10.
 
@@ -486,6 +572,9 @@ def _select_host(
       được"). Lý do loại vẫn được giữ để in ra.
     * ``ignore_busy=True`` ⇒ host **bridge đang bận** vẫn là ứng viên hợp lệ
       (bridge bận = "đang bận" ⇒ job sẽ xếp hàng).
+    * ``inferred_needs`` = tool **suy ra** từ câu lệnh — tiêu chí **MỀM**:
+      host có tool đó được **ưu tiên**, host không có **vẫn** là ứng viên hợp
+      lệ (chỉ bị đẩy xuống cuối). Rỗng ⇒ hành vi **không đổi**.
     """
     if forced:
         profile = next(
@@ -524,6 +613,8 @@ def _select_host(
             ignore_slots=ignore_slots,
             ignore_busy=ignore_busy,
             running=running,
+            # Tool suy ra: tiêu chí **MỀM** (ưu tiên, không loại host).
+            inferred_needs=list(inferred_needs or []),
         )
 
     choice = _select(busy)
@@ -712,7 +803,11 @@ def _job_specs(args: argparse.Namespace) -> list[dict]:
                 error=f"--each không khớp file nào: {each}",
                 each=str(each),
             )
-    shards = _int_option(getattr(args, "shards", 1) or 1, "--shards", minimum=1)
+    # ``--shards`` mặc định là 1. **0 là giá trị người dùng gõ** ⇒ không được
+    # nuốt bằng ``or`` (nuốt ⇒ thông điệp lỗi nói "1" thay vì "0" ⇒ người
+    # đọc không biết mình đã gõ sai gì).
+    raw_shards = getattr(args, "shards", None)
+    shards = 1 if raw_shards is None else _int_option(raw_shards, "--shards", minimum=1)
     if items:
         for item in items:
             specs.append(
@@ -754,6 +849,77 @@ def _remote_item_path(
     )
 
 
+# --------------------------------------------------------------------------
+# `--sync-back` — ánh xạ path local ⇄ remote (B26)
+# --------------------------------------------------------------------------
+def _rel_inside(base: str, target: str) -> str | None:
+    """Đường dẫn ``target`` **tương đối** so với ``base``; ``None`` nếu ngoài.
+
+    * ``target == base`` ⇒ ``""`` (trùng chính nó);
+    * ``target`` nằm trong ``base`` ⇒ đường dẫn tương đối, dấu phân tách
+      ``/`` (dùng được cho đường dẫn remote);
+    * ``target`` nằm ngoài ``base`` ⇒ ``None``.
+    """
+    root = os.path.abspath(str(base or ""))
+    path = os.path.abspath(str(target or ""))
+    if not root or not path:
+        return None
+    if path == root:
+        if os.path.isdir(root):
+            return ""
+        # Input là **file** ⇒ trong kho dùng chung nó nằm ở ``{key}/{tên}``.
+        return os.path.basename(root)
+    if path.startswith(root.rstrip(os.sep) + os.sep):
+        return os.path.relpath(path, root).replace(os.sep, "/")
+    return None
+
+
+def _sync_back_targets(
+    project_root: str,
+    sync_back: Sequence[str],
+    path_sources: Sequence[dict],
+) -> list[str]:
+    """Đích **local** của mỗi path ``--sync-back`` (B26) + kiểm tra hợp lệ.
+
+    * ``p`` **tương đối** ⇒ đích local = ``abspath(join(project_root, p))``;
+    * ``p`` **tuyệt đối** ⇒ giữ nguyên ``p``.
+
+    Path nằm ngoài ``project_root`` **và** ngoài mọi input source ⇒ **từ
+    chối ngay** (exit 2, ``sync_back_outside_project``): không có nơi nào trên
+    host để tìm file đó ⇒ im lặng làm cái gì đó vô nghĩa (B26).
+
+    Raises:
+        RoffError: ``EXIT_INPUT`` + ``sync_back_outside_project``.
+    """
+    out: list[str] = []
+    for raw in sync_back:
+        text = os.path.expanduser(str(raw))
+        if os.path.isabs(text):
+            local = os.path.abspath(text)
+        else:
+            local = os.path.abspath(os.path.join(project_root, text))
+        inside = _rel_inside(project_root, local) is not None
+        if not inside:
+            for source in path_sources:
+                base = str(source.get("local") or "")
+                if base and _rel_inside(base, local) is not None:
+                    inside = True
+                    break
+        if not inside:
+            raise RoffError(
+                EXIT_INPUT,
+                REASON_SYNC_BACK_OUTSIDE_PROJECT,
+                error=(
+                    f"path --sync-back nằm ngoài project: {raw!r} "
+                    f"(project root: {project_root})"
+                ),
+                path=str(raw),
+                project_root=project_root,
+            )
+        out.append(local)
+    return out
+
+
 def _cmd_do(args: argparse.Namespace) -> tuple[dict, int]:
     """``roff do`` — lệnh chính (thứ tự theo ``docs/SPEC-CLI.md`` §16).
 
@@ -770,6 +936,10 @@ def _cmd_do(args: argparse.Namespace) -> tuple[dict, int]:
     cmd = str(getattr(args, "cmd", "") or "").strip()
     if not cmd:
         raise RoffError(EXIT_INPUT, "missing_cmd", error="--cmd không được rỗng")
+    # Tool **suy ra** từ câu lệnh — tính **1 lần** (không lặp lại cho mỗi job
+    # của ``--each``/``--shards``), **không** gọi ssh ⇒ đường chạy nóng OK.
+    # Chỉ dùng để **ưu tiên** host; KHÔNG dùng để loại host hay để cài tool.
+    inferred_needs = _infer_needs(cmd)
     timeout = _int_option(getattr(args, "timeout", DEFAULT_TIMEOUT), "--timeout")
     if timeout <= 0:
         raise RoffError(
@@ -790,6 +960,7 @@ def _cmd_do(args: argparse.Namespace) -> tuple[dict, int]:
     mem_mb = _parse_size(args.mem, "--mem") if getattr(args, "mem", None) else 0
     disk_mb = _parse_size(args.disk, "--disk") if getattr(args, "disk", None) else 0
     inputs = [_parse_input(spec) for spec in (getattr(args, "inputs", None) or [])]
+    sync_back = list(getattr(args, "sync_back", None) or [])
     for item in inputs:
         if item.kind == "path":
             local = os.path.abspath(os.path.expanduser(item.value))
@@ -805,6 +976,31 @@ def _cmd_do(args: argparse.Namespace) -> tuple[dict, int]:
                 raise RoffError(
                     EXIT_INPUT, "invalid_input", error="--in job: cần job id"
                 )
+
+    # Kế hoạch input (CHƯA chạm vào host): mọi input đều được ghi vào ledger
+    # ⇒ watcher dựng lại được khi failover sang host khác (input git:/http:/job:
+    # không phải path nên không "đẩy lại" được, phải dựng lại từ đầu).
+    input_specs = [{"kind": item.kind, "value": item.value} for item in inputs]
+    path_sources: list[dict[str, Any]] = []
+    for item in inputs:
+        if item.kind != "path":
+            continue
+        local = os.path.abspath(os.path.expanduser(item.value))
+        path_sources.append(
+            {
+                "local": local,
+                "key": shared_mod.shared_key(local),
+                "rel": shared_mod.shared_rel(local),
+            }
+        )
+
+    # --- `--sync-back`: gốc project = thư mục làm việc lúc gọi `roff do` ---
+    # Đích local tính được ngay (không phụ thuộc host) ⇒ path nằm ngoài
+    # project **và** ngoài mọi input bị **từ chối ngay** (exit 2), trước khi
+    # đụng vào fleet — đừng tạo job rồi mới biết là vô nghĩa (B26).
+    project_root = os.path.abspath(os.getcwd())
+    sync_back_local = _sync_back_targets(project_root, sync_back, path_sources)
+
     after = str(getattr(args, "after", "") or "").strip()
     after_id = ""
     if after:
@@ -846,7 +1042,6 @@ def _cmd_do(args: argparse.Namespace) -> tuple[dict, int]:
     needs = list(getattr(args, "need", None) or [])
     wants_internet = any(item.kind == "http" for item in inputs)
     prefer_same_host = bool(getattr(args, "prefer_same_host", True))
-    sync_back = list(getattr(args, "sync_back", None) or [])
 
     # input từ job khác → ưu tiên host đang giữ dữ liệu
     prefer_hosts: list[str] = []
@@ -856,23 +1051,6 @@ def _cmd_do(args: argparse.Namespace) -> tuple[dict, int]:
             source_job = job_mod.load_job(item.value)
             if prefer_same_host and source_job.host:
                 prefer_hosts.append(source_job.host)
-
-    # Kế hoạch input (CHƯA chạm vào host): mọi input đều được ghi vào ledger
-    # ⇒ watcher dựng lại được khi failover sang host khác (input git:/http:/job:
-    # không phải path nên không "đẩy lại" được, phải dựng lại từ đầu).
-    input_specs = [{"kind": item.kind, "value": item.value} for item in inputs]
-    path_sources: list[dict[str, Any]] = []
-    for item in inputs:
-        if item.kind != "path":
-            continue
-        local = os.path.abspath(os.path.expanduser(item.value))
-        path_sources.append(
-            {
-                "local": local,
-                "key": shared_mod.shared_key(local),
-                "rel": shared_mod.shared_rel(local),
-            }
-        )
 
     ledger = slots_mod.SlotLedger()
     used_hosts: set[str] = set()
@@ -901,6 +1079,10 @@ def _cmd_do(args: argparse.Namespace) -> tuple[dict, int]:
         ⇒ dùng lại host đã dùng (ít tải nhất) và **bỏ qua** 2 luật "đang bận"
         ("đã đầy slot" + "bridge đang bận"): 2 luật đó ⇒ job **xếp hàng**,
         không phải "không dùng được" (W3b).
+
+        Tool **suy ra** từ lệnh (``inferred_needs``) đi xuyên suốt tới
+        :func:`policy.select` — tiêu chí **MỜM** (ưu tiên host có sẵn tool,
+        không loại host thiếu tool).
         """
         remaining = [
             p
@@ -919,6 +1101,7 @@ def _cmd_do(args: argparse.Namespace) -> tuple[dict, int]:
                     forced_host,
                     wants_internet,
                     running=running,
+                    inferred_needs=inferred_needs,
                 )
             except RoffError as exc:
                 if exc.code != EXIT_NO_HOST:
@@ -942,6 +1125,7 @@ def _cmd_do(args: argparse.Namespace) -> tuple[dict, int]:
             ignore_slots=True,
             ignore_busy=True,
             running=running,
+            inferred_needs=inferred_needs,
         )
 
     def _drop_ticket(ticket: str, lease: Any) -> None:
@@ -957,29 +1141,33 @@ def _cmd_do(args: argparse.Namespace) -> tuple[dict, int]:
             pass
 
     def _sync_back_remotes(workdir: str, layout_root: str) -> list[str]:
-        """Đường dẫn **remote** của các path ``--sync-back``.
+        """Đường dẫn **remote** của các path ``--sync-back`` (B26).
 
-        Path nằm trong 1 input (nguồn local) ⇒ nằm trong **kho dùng chung**
-        của host (``<layout_root>/inputs/<key>/…``) — input không còn được
-        copy vào workdir (W3f). Còn lại ⇒ path trong workdir.
+        Ánh xạ theo **đích local** (đã tính ở :func:`_sync_back_targets`):
+
+        * đích local nằm trong 1 input (nguồn local) ⇒ nằm trong **kho dùng
+          chung** của host (``<layout_root>/inputs/<key>/…``) — input không
+          còn được copy vào workdir (W3f);
+        * đích local nằm trong ``project_root`` ⇒ ``<workdir>/<relpath>`` —
+          cwd của job **chính là** workdir (``$ROFF_WORK``) ⇒ file job tạo ra
+          nằm đúng chỗ (vd ``--sync-back report.md`` ⇒ ``<workdir>/report.md``).
         """
         out: list[str] = []
-        for raw in sync_back:
-            text = str(raw).lstrip("/")
+        for local in sync_back_local:
             remote = ""
             for source in path_sources:
                 base = os.path.abspath(str(source.get("local") or ""))
-                if not base or not os.path.isdir(base):
+                if not base:
                     continue
-                candidate = os.path.abspath(os.path.join(base, text))
-                if not candidate.startswith(base + os.sep):
+                rel = _rel_inside(base, local)
+                if rel is None:
                     continue
-                rel = os.path.relpath(candidate, base).replace(os.sep, "/")
                 key = str(source.get("key") or "")
                 remote = shared_mod.shared_remote_path(layout_root, key, rel)
                 break
             if not remote:
-                remote = f"{workdir.rstrip('/')}/{text}"
+                rel = _rel_inside(project_root, local) or ""
+                remote = f"{workdir.rstrip('/')}/{rel}" if rel else workdir
             out.append(remote)
         return out
 
@@ -1004,6 +1192,9 @@ def _cmd_do(args: argparse.Namespace) -> tuple[dict, int]:
             busy = _busy_map()
             running = _running_map()
             need = policy_mod.Need(
+                # CHỈ tool ghi rõ bằng ``--need`` ⇒ tiêu chí **CỨNG** (thiếu
+                # tool ⇒ loại host). Tool **suy ra** cố ý KHÔNG nằm ở đây:
+                # suy ra là phỏng đoán, không được loại host (S38).
                 tools=list(needs),
                 mem_mb=mem_mb,
                 disk_mb=disk_mb,
@@ -1065,6 +1256,10 @@ def _cmd_do(args: argparse.Namespace) -> tuple[dict, int]:
             # ``roff do`` **không bao giờ** block chờ slot: hết slot là "đang
             # bận" (job xếp hàng), không phải lỗi. 1 ticket duy nhất giữ
             # đúng vị trí FIFO cho tới khi watcher được cấp slot.
+            # ``slots = 0`` trong config ⇒ bị coi là "không đặt" ⇒ dùng 1
+            # (giữ **nguyên** hành vi cũ: người dùng có thể đang dùng 0 để
+            # "tắt" host — đổi hành vi này là quyết định sản phẩm, không phải
+            # việc sửa lỗi ở đây).
             slots = int(getattr(cfg.host(host), "slots", 1) or 1)
             ticket = ledger.request_slot(host, slots, priority, owner=job_id)
             lease = ledger.try_acquire(ticket, owner=job_id)
@@ -1094,7 +1289,11 @@ def _cmd_do(args: argparse.Namespace) -> tuple[dict, int]:
                 "host_reasons": reasons,
                 "prefer_hosts": list(prefer_hosts),
                 "sync_back": list(sync_back),
+                "sync_back_local": list(sync_back_local),
                 "sync_back_remote": _sync_back_remotes(workdir, layout_root),
+                # Gốc project local (thư mục làm việc lúc gọi `roff do`) ⇒
+                # watcher biết đường dẫn local đích của `--sync-back` (B26).
+                "project_root": project_root,
                 "checkpoint": checkpoint_remote,
                 "items": spec.get("items"),
                 "slot_ticket": ticket,
@@ -1122,6 +1321,9 @@ def _cmd_do(args: argparse.Namespace) -> tuple[dict, int]:
             retry_host = False
             try:
                 # --- ensure toolchain nếu thiếu -----------------------------
+                # CHỈ cài tool ghi rõ bằng ``--need`` (``needs``). Tool **suy
+                # ra** từ lệnh KHÔNG được cài: suy ra có thể sai ⇒ cài theo
+                # suy ra là rủi ro (S38).
                 ensured = _ensure_tools(host, choice.profile, needs)
 
                 # --- chuẩn bị input -------------------------------------------
@@ -1246,6 +1448,8 @@ def _cmd_do(args: argparse.Namespace) -> tuple[dict, int]:
                     "ensured": ensured,
                     "state": "queued" if queued else "launched",
                     "host_reasons": list(reasons),
+                    # Tool **suy ra** từ lệnh (minh bạch — S37). Rỗng ⇒ `[]`.
+                    "inferred_needs": list(inferred_needs),
                 }
             except Exception as exc:
                 # Trả slot ĐÚNG lease đã chiếm + bỏ ticket khỏi hàng đợi.
@@ -1282,7 +1486,12 @@ def _cmd_do(args: argparse.Namespace) -> tuple[dict, int]:
         host_reasons=first_reasons or host_reasons,
         ledger=job_mod.job_path(first_job) if first_job else None,
         next=[f"roff wait {first_job} --timeout {timeout}"] if first_job else [],
+        # Tool **suy ra** từ lệnh (minh bạch — S37): `[]` khi không suy ra
+        # được (vd `echo hi`).
+        inferred_needs=list(inferred_needs),
     )
+    # B27: báo "fleet đang mở" ngay trong JSON của `roff do` (máy đọc được).
+    payload.update(_fleet_flags(cfg))
     if len(job_ids) > 1:
         payload["jobs"] = job_ids
         payload["count"] = len(job_ids)
@@ -1350,6 +1559,87 @@ def _wait_dependency(job_id: str, timeout: int) -> None:
 # --------------------------------------------------------------------------
 # lệnh: status / result / wait / jobs
 # --------------------------------------------------------------------------
+def _pull_info(options: dict) -> dict:
+    """Trạng thái pull của job từ khối options của ledger (B23).
+
+    Trả ``{"pulled": bool, "pull_error": str, "pull_failed": bool}``.
+
+    ``pull_failed`` = **ĐÃ** thử pull và **hỏng** ⇒ artifact chưa về local.
+
+    Phân biệt 3 trạng thái (quan trọng — job cũ không có khoá ``pulled``):
+
+    * không có khoá ``pulled`` (job cũ / watcher chưa chạy) ⇒ **không** biết
+      ⇒ coi như không hỏng (giữ hành vi cũ: ``roff wait`` trả 0);
+    * ``pulled`` = ``true`` ⇒ kéo xong;
+    * ``pulled`` = ``false`` (hoặc ``pull_error`` khác rỗng) ⇒ pull **hỏng**
+      ⇒ ``roff wait`` phải báo lỗi (exit 74), **không** phải báo thành công.
+    """
+    raw = options.get("pulled")
+    pull_error = str(options.get("pull_error") or "")
+    return {
+        "pulled": bool(raw),
+        "pull_error": pull_error,
+        "pull_failed": raw is False or bool(pull_error),
+    }
+
+
+def _sync_back_info(options: dict) -> dict:
+    """Trạng thái ``--sync-back`` của job từ ledger (B26).
+
+    Trả ``{"sync_back_error": str, "sync_back_failed": bool}``.
+
+    ``sync_back_error`` khác rỗng ⇒ có path ``--sync-back`` **không về** local
+    ⇒ ``roff wait``/``roff result`` phải báo lỗi (exit 74, cùng họ với
+    ``pull_failed``) — **không** được báo thành công rồi để agent đọc file
+    rỗng (bài học của B23).
+    """
+    error = str(options.get("sync_back_error") or "")
+    return {"sync_back_error": error, "sync_back_failed": bool(error)}
+
+
+def _pull_sync_back_paths(
+    job: job_mod.Job, options: dict, fallback_dir: str
+) -> tuple[list[dict], str]:
+    """Kéo lại các path ``--sync-back`` (B26).
+
+    Mỗi cặp ``(sync_back_remote[i], sync_back_local[i])`` được kéo về **đúng**
+    đường dẫn local của nó. Job cũ (chưa có ``sync_back_local``) ⇒ kéo vào
+    thư mục ``fallback_dir`` (thư mục ``--local``) như trước.
+
+    Trả ``(manifest, error)`` — ``error`` khác rỗng ⇒ có path **không** kéo
+    về được (KHÔNG nuốt lỗi).
+    """
+    remotes = list(options.get("sync_back_remote") or [])
+    locals_ = list(options.get("sync_back_local") or [])
+    files: list[dict] = []
+    errors: list[str] = []
+    for index, remote in enumerate(remotes):
+        text = str(remote or "")
+        if not text:
+            continue
+        local = str(locals_[index]) if index < len(locals_) else ""
+        if not local:
+            local = fallback_dir
+        try:
+            parent = os.path.dirname(local)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            extra = transfer_mod.pull_path(job.host, text, local)
+        except Exception as exc:
+            errors.append(f"{local}: {exc}")
+            continue
+        if extra is None:
+            errors.append(f"{local}: pull_path không trả về kết quả")
+            continue
+        if getattr(extra, "ok", False):
+            files.extend(list(getattr(extra, "files", []) or []))
+        else:
+            errors.append(
+                f"{local}: {getattr(extra, 'error', '') or 'pull thất bại'}"
+            )
+    return files, "; ".join(errors)
+
+
 def _job_summary(job: job_mod.Job) -> dict:
     """Tóm tắt 1 job cho JSON."""
     return {
@@ -1366,6 +1656,8 @@ def _cmd_status(args: argparse.Namespace) -> tuple[dict, int]:
     """``roff status <job_id>`` — đọc ledger 1 lần (exit 2 nếu không có job)."""
     job = job_mod.load_job(args.job_id)
     options = job_mod.job_options(job.id)
+    info = _pull_info(options)
+    sync_info = _sync_back_info(options)
     payload = _ok(
         job=job.id,
         state=job.state,
@@ -1376,6 +1668,9 @@ def _cmd_status(args: argparse.Namespace) -> tuple[dict, int]:
         heartbeat=job.heartbeat or None,
         reason=job.reason,
         needs_retry=job.needs_retry,
+        pulled=info["pulled"],
+        pull_error=info["pull_error"] or None,
+        sync_back_error=sync_info["sync_back_error"] or None,
         ledger=job_mod.job_path(job.id),
     )
     if options.get("host_reasons"):
@@ -1389,6 +1684,8 @@ def _cmd_result(args: argparse.Namespace) -> tuple[dict, int]:
     options = job_mod.job_options(job.id)
     artifacts = list(options.get("manifest") or [])
     events = list(options.get("events") or [])
+    info = _pull_info(options)
+    sync_info = _sync_back_info(options)
     finished = None
     for event in events:
         if event.get("event") == "finished":
@@ -1420,6 +1717,9 @@ def _cmd_result(args: argparse.Namespace) -> tuple[dict, int]:
         out_remote=job.out_remote,
         reason=job.reason,
         needs_retry=job.needs_retry,
+        pulled=info["pulled"],
+        pull_error=info["pull_error"] or None,
+        sync_back_error=sync_info["sync_back_error"] or None,
         host_reasons=list(options.get("host_reasons") or []),
         events=events[-20:],
         ledger=job_mod.job_path(job.id),
@@ -1431,6 +1731,29 @@ def _cmd_result(args: argparse.Namespace) -> tuple[dict, int]:
         code = EXIT_JOB_LOST
     elif job.state == "cancelled":
         code = EXIT_CANCELLED
+    elif job.state == "exited" and info["pull_failed"]:
+        # Job **remote** chạy xong (exit 0) nhưng artifact chưa về local ⇒
+        # `roff result` cũng phải nói ra, không được báo "thành công" (B23).
+        code = EXIT_PULL_FAILED
+        payload["ok"] = False
+        payload["exit_code"] = EXIT_PULL_FAILED
+        payload["reason"] = REASON_PULL_FAILED
+        payload["error"] = (
+            "job chạy xong nhưng artifact chưa về local — kéo lại bằng "
+            "`roff pull <job>` (KHÔNG cần chạy lại job)"
+        )
+    elif job.state == "exited" and sync_info["sync_back_failed"]:
+        # Job **remote** chạy xong (exit 0) nhưng path `--sync-back` chưa về
+        # local ⇒ cũng phải nói ra (B26). `pulled` giữ nguyên: artifact chính
+        # đã về thì đã về.
+        code = EXIT_PULL_FAILED
+        payload["ok"] = False
+        payload["exit_code"] = EXIT_PULL_FAILED
+        payload["reason"] = REASON_SYNC_BACK_FAILED
+        payload["error"] = (
+            "job chạy xong nhưng path --sync-back chưa về local — kéo lại bằng "
+            "`roff pull <job>` (KHÔNG cần chạy lại job)"
+        )
     return payload, code
 
 
@@ -1470,8 +1793,60 @@ def _cmd_wait(args: argparse.Namespace) -> tuple[dict, int]:
         if code == 0:
             opts = job_mod.job_options(job.id)
             manifest = list(opts.get("manifest") or [])
-            pulled = bool(opts.get("pulled"))
-            pull_error = str(opts.get("pull_error") or "")
+            info = _pull_info(opts)
+            sync_info = _sync_back_info(opts)
+            if info["pull_failed"]:
+                # Job **remote** chạy xong tốt (exit 0) nhưng artifact **chưa
+                # về** local ⇒ KHÔNG được báo thành công, nếu không agent đọc
+                # thư mục --out rỗng mà không có cảnh báo nào (B23).
+                # Exit 74 (EXIT_PULL_FAILED) ⇒ agent kéo lại bằng `roff pull`,
+                # **không** chạy lại job.
+                detail = info["pull_error"] or "artifact chưa kéo về local"
+                return (
+                    _not_ok(
+                        EXIT_PULL_FAILED,
+                        job=job.id,
+                        state=state,
+                        exit=0,
+                        host=job.host,
+                        reason=REASON_PULL_FAILED,
+                        error=(
+                            "job chạy xong nhưng artifact chưa về local — kéo lại "
+                            "bằng `roff pull <job>` (KHÔNG cần chạy lại job)"
+                        ),
+                        detail=detail,
+                        pulled=False,
+                        pull_error=detail,
+                        artifacts=manifest,
+                    ),
+                    EXIT_PULL_FAILED,
+                )
+            if sync_info["sync_back_failed"]:
+                # Job **remote** chạy xong tốt (exit 0) nhưng path
+                # `--sync-back` **chưa về** local ⇒ KHÔNG được báo thành công
+                # (B26) — cùng họ exit 74 với `pull_failed`: kéo lại bằng
+                # `roff pull`, **không** chạy lại job. `pulled` giữ nguyên
+                # (artifact chính đã về thì đã về).
+                detail = sync_info["sync_back_error"]
+                return (
+                    _not_ok(
+                        EXIT_PULL_FAILED,
+                        job=job.id,
+                        state=state,
+                        exit=0,
+                        host=job.host,
+                        reason=REASON_SYNC_BACK_FAILED,
+                        error=(
+                            "job chạy xong nhưng path --sync-back chưa về local — "
+                            "kéo lại bằng `roff pull <job>` (KHÔNG cần chạy lại job)"
+                        ),
+                        detail=detail,
+                        pulled=info["pulled"],
+                        sync_back_error=detail,
+                        artifacts=manifest,
+                    ),
+                    EXIT_PULL_FAILED,
+                )
             return (
                 _ok(
                     EXIT_OK,
@@ -1480,8 +1855,8 @@ def _cmd_wait(args: argparse.Namespace) -> tuple[dict, int]:
                     exit=0,
                     host=job.host,
                     artifacts=manifest,
-                    pulled=pulled,
-                    pull_error=pull_error or None,
+                    pulled=info["pulled"],
+                    pull_error=info["pull_error"] or None,
                 ),
                 EXIT_OK,
             )
@@ -1519,6 +1894,23 @@ def _cmd_wait(args: argparse.Namespace) -> tuple[dict, int]:
                 reason="cancelled",
             ),
             EXIT_CANCELLED,
+        )
+    if state == job_mod.UNKNOWN_STATE:
+        # B13: job định dạng cũ (ledger không có khoá ``state``) ⇒ KHÔNG biết
+        # kết quả. Trả **ngay** (không treo tới hết timeout) với lý do rõ.
+        return (
+            _not_ok(
+                EXIT_JOB_FAILED,
+                job=job.id,
+                state=state,
+                host=job.host,
+                reason="unknown_state",
+                error=(
+                    "job ở định dạng cũ (ledger không có khoá 'state') — không biết "
+                    "kết quả; dọn bằng 'roff gc'"
+                ),
+            ),
+            EXIT_JOB_FAILED,
         )
     return (
         _ok(EXIT_OK, job=job.id, state=state, host=job.host),
@@ -1657,6 +2049,7 @@ def _cmd_hosts(args: argparse.Namespace) -> tuple[dict, int]:
     payload = _ok(
         hosts=[profile.to_dict() for profile in profiles], count=len(profiles)
     )
+    payload.update(_fleet_flags(cfg))
     flapping = probe_mod.detect_flapping(profiles)
     if flapping:
         payload["flapping"] = flapping
@@ -1673,6 +2066,7 @@ def _cmd_probe(args: argparse.Namespace) -> tuple[dict, int]:
             error=f"không với được host {args.host}",
             detail=profile.detail or profile.error,
             host=args.host,
+            reachable=False,
         )
     payload = _ok(**profile.to_dict())
     return payload, EXIT_OK
@@ -1696,6 +2090,7 @@ def _cmd_push(args: argparse.Namespace) -> tuple[dict, int]:
             error=f"không với được host {args.host}",
             detail=profile.detail or profile.error,
             host=args.host,
+            reachable=False,
         )
     layout_root = _layout_root_of(profile)
     remote = f"{layout_root}/projects/{name}"
@@ -1740,20 +2135,61 @@ def _cmd_pull(args: argparse.Namespace) -> tuple[dict, int]:
     result = transfer_mod.pull(job.host, remote, local)
     files = list(result.files)
     options = job_mod.job_options(job.id)
-    sync_paths = list(options.get("sync_back_remote") or options.get("sync_back") or [])
-    for path in sync_paths:
-        extra = transfer_mod.pull_path(job.host, str(path), local)
-        files.extend(extra.files)
+    # Path `--sync-back`: kéo về **đúng** đường dẫn local của từng path
+    # (B26) — không phải vào thư mục `--local`.
+    sync_files, sync_error = _pull_sync_back_paths(job, options, local)
+    files.extend(sync_files)
+    if sync_error:
+        # KHÔNG nuốt lỗi (bài học B23) ⇒ `roff wait` vẫn báo lỗi (74).
+        job_mod.set_job_options(job.id, sync_back_error=sync_error)
+        watcher_mod.record_event(
+            job.id, "sync_back_failed", detail=sync_error, host=job.host
+        )
+    else:
+        # Kéo lại thành công ⇒ xoá lỗi cũ ⇒ `roff wait` trở lại exit 0.
+        job_mod.set_job_options(job.id, sync_back_error="")
     if not result.ok:
+        detail = str(result.error or "pull thất bại")
+        # Ghi lại thất bại vào ledger ⇒ `roff wait`/`roff result` vẫn báo lỗi
+        # (74) thay vì báo thành công, và agent biết phải kéo lại (B23).
+        job_mod.set_job_options(job.id, pulled=False, pull_error=detail)
+        watcher_mod.record_event(
+            job.id, "pull_failed", detail=detail, host=job.host
+        )
         raise RoffError(
             EXIT_UNREACHABLE,
-            "pull_failed",
+            REASON_PULL_FAILED,
             error=f"pull thất bại từ {job.host}",
-            detail=result.error,
+            detail=detail,
             job=job.id,
             host=job.host,
         )
-    job_mod.set_job_options(job.id, manifest=files)
+    # Kéo lại thành công ⇒ `pulled=true` + manifest mới ⇒ `roff wait` trả 0
+    # trở lại (job không còn lỗi pull nữa) — B23.
+    job_mod.set_job_options(job.id, manifest=files, pulled=True, pull_error="")
+    if sync_error:
+        # Artifact đã về nhưng path `--sync-back` chưa về ⇒ báo lỗi rõ ràng
+        # (exit 74, `sync_back_failed`) thay vì báo thành công (B26).
+        raise RoffError(
+            EXIT_PULL_FAILED,
+            REASON_SYNC_BACK_FAILED,
+            error=(
+                "artifact đã về local nhưng path --sync-back chưa về — kéo lại "
+                "bằng `roff pull <job>` (KHÔNG cần chạy lại job)"
+            ),
+            detail=sync_error,
+            job=job.id,
+            host=job.host,
+            pulled=True,
+            sync_back_error=sync_error,
+            files=files,
+        )
+    if job.reason in (REASON_PULL_FAILED, REASON_SYNC_BACK_FAILED):
+        job.reason = None
+        job_mod.save_job(job)
+    watcher_mod.record_event(
+        job.id, "pulled", files=len(files), bytes=int(result.bytes_transferred or 0)
+    )
     return (
         _ok(
             job=job.id,
@@ -1761,6 +2197,7 @@ def _cmd_pull(args: argparse.Namespace) -> tuple[dict, int]:
             local=local,
             bytes=result.bytes_transferred,
             files=files,
+            pulled=True,
         ),
         EXIT_OK,
     )
@@ -1797,6 +2234,7 @@ def _cmd_ensure(args: argparse.Namespace) -> tuple[dict, int]:
             error=f"không với được host {args.host}",
             detail=profile.detail or profile.error,
             host=args.host,
+            reachable=False,
         )
     result = _run_setup(args.host, profile, setup, name)
     payload = _ok(
@@ -1812,6 +2250,33 @@ def _cmd_ensure(args: argparse.Namespace) -> tuple[dict, int]:
 # --------------------------------------------------------------------------
 # lệnh: tunnel
 # --------------------------------------------------------------------------
+def _doctor_module() -> Any:
+    """Module ``roffkit.doctor`` — import lười (như tunnel)."""
+    try:
+        from . import doctor as doctor_mod  # type: ignore
+    except ImportError:
+        raise RoffError(
+            EXIT_INPUT,
+            "doctor_unavailable",
+            error="module roffkit.doctor chưa có trong bản này",
+        ) from None
+    return doctor_mod
+
+
+def _cmd_doctor(args: argparse.Namespace) -> tuple[dict, int]:
+    """``roff doctor [--probe]`` — chẩn đoán sức khoẻ hệ thống (chỉ **báo**).
+
+    Mặc định KHÔNG probe mạng (đọc cache ``probes.json``) ⇒ chạy trong < 1 s;
+    ``--probe`` mới probe thật host.
+    """
+    doctor_mod = _doctor_module()
+    payload = doctor_mod.run_checks(
+        probe_now=bool(getattr(args, "probe", False)),
+        state_dir=state_dir(),
+    )
+    return payload, int(payload.get("exit_code") or EXIT_OK)
+
+
 def _tunnel_module() -> Any:
     """Module ``roffkit.tunnel`` (phần D sở hữu) — import lười."""
     try:
@@ -1868,7 +2333,45 @@ def _cmd_tunnel(args: argparse.Namespace) -> tuple[dict, int]:
             ),
             EXIT_OK,
         )
+    if action == "link":
+        from_alias = getattr(args, "from_alias", None)
+        to_alias = getattr(args, "to_alias", None)
+        rport = _int_option(getattr(args, "rport", None) or 0, "--rport", minimum=1)
+        via_raw = getattr(args, "via_lport", None)
+        via = _int_option(via_raw, "--via-lport", minimum=1) if via_raw else None
+        to_raw = getattr(args, "to_port", None)
+        to_port = _int_option(to_raw, "--to-port", minimum=1) if to_raw else None
+        result = tunnel_mod.tunnel_link(from_alias, to_alias, rport, via, to_port)
+        return (
+            {
+                "ok": True,
+                "exit_code": EXIT_OK,
+                "from": result.get("from_alias"),
+                "to": result.get("to_alias"),
+                "rport": result.get("rport"),
+                "to_port": result.get("to_port"),
+                "via_lport": result.get("via_lport"),
+                "a_listening": result.get("a_listening"),
+                "b_listening": result.get("b_listening"),
+                "note": result.get("note"),
+            },
+            EXIT_OK,
+        )
     if action == "stop":
+        from_alias = getattr(args, "from_alias", None)
+        if from_alias:
+            # Dọn link phối hợp: `roff tunnel stop --from A --rport P`
+            rport = _int_option(getattr(args, "rport", None) or 0, "--rport", minimum=1)
+            result = tunnel_mod.tunnel_stop_link(from_alias, rport)
+            payload = _ok(**{"from": from_alias, "rport": rport})
+            if isinstance(result, dict):
+                for key, value in result.items():
+                    if key in payload or key in ("from_alias", "to_alias"):
+                        continue
+                    if value is None:
+                        continue
+                    payload[key] = value
+            return payload, EXIT_OK
         host = getattr(args, "host", None)
         lport = _int_option(getattr(args, "lport", None) or 0, "--lport", minimum=1)
         result = tunnel_mod.tunnel_stop(host, lport)
@@ -1880,6 +2383,13 @@ def _cmd_tunnel(args: argparse.Namespace) -> tuple[dict, int]:
         return payload, EXIT_OK
     if action == "list":
         tunnels = tunnel_mod.tunnel_list()
+        links = []
+        lister = getattr(tunnel_mod, "link_list", None)
+        if callable(lister):
+            try:
+                links = list(lister() or [])
+            except Exception:  # pragma: no cover - lỗi đọc state không làm hỏng lệnh
+                links = []
         return (
             _ok(
                 tunnels=[
@@ -1892,7 +2402,8 @@ def _cmd_tunnel(args: argparse.Namespace) -> tuple[dict, int]:
                     }
                     for item in tunnels or []
                 ],
-                count=len(tunnels or []),
+                links=links,
+                count=len(tunnels or []) + len(links),
             ),
             EXIT_OK,
         )
@@ -1961,7 +2472,9 @@ def _gc_host_stores(
                 {
                     "host": alias,
                     "removed": [],
+                    "removed_locks": [],
                     "skipped": [],
+                    "skipped_locks": [],
                     "freed_mb": 0.0,
                     "error": str(getattr(profile, "error", "") or "host unreachable"),
                 }
@@ -1976,13 +2489,29 @@ def _gc_host_stores(
                 {
                     "host": alias,
                     "removed": [],
+                    "removed_locks": [],
                     "skipped": [],
+                    "skipped_locks": [],
                     "freed_mb": 0.0,
                     "error": str(exc),
                 }
             )
             continue
         out.append(result)
+    return out
+
+
+def _gc_removed_locks(hosts: list[dict[str, Any]]) -> list[str]:
+    """Lock mồ côi đã dọn, gom theo ``host:key`` (B22).
+
+    Mỗi host có thể dọn nhiều lock ⇒ cần **tên host** để biết lock nào nằm
+    ở đâu (``<layout_root>/inputs/<key>.lock``).
+    """
+    out: list[str] = []
+    for item in hosts:
+        host = str(item.get("host") or "")
+        for key in item.get("removed_locks") or []:
+            out.append(f"{host}:{key}")
     return out
 
 
@@ -1993,16 +2522,53 @@ def _cmd_gc(args: argparse.Namespace) -> tuple[dict, int]:
     ``cache_min_free_mb`` (để không làm máy local chết vì thiếu chỗ).
 
     Kho input trên host (``<layout_root>/inputs/``) được dọn riêng: xoá bản
-    copy mà **không job nào dùng** và đã cũ hơn 7 ngày (W3g).
+    copy mà **không job nào dùng** và đã cũ hơn ``--max-age-days`` ngày (mặc
+    định 7). ``--max-age-days 0`` ⇒ dọn **mọi** bản copy không còn ai dùng.
+
+    Ngưỡng tuổi đọc bằng kiểm tra **None** (không truyền) — **không** dùng
+    ``or``: 0 là falsy ⇒ bị nuốt thành mặc định ⇒ ``gc`` không bao giờ dọn
+    được kho input ⇒ kho input phía host **phình vô hạn** (B32).
     """
+    # Validate option **trước** khi nạp config: input sai ⇒ exit 2 (chưa làm
+    # gì), config sai ⇒ exit 3 — đúng thứ tự "validate → nạp config" của
+    # ``roff do``.
+    age_days = _float_option(
+        getattr(args, "max_age_days", None),
+        "--max-age-days",
+        minimum=0.0,
+        default=shared_mod.DEFAULT_STORE_MAX_AGE_S / 86400.0,
+    )
+    age_s = age_days * 86400.0
+    job_days = _float_option(
+        getattr(args, "job_max_age_days", None),
+        "--job-max-age-days",
+        minimum=0.0,
+        default=float(job_mod.DEFAULT_GC_MAX_AGE_DAYS),
+    )
     cfg = _load_config()
     root = cache_dir()
     payload: dict[str, Any] = {"ok": True, "exit_code": EXIT_OK}
-    try:
-        age_s = float(getattr(args, "max_age_days", 7.0) or 7.0) * 86400.0
-    except (TypeError, ValueError):
-        age_s = shared_mod.DEFAULT_STORE_MAX_AGE_S
+    # Lock mồ côi đã dọn trên host (B22) — luôn có trong JSON, kể cả khi
+    # không dọn được gì.
+    payload["removed_locks"] = []
+    payload["removed_locks_count"] = 0
     keep_keys = _store_keys_in_use()
+
+    # --- dọn ledger job (W5b / B13) ------------------------------------------------
+    # Job định dạng cũ (không có khoá ``state``) là **rác**: 951 file trong
+    # ledger của người dùng ⇒ ``roff wait`` treo hết timeout. Job terminal quá
+    # hạn cũng dọn. Job **đang chạy / xếp hàng** thì giữ.
+    try:
+        job_gc = job_mod.gc_jobs(state_dir=state_dir(), max_age_days=job_days)
+    except Exception as exc:  # pragma: no cover - lỗi dọn không làm hỏng gc
+        job_gc = {"removed": [], "removed_count": 0, "freed_bytes": 0,
+                  "error": str(exc)}
+    payload["removed_jobs"] = list(job_gc.get("removed") or [])
+    payload["removed_jobs_count"] = int(job_gc.get("removed_count") or 0)
+    payload["skipped_jobs"] = list(job_gc.get("skipped") or [])
+    payload["freed_jobs_mb"] = round(
+        float(job_gc.get("freed_bytes") or 0) / (1024.0 * 1024.0), 3
+    )
     # Dọn ticket/lease mồ côi của sổ slot (W3a) — host bị kẹt vĩnh viễn vì
     # 1 ticket của job đã chết là lỗi của *sổ slot*, không phải của cache.
     slot_result = _reconcile_slots()
@@ -2016,8 +2582,12 @@ def _cmd_gc(args: argparse.Namespace) -> tuple[dict, int]:
         payload["cache"] = root
         hosts = _gc_host_stores(keep_keys, age_s)
         payload["hosts"] = hosts
+        payload["removed_locks"] = _gc_removed_locks(hosts)
+        payload["removed_locks_count"] = len(payload["removed_locks"])
         payload["freed_mb"] = round(
-            sum(float(item.get("freed_mb") or 0.0) for item in hosts), 3
+            sum(float(item.get("freed_mb") or 0.0) for item in hosts)
+            + payload["freed_jobs_mb"],
+            3,
         )
         return payload, EXIT_OK
 
@@ -2053,8 +2623,12 @@ def _cmd_gc(args: argparse.Namespace) -> tuple[dict, int]:
         payload["removed"] = []
         hosts = _gc_host_stores(keep_keys, age_s)
         payload["hosts"] = hosts
+        payload["removed_locks"] = _gc_removed_locks(hosts)
+        payload["removed_locks_count"] = len(payload["removed_locks"])
         payload["freed_mb"] = round(
-            sum(float(item.get("freed_mb") or 0.0) for item in hosts), 3
+            sum(float(item.get("freed_mb") or 0.0) for item in hosts)
+            + payload["freed_jobs_mb"],
+            3,
         )
         return payload, EXIT_OK
 
@@ -2075,9 +2649,12 @@ def _cmd_gc(args: argparse.Namespace) -> tuple[dict, int]:
     payload["removed_count"] = len(removed)
     hosts = _gc_host_stores(keep_keys, age_s)
     payload["hosts"] = hosts
+    payload["removed_locks"] = _gc_removed_locks(hosts)
+    payload["removed_locks_count"] = len(payload["removed_locks"])
     payload["freed_mb"] = round(
         freed / (1024.0 * 1024.0)
-        + sum(float(item.get("freed_mb") or 0.0) for item in hosts),
+        + sum(float(item.get("freed_mb") or 0.0) for item in hosts)
+        + payload["freed_jobs_mb"],
         3,
     )
     return payload, EXIT_OK
@@ -2265,8 +2842,28 @@ def _build_parser() -> _Parser:
     t_start.add_argument("--lport", required=True)
     t_start.add_argument("--rport", required=True)
     t_stop = tunnel_sub.add_parser("stop")
-    t_stop.add_argument("--host", required=True)
-    t_stop.add_argument("--lport", required=True)
+    t_stop.add_argument("--host", help="alias host (dừng tunnel đơn)")
+    t_stop.add_argument("--lport", help="cổng local (dừng tunnel đơn)")
+    t_stop.add_argument(
+        "--from", dest="from_alias",
+        help="alias máy nhận (dừng link phối hợp)",
+    )
+    t_stop.add_argument(
+        "--rport", help="cổng listener trên máy nhận (dừng link phối hợp)",
+    )
+    t_link = tunnel_sub.add_parser(
+        "link", help="nối phối hợp giữa 2 máy (A nhận, B phục vụ)"
+    )
+    t_link.add_argument("--from", dest="from_alias", required=True,
+                        help="alias máy nhận kết nối (listener trên máy này)")
+    t_link.add_argument("--to", dest="to_alias", required=True,
+                        help="alias máy phục vụ (dịch vụ đang LISTEN trên máy này)")
+    t_link.add_argument("--rport", required=True,
+                        help="cổng listener trên máy --from")
+    t_link.add_argument("--to-port", dest="to_port",
+                        help="cổng dịch vụ trên máy --to (mặc định = --rport)")
+    t_link.add_argument("--via-lport", dest="via_lport",
+                        help="cổng trung gian trên máy local (mặc định tự chọn 18500-18599)")
     tunnel_sub.add_parser("list")
 
     # --- gc ---------------------------------------------------------------
@@ -2277,6 +2874,26 @@ def _build_parser() -> _Parser:
         type=float,
         default=7.0,
         help="xoá bản copy trong kho input của host nếu cũ hơn N ngày (mặc định 7)",
+    )
+    gc.add_argument(
+        "--job-max-age-days",
+        dest="job_max_age_days",
+        type=float,
+        default=30.0,
+        help=(
+            "xoá job terminal trong ledger nếu cũ hơn N ngày (mặc định 30); "
+            "job định dạng cũ (không có khoá 'state') luôn bị xoá"
+        ),
+    )
+
+    # --- doctor ------------------------------------------------------------
+    doctor = sub.add_parser(
+        "doctor", help="chẩn đoán sức khoẻ hệ thống (chỉ báo, không sửa gì)"
+    )
+    doctor.add_argument(
+        "--probe",
+        action="store_true",
+        help="probe thật host (chậm vài giây); mặc định đọc cache",
     )
 
     # --- __watch (nội bộ) -------------------------------------------------
@@ -2301,6 +2918,7 @@ _HANDLERS: dict[str, Callable[[argparse.Namespace], tuple[dict, int]]] = {
     "ensure": _cmd_ensure,
     "tunnel": _cmd_tunnel,
     "gc": _cmd_gc,
+    "doctor": _cmd_doctor,
     "__watch": _cmd_watch,
 }
 
@@ -2316,12 +2934,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     * Mọi lệnh khác → in **1 JSON object** ra stdout + exit code tương ứng.
     """
     parser = _build_parser()
-    # Chuẩn hoá quyền file state (W3h): file 0600, thư mục 0700 — kể cả file
-    # đã tồn tại từ trước (mode 0664 do umask của máy tạo ra).
-    try:
-        perm.normalize_tree(state_dir())
-    except Exception:  # pragma: no cover - lỗi quyền không được làm hỏng lệnh
-        pass
     try:
         args = parser.parse_args(list(argv) if argv is not None else None)
     except SystemExit as exc:
@@ -2329,6 +2941,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return code
 
     command = getattr(args, "command", None)
+    # Chuẩn hoá quyền file state (W3h): file 0600, thư mục 0700 — kể cả file
+    # đã tồn tại từ trước (mode 0664 do umask của máy tạo ra).
+    # ``doctor`` **chỉ báo** ⇒ không được sửa gì, kể cả quyền file.
+    if command != "doctor":
+        try:
+            perm.normalize_tree(state_dir())
+        except Exception:  # pragma: no cover - lỗi quyền không được làm hỏng lệnh
+            pass
     if not command:
         parser.print_usage(sys.stderr)
         sys.stderr.write("roff: cần một lệnh (xem 'roff --help')\n")

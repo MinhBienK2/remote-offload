@@ -29,6 +29,16 @@ from pathlib import Path
 
 import pytest
 
+#: State dir **riêng cho test** — test KHÔNG được ghi vào ledger thật của
+#: người dùng (``~/.local/state/roff``). Nếu không, mỗi lần chạy nghiệm thu lại
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _common as common  # noqa: E402
+_DEFAULT_STATE = common.DEFAULT_STATE  # dùng chung (xem _common.py)
+
+from _common import pick_live  # noqa: E402
+from _common import wait_or_skip  # noqa: E402
+
 REPO = Path(__file__).resolve().parents[2]
 SKILL = REPO / "skill"
 LAUNCHER = SKILL / "roff.py"
@@ -43,9 +53,7 @@ HOST_DEATH_REASONS = {"no_host", "host_unreachable", "unknown_host", "empty_flee
 
 # ------------------------------------------------------------------ helpers
 def roff_json(args, timeout=300, env=None):
-    e = dict(os.environ)
-    if env:
-        e.update(env)
+    e = common.roff_env(env)
     p = subprocess.run([sys.executable, str(LAUNCHER)] + list(args),
                        capture_output=True, text=True, timeout=timeout, env=e)
     lines = [ln for ln in p.stdout.strip().splitlines() if ln.strip()]
@@ -71,6 +79,25 @@ def ssh_ok(alias, timeout=20):
         return r.returncode == 0
     except subprocess.SubprocessError:
         return False
+
+
+def dir_state(alias, path, attempts=3):
+    """Thư mục ``path`` có tồn tại trên ``alias`` không?
+
+    * ``True`` — có;
+    * ``False`` — không có;
+    * ``None`` — **không xác định**: host không với được (sự cố hạ tầng).
+
+    Phân biệt ``False`` với ``None`` là bắt buộc: nếu không, một lần host
+    chết sẽ bị báo thành "gc đã xoá nhầm dữ liệu" — tức là báo cáo **sai**
+    về nguyên nhân (đã xảy ra thật 23/11/2026).
+    """
+    for _ in range(max(1, attempts)):
+        rc, out, _err = ssh_out(alias, f"test -d {path} && echo yes || echo no")
+        if rc == 0:
+            return out.strip() == "yes"
+        time.sleep(3)
+    return None
 
 
 def live_muses():
@@ -237,7 +264,11 @@ def test_s25_leaked_slot_does_not_block_host_forever(fleet, cfg, tmp_path):
     Đạt khi: job3 có ``state == "launched"`` (không phải ``queued``), và job2
     vẫn ``queued`` đúng như FIFO (không được âm thầm chạy).
     """
-    alias = fleet[0]
+    alias = pick_live(fleet)
+
+    if alias is None:
+
+        pytest.skip("mọi máy muse đã chết — sự cố hạ tầng")
     pin_host(cfg, alias, slots=1)
 
     # 1. job1 giữ slot
@@ -303,8 +334,7 @@ def test_s25_leaked_slot_does_not_block_host_forever(fleet, cfg, tmp_path):
     assert job3
 
     # job3 phải thật sự chạy xong
-    rc, res, err = roff_json(["wait", job3, "--timeout", "300"],
-                             timeout=360, env=cfg["env"])
+    rc, res, err = wait_or_skip(job3, timeout=360, env=cfg["env"], wait_timeout=300)
     assert rc == 0, f"job3 không hoàn tất: rc={rc} res={res} err={err[-300:]}"
     assert (tmp_path / "out" / "ok.txt").exists(), "job3 không sinh output"
 
@@ -319,7 +349,11 @@ def test_s26_queued_job_auto_launches_when_slot_frees(fleet, cfg, tmp_path):
     Đạt khi: job1 (giữ slot) và job2 (xếp hàng) **cùng** về exit 0, và
     output của job2 có mặt trên máy local.
     """
-    alias = fleet[0]
+    alias = pick_live(fleet)
+
+    if alias is None:
+
+        pytest.skip("mọi máy muse đã chết — sự cố hạ tầng")
     pin_host(cfg, alias, slots=1)
 
     out = tmp_path / "out"
@@ -341,8 +375,7 @@ def test_s26_queued_job_auto_launches_when_slot_frees(fleet, cfg, tmp_path):
     assert obj2.get("state") == "queued", f"job2 phải queued: {obj2}"
 
     for jid in (job1, job2):
-        rc, res, err = roff_json(["wait", jid, "--timeout", "600"],
-                                 timeout=660, env=cfg["env"])
+        rc, res, err = wait_or_skip(jid, timeout=660, env=cfg["env"], wait_timeout=600)
         assert rc == 0, (
             f"job {jid} không về exit 0: rc={rc} res={res} err={err[-300:]} "
             f"— job xếp hàng phải tự chạy khi slot trống")
@@ -362,11 +395,17 @@ def test_s27_state_files_are_private(fleet, cfg, tmp_path):
 
     Đạt khi: mọi file state đều mode **0600**, mọi thư mục state **0700**.
     """
-    alias = fleet[0]
+    alias = pick_live(fleet)
+
+    if alias is None:
+
+        pytest.skip("mọi máy muse đã chết — sự cố hạ tầng")
     pin_host(cfg, alias, slots=1)
 
     rc, _, err = roff_json(["do", "--host", alias, "--cmd", "true",
                              "--name", "s27-perm"], timeout=300, env=cfg["env"])
+    if common.is_host_down(rc, {}, err):
+        pytest.skip(f"host {alias} chết lúc gửi job — sự cố hạ tầng: {err[-200:]}")
     assert rc == 0, f"roff do lỗi: rc={rc} err={err[-300:]}"
 
     state = cfg["state"]
@@ -411,7 +450,11 @@ def test_s28_gc_cleans_host_input_store_but_not_running_jobs(fleet, cfg, tmp_pat
       * sau khi job chạy xong, ``roff gc`` xoá được kho input của job đó;
       * khi job **đang chạy**, ``roff gc`` **không** được xoá kho đó.
     """
-    alias = fleet[0]
+    # Chọn host **đang sống lúc này** (fleet flap liên tục ⇒ `fleet[0]` có thể
+    # đã chết từ lúc fixture chạy).
+    alias = next((a for a in fleet if ssh_ok(a)), "")
+    if not alias:
+        pytest.skip("mọi máy muse đã chết giữa chừng — sự cố hạ tầng")
     pin_host(cfg, alias, slots=1)
 
     src = tmp_path / "data"
@@ -425,6 +468,8 @@ def test_s28_gc_cleans_host_input_store_but_not_running_jobs(fleet, cfg, tmp_pat
         "--out", str(out),
         "--name", "s28-gc",
     ], cfg)
+    if rc == 255 and str(obj.get("reason") or "") == "host_unreachable":
+        pytest.skip(f"host {alias} chết ngay lúc gửi job — sự cố hạ tầng")
     assert rc == 0, f"roff do lỗi: rc={rc} obj={obj} err={err[-300:]}"
     job = obj.get("job")
     assert job
@@ -436,30 +481,38 @@ def test_s28_gc_cleans_host_input_store_but_not_running_jobs(fleet, cfg, tmp_pat
     store = f"{root}/inputs/{key}"
 
     # kho input phải tồn tại trên host
-    rc2, out2, err2 = ssh_out(alias, f"test -d {store} && echo yes || echo no")
-    assert out2.strip() == "yes", (
-        f"không thấy kho input {store} trên {alias}: {err2[-200:]}")
+    state = dir_state(alias, store)
+    if state is None:
+        pytest.skip(f"host {alias} không với được lúc đo — sự cố hạ tầng")
+    assert state is True, (
+        f"không thấy kho input {store} trên {alias} (ssh hỏng: {state})")
 
     # gc KHI job đang chạy ⇒ không được xoá
     rc3, _, err3 = roff_json(["gc"], timeout=600, env=cfg["env"])
     assert rc3 == 0, f"roff gc lỗi: rc={rc3} err={err3[-300:]}"
-    rc4, out4, _ = ssh_out(alias, f"test -d {store} && echo yes || echo no")
-    assert out4.strip() == "yes", (
+    state = dir_state(alias, store)
+    if state is None:
+        pytest.skip(f"host {alias} không với được lúc đo — sự cố hạ tầng")
+    assert state is True, (
         f"roff gc đã xoá kho input của job **đang chạy** ({store}) — "
-        f"không được xoá khi job còn dùng")
+        f"không được xoá khi job còn dùng (ssh hỏng: {state})")
 
-    # chờ job xong rồi gc ⇒ phải dọn được
-    rc5, res, err5 = roff_json(["wait", job, "--timeout", "600"],
-                                timeout=660, env=cfg["env"])
+    # chờ job xong rồi gc ⇒ phải dọn được.
+    # `--max-age-days 0`: mặc định gc giữ bản copy 7 ngày (chính sách cache),
+    # nên muốn kiểm chứng **đường dọn** thì phải bỏ ngưỡng tuổi.
+    rc5, res, err5 = wait_or_skip(job, timeout=660, env=cfg["env"], wait_timeout=600)
     assert rc5 == 0, f"job không hoàn tất: rc={rc5} res={res} err={err5[-300:]}"
     assert res.get("exit") == 0, f"job exit={res.get('exit')}: {res}"
 
-    rc6, _, err6 = roff_json(["gc"], timeout=600, env=cfg["env"])
+    rc6, _, err6 = roff_json(
+        ["gc", "--max-age-days", "0"], timeout=600, env=cfg["env"])
     assert rc6 == 0, f"roff gc lần 2 lỗi: rc={rc6} err={err6[-300:]}"
-    rc7, out7, _ = ssh_out(alias, f"test -d {store} && echo yes || echo no")
-    assert out7.strip() == "no", (
+    state = dir_state(alias, store)
+    if state is None:
+        pytest.skip(f"host {alias} không với được lúc đo — sự cố hạ tầng")
+    assert state is False, (
         f"roff gc không dọn được kho input đã hết dùng ({store}) trên {alias} "
-        f"— kho input phía host phình vô hạn")
+        f"— kho input phía host phình vô hạn (ssh hỏng: {state})")
 
 
 # ------------------------------------------------------------------ S29
@@ -543,17 +596,29 @@ def test_s30_job_routed_to_host_that_has_the_tool(fleet, cfg, tmp_path):
         f"tool không tồn tại ⇒ phải exit 10 (no_host), thực tế rc={rc}: {obj}")
     rejected = obj.get("rejected") or {}
     assert rejected, f"phải nói lý do loại từng host: {obj}"
+    if not any("thiếu tool" in str(v) for v in rejected.values()):
+        # Không phải "thiếu tool" ⇒ nhiều khả năng máy **chết** lúc probe
+        # (probe không xong ⇒ không kịp biết máy có tool hay không).
+        # Phân biệt: còn máy sống ⇒ lý do loại sai ⇒ **lỗi của roff** (FAIL).
+        if not any(ssh_ok(a) for a in MUSE):
+            pytest.skip("mọi máy muse chết lúc probe — sự cố hạ tầng")
     assert any("thiếu tool" in str(v) for v in rejected.values()), (
         f"lý do loại phải nói 'thiếu tool': {rejected}")
 
     # --- tool có sẵn ⇒ host được chọn phải thật sự có nó ---
-    alias = fleet[0]
+    alias = pick_live(fleet)
+
+    if alias is None:
+
+        pytest.skip("mọi máy muse đã chết — sự cố hạ tầng")
     pin_host(cfg, alias, slots=1)
     rc, obj, err = do_on(alias, [
         "--cmd", "true",
         "--need", "ffmpeg",
         "--name", "s30-need",
     ], cfg)
+    if common.is_host_down(rc, obj, err):
+        pytest.skip(f"host {alias} chết lúc gửi job — sự cố hạ tầng: {err[-200:]}")
     assert rc == 0, f"roff do lỗi: rc={rc} obj={obj} err={err[-300:]}"
     host = obj.get("host")
     assert host, f"không có host trong JSON: {obj}"

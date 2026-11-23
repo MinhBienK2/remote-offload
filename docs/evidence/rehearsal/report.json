@@ -1,0 +1,19 @@
+{
+  "tag": "rehearsal",
+  "started_at": "2026-11-23 13:47:24",
+  "steps": {
+    "fleet": {
+      "ok": true
+    },
+    "acceptance": {
+      "rc": 1,
+      "seconds": 3060.5,
+      "tail": "__\n\nhost_and_profile = ('muse-pmb333', Profile(alias='muse-pmb333', reachable=True, error=None, detail=None, hostname='htch-runtime', boot_id... 'x3dvv43', 'x3dvv44', 'x3dvv45a', 'x3dvv46', 'x3dwip'], toolchains=['bin', 'node'], uptime_s=2067.22, restarts_24h=1))\nledger = PosixPath('/tmp/pytest-of-minhbien/pytest-1119/test_s06_resume_partial_transf0/state')\ntmp_path = PosixPath('/tmp/pytest-of-minhbien/pytest-1119/test_s06_resume_partial_transf0')\n\n    def test_s06_resume_partial_transfer_on_real_host(host_and_profile, ledger, tmp_path):\n        \"\"\"S6: transfer bị ngắt giữa chừng → lần sau phải TIẾP TỤC, không truyền lại\n        từ đầu (rsync --partial).\"\"\"\n        alias, prof = host_and_profile\n        from roffkit import transfer as tr\n    \n        src = tmp_path / \"big\"\n        src.mkdir()\n        # 8 MB — đủ để lần truyền bị ngắt giữa chừng\n        (src / \"blob.bin\").write_bytes(os.urandom(8 * 1024 * 1024))\n    \n        remote = f\"{prof.layout_root or '/root/.local/share/roff'}/acceptance-resume\"\n        ssh_run(alias, f\"rm -rf '{remote}'; mkdir -p '{remote}'\")\n    \n        # Cắt ngang: timeout rất ngắn buộc phải dở dang.\n        import roffkit.transfer as tr_mod\n    \n        real_timeout = tr_mod.push.__defaults__\n        try:\n            tr.push(alias, str(src), remote, timeout=2)\n        except Exception:\n            pass\n    \n        # Lần 2: phải thành công, và byte truyền lần 2 phải ÍT hơn tổng (đã truyền\n        # được một phần lần 1).\n        r = tr.push(alias, str(src), remote, timeout=300)\n>       assert r.ok, f\"lần 2 push thất bại: {r.error}\"\nE       AssertionError: lần 2 push thất bại: ssh: connect to host 127.0.0.1 port 2222: Connection refused\nE       assert False\nE        +  where False = TransferResult(ok=False, bytes_transferred=0, files=[], resumed=False, error='ssh: connect to host 127.0.0.1 port 2222: Connection refused').ok\n\ntests/acceptance/test_lifecycle_real.py:209: AssertionError\n=========================== short test summary info ============================\nFAILED tests/acceptance/test_acceptance_resilience.py::test_s07_tunnel_drop_does_not_failover\nFAILED tests/acceptance/test_acceptance_resilience.py::test_s10_job_survives_agent_death\nFAILED tests/acceptance/test_acceptance_resilience.py::test_s11_shards_spread_over_hosts\nFAILED tests/acceptance/test_acceptance_resilience.py::test_s18_parallel_speedup\nFAILED tests/acceptance/test_acceptance_safety.py::test_s14_secret_never_leaks\nFAILED tests/acceptance/test_acceptance_safety.py::test_s12_tunnel_serves_and_stops_cleanly\nFAILED tests/acceptance/test_acceptance_w3_resilience.py::test_s26_queued_job_auto_launches_when_slot_frees\nFAILED tests/acceptance/test_acceptance_w3_resilience.py::test_s28_gc_cleans_host_input_store_but_not_running_jobs\nFAILED tests/acceptance/test_lifecycle_real.py::test_s02b_job_failure_exit_code_on_real_host\nFAILED tests/acceptance/test_lifecycle_real.py::test_s06_resume_partial_transfer_on_real_host\n10 failed, 19 passed in 3059.90s (0:50:59)\n"
+    },
+    "measure": {
+      "rc": 1,
+      "seconds": 142.4
+    }
+  },
+  "finished_at": "2026-11-23 14:41:20"
+}

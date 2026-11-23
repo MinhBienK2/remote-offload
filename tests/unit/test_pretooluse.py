@@ -78,6 +78,34 @@ BLOCKED = [
     "webpack",
     "pip install -r requirements.txt",
     "docker build .",
+    # build — hệ sinh thái khác (dotnet / swift / bazel / ninja / meson / sbt / mix / deno)
+    "dotnet build",
+    "dotnet publish",
+    "dotnet restore",
+    "dotnet msbuild",
+    "swift build",
+    "bazel build //...",
+    "ninja",
+    "meson compile",
+    "sbt compile",
+    "sbt package",
+    "mix compile",
+    "deno compile",
+    "deno task build",
+    "python -m build",
+    # test — ngôn ngữ khác
+    "python -m unittest",
+    "python -m unittest discover",
+    "dotnet test",
+    "swift test",
+    "bazel test //...",
+    "meson test",
+    "sbt test",
+    "mix test",
+    "deno test",
+    "deno task test",
+    "phpunit",
+    "php artisan test",
     # test
     "npx vitest run",
     "vitest run",
@@ -128,6 +156,28 @@ ALLOWED = [
     "vitest run src/a.test.ts",
     "jest src/a.test.ts",
     "rspec spec/models/user_spec.rb",
+    # lệnh giới hạn vào file/test cụ thể (ngôn ngữ khác)
+    "phpunit tests/FooTest.php",
+    "phpunit --filter FooTest",
+    "php artisan test --filter FooTest",
+    "deno test tests/a_test.ts",
+    "deno test --filter 'a_test'",
+    "mix test tests/foo_test.exs",
+    "python -m unittest tests/test_a.py",
+    "swift test --filter MyTestCase",
+    "sbt 'testOnly com.foo.BarTest'",
+    # cờ chỉ-in-thông-tin / chạy-thử
+    "dotnet --version",
+    "dotnet build --help",
+    "swift --version",
+    "bazel --version",
+    "ninja -n",
+    "ninja -t targets",
+    "sbt --version",
+    "mix --version",
+    "deno --version",
+    "phpunit --version",
+    "meson --version",
     # make dry-run, tsc 1 file
     "make -n build",
     "tsc src/a.ts",
@@ -142,6 +192,14 @@ SUGGESTED = [
     "next dev",
     "python -m http.server 8000",
     "jupyter lab",
+    # dev server / process sống — chỉ gợi ý, không chặn cứng
+    "dotnet watch",
+    "dotnet run",
+    "mix phx.server",
+    "php artisan serve",
+    "swift run",
+    "bazel run //app:app",
+    "sbt",
 ]
 
 
@@ -340,3 +398,92 @@ def test_quoted_separator_inside_shell_script_is_not_split():
 def test_nested_shell_scripts_do_not_recurse_forever():
     decision = hook.classify('bash -lc "bash -lc \'bash -lc \\"ls\\"\'"')
     assert decision.action in ("allow", "block", "suggest")
+
+
+# --------------------------------------------------------------------------------------
+# Ngôn ngữ khác: dotnet / swift / bazel / ninja / meson / sbt / mix / deno / php
+# --------------------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "command,group",
+    [
+        ("python -m unittest", "test"),
+        ("python3 -m unittest discover", "test"),
+        ("python3.11 -m unittest", "test"),
+        ("python -m build", "build"),
+        ("python3 -m build", "build"),
+    ],
+)
+def test_python_module_command_is_unwrapped_then_classified(command, group):
+    """`python -m <module>` bóc wrapper còn lại tên module → phân loại theo module."""
+    decision = hook.classify(command)
+    assert decision.action == "block", f"{command!r} phải bị chặn, got {decision.action}"
+    assert decision.group == group
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python -m unittest tests/test_a.py",
+        "phpunit tests/FooTest.php",
+        "deno test tests/a_test.ts",
+        "mix test tests/foo_test.exs",
+        "swift test --filter MyTestCase",
+        "php artisan test --filter FooTest",
+        "sbt 'testOnly com.foo.BarTest'",
+    ],
+)
+def test_new_test_runner_scoped_run_is_allowed(command):
+    """Lệnh giới hạn vào file/test cụ thể thì không chặn cứng."""
+    assert hook.classify(command).action == "allow", command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "dotnet --version",
+        "dotnet build --help",
+        "swift --version",
+        "bazel --version",
+        "ninja -n",
+        "ninja -t targets",
+        "sbt --version",
+        "mix --version",
+        "deno --version",
+        "phpunit --version",
+        "meson --version",
+    ],
+)
+def test_info_flags_are_never_blocked(command):
+    assert hook.classify(command).action == "allow", command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "dotnet watch",
+        "dotnet run",
+        "mix phx.server",
+        "php artisan serve",
+        "swift run",
+        "bazel run //app:app",
+    ],
+)
+def test_dev_servers_of_new_ecosystems_are_only_suggested(command):
+    decision = hook.classify(command)
+    assert decision.action == "suggest", f"{command!r} phải gợi ý, got {decision.action}"
+
+
+def test_escape_hatch_applies_to_new_commands():
+    assert hook.classify("ROFF_LOCAL=1 dotnet build").action == "allow"
+    assert hook.classify("ROFF_LOCAL=1 python -m unittest").action == "allow"
+
+
+def test_config_still_wins_for_new_commands(isolated_config):
+    isolated_config.write_text("[heavy]\nallow = dotnet build\n")
+    assert hook.classify("dotnet build").action == "allow"
+    assert hook.classify("dotnet publish").action == "block"
+
+
+def test_config_add_blocks_new_command(isolated_config):
+    isolated_config.write_text("[heavy]\nadd = bazel build\n")
+    assert hook.classify("bazel build //...").action == "block"

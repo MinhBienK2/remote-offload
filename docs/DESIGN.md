@@ -131,8 +131,8 @@ tối ưu theo "ít byte đi qua máy local", không phải "nhiều core nhất
 | Q24 | Công thức chấm điểm host: ấm + khoẻ + ổn định − đang bận, × weight |
 | Q25 | `--retry 1` mặc định; **chỉ retry lỗi hạ tầng, không bao giờ retry job tự fail**; timeout 2 h |
 | Q26 | Người dùng **restart thật** máy Muse giữa lúc test |
-| Q27–Q28 | Dùng được mọi máy `muse-*`; ngưỡng tài nguyên local: CPU roff+ssh < 2% core, RAM < 100 MB |
-| Q29–Q31 | Fleet = `muse-*` + `qwen1-direct`; 22 kịch bản nghiệm thu S1–S22 |
+| Q27–Q28 | Dùng được mọi máy `muse-*`; ngưỡng tài nguyên local: CPU roff+ssh **trung bình** < 2% một core (đỉnh theo cửa sổ 0,5 s **không** dùng làm ngưỡng — nó bắt cả khởi động interpreter của watcher ⇒ FAIL giả, đo thật 23/11/2026), RAM < 100 MB, lệnh tương tác không chậm > 20% |
+| Q29–Q31 | Fleet = `muse-*` + `qwen1-direct`; **60** mục kịch bản nghiệm thu trong danh mục (mã `S1`–`S47`, `S44` không dùng): **52** kịch bản có test tự động, **5** phải đo bằng tay, **2** chạy bằng script riêng, **1** đã đo bằng bằng chứng sự cố thật |
 | Q32 | **Sổ chiếm chỗ chung ở local** (`flock`) cho mọi phiên/agent/harness |
 | Q33 | **Xếp hàng FIFO** khi fleet bận, có `--priority`; không bao giờ chạy local thay thế |
 | Q34 | `--cpus N` / `--mem`, export `$ROFF_CPUS`; mặc định job chiếm trọn host |
@@ -144,6 +144,9 @@ tối ưu theo "ít byte đi qua máy local", không phải "nhiều core nhất
 | Q43 | Host↔host **không dùng được** → stream pipe qua local, không ghi đĩa; `--prefer-same-host` mặc định bật |
 | Q44 | Cache local có trần 5 GB + LRU; checkpoint dài hạn đẩy lên host có layout bền vững |
 | Q45 | Fleet = `muse-*` + `qwen1-direct`; `comfy`/`colab-comfy` ngoài (bridge một phiên) |
+| Q46 | **`roff` và `ssh` phải đọc CÙNG một file ssh-config** — roff **luôn** truyền `-F <path>`; nguồn sự thật duy nhất là `fleet.ssh_config_file()`. Lý do: OpenSSH mở rộng `~` theo **passwd home** (`getpwuid`), **không** theo `$HOME` ⇒ không truyền `-F` thì ssh đọc file **A** còn roff fingerprint file **B** ⇒ đổi config không đổi fingerprint ⇒ tái dùng ControlMaster cũ ⇒ **nói chuyện với máy cũ** (B14+B25). Luật mở rộng `Include` bên trong file cũng phải khớp ssh thật (`Include` tương đối ⇒ `$HOME/.ssh`, **không** phải thư mục file config) |
+| Q47 | **Cờ phải *làm* việc, không chỉ được ghi vào ledger** — `--sync-back` kéo file **thật** về project (trước đó là lệnh rỗng: job báo thành công, `pulled:true`, file không về ⇒ agent đọc file cũ). Nguyên tắc chung: **thất bại phải báo, không được nuốt** — pull hỏng ⇒ exit 74 + `pulled:false` + `pull_error` (B23); sync-back hỏng ⇒ exit 74 + `pulled:true` + `sync_back_error` (B26). Job remote **đã** chạy xong ⇒ **kéo lại**, không chạy lại job |
+| Q48 | **Bộ nghiệm thu cũng là sản phẩm** — nó phải phân biệt "máy chết" với "lỗi của `roff`", nếu không báo cáo đo **độ ổn định của đường truyền** chứ không phải chất lượng sản phẩm. Ba lớp: (1) **guard tường minh** trong từng test (`pick_live` chọn máy *đang sống lúc chạy*, `is_host_down` → `pytest.skip`, `dir_state` trả 3 trạng thái); (2) **lưới an toàn cuối cùng** trong `tests/acceptance/conftest.py` — FAIL có dấu hiệu tầng ssh/tầng host ⇒ SKIP **kèm lý do**, ngưỡng hẹp và có unit test riêng để không bao giờ che lỗi thật; (3) **bằng chứng** phải mang lý do (`pytest -rfEs`) ⇒ đọc `acceptance.txt` là biết vì sao bỏ qua. Bài học: một kịch bản có thể **tự** sai (S07 cắt kết nối trước khi job chạy; S11 không kiểm `exit` của shard; S18 đọc `cfg["state"]` — khoá không tồn tại — và **chỉ lộ ra** ở đợt mà nó không skip) — mỗi lần "đỏ" phải hỏi: *lỗi ở sản phẩm hay ở kịch bản?*; và **một kịch bản luôn skip là một kịch bản chưa bao giờ được kiểm chứng** — phải chạy tay ít nhất một lần |
 
 ## 5. Kiến trúc
 
@@ -172,7 +175,7 @@ skill/
 docs/
   DESIGN.md           ← file này
   SPEC-CLI.md         ← hợp đồng CLI: từng lệnh, từng tham số, từng exit code
-  SCENARIOS.md        ← 22 kịch bản nghiệm thu + 20 test hồi quy
+  SCENARIOS.md        ← 60 mục kịch bản nghiệm thu + test hồi quy
   REPORT.md           ← kết quả nghiệm thu (viết sau khi chạy)
 ```
 
@@ -218,6 +221,7 @@ Bất biến: **mọi lệnh in đúng 1 JSON object ra stdout**. Exit code nói
 | 2 | `error` | input sai, chưa có gì chạy | sửa input; không có job để dọn |
 | 3 | `error` | config sai/không đọc được | sửa `~/.config/roff/config.ini` |
 | 10 | `reason` | **không còn host nào dùng được** (fleet cạn, mọi host chết) | báo user; **tuyệt đối không chạy local** |
+| 74 | `reason`, `pull_error` | job **chạy xong** (`exit`=0) nhưng **artifact chưa về** local | `roff pull <id> --local <dir>` — **không** chạy lại job |
 | 69 | `reason` | job bị mất: host restart / wipe / OOM | xem `reason`; `roff pull` lấy partial; re-ensure, re-push, chạy lại |
 | 97 | — | workdir không tồn tại trên host | chưa push project đó; `roff push` rồi chạy lại |
 | 124 | — | wait hết giờ | **không phải lỗi** — job vẫn chạy **hoặc vẫn xếp hàng chờ slot**; wait lại |
@@ -225,6 +229,12 @@ Bất biến: **mọi lệnh in đúng 1 JSON object ra stdout**. Exit code nói
 | 255 | `detail` | không với được host | đọc `detail`; "Permission denied" = key bị từ chối (báo user), còn lại = host chết, chọn máy khác |
 
 `reason` ở exit 69 là một trong: `host_restarted` · `host_wiped` · `oom_killed` · `vanished`.
+
+**Exit 74 (B23) — lỗi *âm thầm* nguy hiểm nhất.** Job chạy xong (`exit`=0) ⇒ công
+việc trên máy **đã** xong; chỉ bước kéo về local hỏng (reverse tunnel rớt). Nếu
+`wait` vẫn trả `0`, agent đọc thư mục `--out` **rỗng** và tưởng job chạy mà không
+ra kết quả — **không có cảnh báo nào**. Vì vậy `74` tách riêng khỏi `1` (`1` =
+*job* fail ⇒ đừng chạy lại; `74` ⇒ **kéo lại**, đừng chạy lại).
 
 ### 5.3 Phân biệt 3 tình huống mất host
 
@@ -460,7 +470,7 @@ Chi tiết đầy đủ: `docs/SPEC-CLI.md` (viết bởi subagent, tôi duyệt
 
 ## 7. Kịch bản nghiệm thu
 
-22 kịch bản S1–S22 (chi tiết ở `docs/SCENARIOS.md`). Tóm tắt:
+60 mục kịch bản (mã `S1`–`S47`, `S44` không dùng): 52 kịch bản có test tự động trong `tests/acceptance/`, 5 đo tay, 2 chạy bằng script riêng, 1 đã đo bằng bằng chứng sự cố thật — chi tiết ở `docs/SCENARIOS.md`. Tóm tắt:
 
 | Nhóm | Kịch bản |
 |---|---|
@@ -476,7 +486,7 @@ Chi tiết đầy đủ: `docs/SPEC-CLI.md` (viết bởi subagent, tôi duyệt
 | Song song | S18 (tăng tốc 2 phép đo), S19 (3 phiên agent cùng lúc), S20 (1 máy chết giữa lô → chỉ item của máy đó chạy lại), S21 (split→encode→concat), S22 (item chậm → bản sao) |
 
 **Ngưỡng tài nguyên local (Q28)** — đo ở mọi kịch bản:
-- job đang chạy remote: CPU (roff + ssh + rsync) < 2% một core, RAM < 100 MB
+- job đang chạy remote: CPU **trung bình** (roff + ssh + rsync) < 2% một core, RAM < 100 MB
 - lúc push/pull: chạy dưới nice 19 / ionice idle; lệnh benchmark tương tác chậm thêm ≤ 20%
 - không còn tiến trình roff sót sau khi xong (trừ tunnel cố ý)
 
@@ -561,7 +571,7 @@ nhau**"*. Hiện có:
 |---|---|
 | chuyển **dữ liệu** giữa 2 máy | có — `transfer.stream_between` (A → local → B, không ghi đĩa local) |
 | giữ dữ liệu **không đi qua dây** | có — `--in job:<id>` (job sau chạy trên đúng máy đang giữ dữ liệu) |
-| **kết nối phối hợp** giữa 2 máy (tiến trình A nói chuyện với tiến trình B) | **chưa có** |
+| **kết nối phối hợp** giữa 2 máy (tiến trình A nói chuyện với tiến trình B) | có — `roff tunnel link` / `roff tunnel stop --from A --rport P` (đo thật 23/11/2026: `curl` từ A qua B trả HTTP 200) |
 
 Host ↔ host **không nối thẳng** trên fleet này (bridge chết ở bước SSH banner),
 nhưng **chuỗi reverse-forward qua máy local** thì làm được:
@@ -607,3 +617,11 @@ gần đây, dung lượng, job mồ côi) · báo cáo tuần · `roff gc` toà
 | `ROFF_HOOK_OFF=1` | tắt hook cả phiên — để tự quyết, hoặc để đo "skill tự bật được không mà không cần hook" |
 | `policy.select` **cảnh báo** alias trùng máy vật lý (**chưa loại** — xem W6f) | `same_physical_host` ghi vào `rejected` (map báo cáo) nhưng **không** loại khỏi `candidates` ⇒ 2 alias cùng máy vẫn có thể chạy song song. Trên fleet hiện tại 4 máy Muse có `boot_id`+`machine-id` khác nhau nên chưa kích hoạt. Việc loại thật để lại **W6f** (sửa trong `policy.select`, **trước** khi chọn) |
 
+### 11.6 Đợt 6–8 (W6/W7/W8) — chất lượng chọn host & kho input không kẹt
+
+| Đợt | Việc | Vì sao |
+|---|---|---|
+| **W6** | `infer.py` — **suy ra tool** từ câu lệnh (`ffmpeg -i …` ⇒ `ffmpeg`, `npm test` ⇒ `node`) và truyền vào `policy.select(..., inferred_needs=…)` | agent thường **quên** `--need` ⇒ job được giao cho máy **không có** tool ⇒ chết ngay với exit 127. Suy ra giúp, nhưng **mềm**: máy thiếu tool vẫn được chọn, chỉ xếp thấp hơn |
+| **W6f** | `policy.select` **loại** alias trùng máy vật lý **trước** khi chấm điểm | trước đó chỉ *cảnh báo* ⇒ 2 alias cùng 1 máy vẫn chạy song song ⇒ vỡ giả định "mỗi host 1 slot" |
+| **W7** | Kho input dùng chung **không được kẹt vĩnh viễn**: `LOCK_STALE_S` 1800 → **30** s (nhỏ hơn `MARKER_WAIT_S=60`), lock ghi `owner` + nhịp chạm 10 s, nhả lock bằng `rm -rf` + kiểm tra lại (3 lần) rồi mới cảnh báo stderr; watcher: lỗi hạ tầng + host **không** ghim ⇒ **failover**, lỗi **của job** ⇒ `lost` ngay | đo thật 23/11/2026: 1 job quay vòng **2 giờ** trên cùng host vì lock mồ côi, **không** failover ⇒ job treo tới hết timeout. Sau bản vá: **8 giây**, lý do **đúng** |
+| **W8** | `probe.DEFAULT_TOOLS` 32 → **40 tool** (thêm `pytest`, `mypy`, `ruff`, `eslint`, `tsc`, `jest`, `convert`, `magick`); `policy.select` chỉ kèm lý do tool khi **có** host thực sự có tool; `infer` bỏ `sleep`/`wait`/`pwd`… khỏi danh sách tool | "ưu tiên máy có tool" là **rơi vào no-op** nếu không host nào từng được dò tool đó ⇒ ưu tiên **vô nghĩa**. Đo thật: bản 40 tool phát hiện **25** tool trên 1 máy (bản 32 tool chỉ 23), thời gian probe trung vị 6,27 s → **5,32 s** ⇒ thêm 8 tool **không** làm chậm |

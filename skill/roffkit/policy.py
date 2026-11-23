@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Sequence
 
 if TYPE_CHECKING:  # pragma: no cover - chỉ để type checker
     from roffkit.probe import Profile
@@ -36,6 +36,11 @@ try:  # probe.py là cùng phần B -> import thẳng
     from roffkit.probe import same_physical_host
 except ImportError:  # pragma: no cover
     same_physical_host = None  # type: ignore[assignment]
+
+try:  # bảng alias (tool suy ra) -> hỏi "host có tool này không?"
+    from roffkit.infer import tool_family as _tool_family
+except ImportError:  # pragma: no cover
+    _tool_family = None  # type: ignore[assignment]
 
 
 # --------------------------------------------------------------------------
@@ -355,6 +360,160 @@ def score(profile: "Profile", need: Need, cfg: "Config", busy: int = 0) -> tuple
 # --------------------------------------------------------------------------
 # select
 # --------------------------------------------------------------------------
+def _normalize_needs(inferred_needs: Sequence[str] | None) -> list[str]:
+    """Chuẩn hoá danh sách tool suy ra (bỏ rỗng, bỏ trùng, giữ thứ tự)."""
+    out: list[str] = []
+    for raw in inferred_needs or []:
+        tool = str(raw or "").strip()
+        if not tool or tool in out:
+            continue
+        out.append(tool)
+    return out
+
+
+def _tool_names(tool: str) -> tuple[str, ...]:
+    """Mọi tên khác nhau của 1 tool (chuẩn + alias) — vd ``maven``/``mvn``."""
+    if _tool_family is not None:
+        try:
+            return _tool_family(tool)
+        except Exception:  # pragma: no cover - bảng alias hỏng thì bỏ qua
+            pass
+    return (tool,)
+
+
+def _host_has_tool(have: Any, tool: str) -> bool:
+    """Host có tool này không (theo ``Profile.tools`` — **không** gọi ssh)."""
+    for name in _tool_names(tool):
+        try:
+            if name in have:
+                return True
+        except TypeError:  # pragma: no cover - profile.tools lạ kiểu
+            return False
+    return False
+
+
+def _need_tier(profile: Any, wants: list[str]) -> tuple[int, list[str], list[str]]:
+    """Bậc ưu tiên của host theo tool suy ra: ``(bậc, tool khớp, tool thiếu)``.
+
+    * ``2`` — có **đủ** tool suy ra;
+    * ``1`` — có **một phần**;
+    * ``0`` — không có tool nào (hoặc không có tool suy ra nào).
+
+    Tool suy ra là tiêu chí **mềm**: thiếu tool ⇒ host **vẫn là ứng viên hợp
+    lệ**, chỉ bị đẩy xuống cuối (không loại).
+    """
+    if not wants:
+        return 0, [], []
+    have = getattr(profile, "tools", None) or {}
+    matched = [tool for tool in wants if _host_has_tool(have, tool)]
+    missing = [tool for tool in wants if tool not in matched]
+    if not missing:
+        return 2, matched, missing
+    if matched:
+        return 1, matched, missing
+    return 0, matched, missing
+
+
+def _same_physical(a: Any, b: Any) -> bool:
+    """Hai profile có phải cùng **một máy vật lý** không?
+
+    ``same_physical_host`` trả ``None``/``False`` (hoặc ném lỗi) ⇒ coi là
+    **khác máy**: thiếu dữ liệu (``boot_id``/``instance_token``) không phải
+    bằng chứng ⇒ không được loại nhầm.
+    """
+    if same_physical_host is None:
+        return False
+    try:
+        return bool(same_physical_host(a, b))
+    except Exception:  # pragma: no cover - hàm thay thế hỏng
+        return False
+
+
+def _group_physical_host(profiles: list[Any]) -> list[list[Any]]:
+    """Chia alias thành nhóm theo **máy vật lý** (``same_physical_host``).
+
+    Thiếu dữ liệu (``boot_id``/``instance_token``) ⇒ alias đó đứng một mình
+    (không đoán bừa ⇒ không loại nhầm).
+    """
+    groups: list[list[Any]] = []
+    for profile in profiles:
+        for group in groups:
+            if _same_physical(group[0], profile):
+                group.append(profile)
+                break
+        else:
+            groups.append([profile])
+    return groups
+
+
+def _pick_keeper(
+    group: list[Any],
+    prefer_index: dict[str, int],
+    base_points: dict[str, float],
+) -> Any:
+    """Alias giữ lại của 1 nhóm: **prefer** > **điểm** > thứ tự danh sách.
+
+    * alias người dùng prefer (``--in job:``) được giữ trước — không được loại
+      trắng alias user chỉ định;
+    * cùng cấp thì giữ alias **điểm cao hơn** (RAM/load/khoẻ…);
+    * vẫn bằng thì giữ alias **đầu tiên** (thứ tự vào ổn định).
+    """
+    best = None
+    best_key: tuple | None = None
+    for profile in group:
+        alias = getattr(profile, "alias", "?")
+        rank = prefer_index.get(alias)
+        key = (
+            0 if rank is not None else 1,
+            rank if rank is not None else 0,
+            -float(base_points.get(alias, 0.0)),
+        )
+        if best_key is None or key < best_key:
+            best, best_key = profile, key
+    return best
+
+
+def _dedupe_physical_host(
+    profiles: list[Any],
+    prefer: list[str] | None = None,
+    base_points: dict[str, float] | None = None,
+) -> tuple[list[Any], dict[str, str]]:
+    """Loại alias trùng máy vật lý — mỗi nhóm chỉ **giữ 1 alias**.
+
+    Trả ``(candidates còn lại, {alias: lý do loại})``. Luôn giữ lại **ít nhất
+    1 alias** mỗi nhóm ⇒ không mất host khỏi fleet.
+
+    Alias **giữ lại** (keeper) của mỗi nhóm, theo thứ tự ưu tiên:
+
+    1. alias mà người dùng **prefer** (``--in job:``) — không được loại trắng
+       alias user chỉ định;
+    2. alias **điểm cao hơn** (RAM/load/khoẻ…);
+    3. thứ tự trong danh sách (thứ tự vào ổn định).
+    """
+    if same_physical_host is None or len(profiles) < 2:
+        return list(profiles), {}
+
+    groups = _group_physical_host(profiles)
+    prefer_index = {alias: i for i, alias in enumerate(prefer or [])}
+    points_by_alias = dict(base_points or {})
+
+    kept: list[Any] = []
+    rejected: dict[str, str] = {}
+    for group in groups:
+        keeper = _pick_keeper(group, prefer_index, points_by_alias)
+        kept.append(keeper)
+        keeper_alias = getattr(keeper, "alias", "?")
+        for other in group:
+            if other is keeper:
+                continue
+            alias = getattr(other, "alias", "?")
+            rejected[alias] = (
+                f"{alias}: cùng máy vật lý với {keeper_alias} "
+                "(cùng boot_id + instance_token) — chỉ dùng 1 alias cho 1 máy"
+            )
+    return kept, rejected
+
+
 def reject_all(
     profiles: list["Profile"],
     need: Need,
@@ -397,12 +556,27 @@ def select(
     ignore_slots: bool = False,
     ignore_busy: bool = False,
     running: dict[str, int] | None = None,
+    inferred_needs: Sequence[str] | None = None,
 ) -> Choice | None:
     """Lọc cứng rồi chấm điểm; trả về host tốt nhất.
 
     ``prefer_hosts`` = danh sách alias đang giữ dữ liệu (``--in job:``).
     Alias **đầu tiên có mặt** trong danh sách được ``+50`` (ưu tiên mạnh).
     Trả ``None`` nếu không host nào dùng được.
+
+    Thứ tự 3 bước:
+
+    1. **Lọc cứng** (:func:`reject_reason`) — host không với được / thiếu tool
+       ghi rõ / thiếu RAM / hết slot ⇒ loại, lý do lưu vào ``rejected``.
+    2. **Loại alias trùng máy vật lý** (W6f) — 1 máy vật lý chỉ dùng qua
+       **1 alias** (nếu không 2 job có thể chạy song song trên cùng 1 máy).
+       Việc này chạy **trước** khi chọn winner ⇒ alias trùng **không** còn là
+       ứng viên. Alias giữ lại của mỗi nhóm: alias user **prefer** trước,
+       rồi alias **điểm cao hơn**, rồi thứ tự danh sách. Thiếu
+       ``boot_id``/``instance_token`` ⇒ coi là khác máy (không loại nhầm);
+       luôn giữ lại **ít nhất 1 alias** mỗi nhóm.
+    3. **Chấm điểm** (:func:`score`) — trong cùng nhóm ưu tiên, điểm cao hơn
+       thắng (điểm cũ của hợp đồng §7, không đổi).
 
     Args:
         busy: số job **đang bận** trên từng host (đang chạy + đang xếp hàng) —
@@ -415,10 +589,24 @@ def select(
             (bridge bận là "đang bận" ⇒ job sẽ xếp hàng, không phải lỗi).
         running: số job **đang giữ slot** trên từng host (dùng cho luật "đã
             đầy slot"). Mặc định lấy từ ``busy``.
+        inferred_needs: tool **suy ra** từ câu lệnh (xem
+            :func:`roffkit.infer.infer_tools`) — tiêu chí **mềm**: host có
+            tool đó trong ``Profile.tools`` được **ưu tiên** (đứng trước
+            trong thứ tự ưu tiên), host không có **vẫn là ứng viên hợp lệ**,
+            chỉ bị đẩy xuống cuối — **không** bị loại. Tool ghi rõ bằng
+            ``--need`` (``need.tools``) vẫn là tiêu chí **cứng** như trước.
+            Rỗng (mặc định) ⇒ hành vi **không đổi**.
+
+            Lý do về tool suy ra chỉ được kèm vào ``reasons`` khi **có**
+            host nào **thực sự** có tool đó (W8b): nếu không host nào có thì
+            dòng "không có tool suy ra từ lệnh: …" chỉ là **nhiễu** (lặp ở
+            mọi host, không giúp ích ai) ⇒ **không** kèm. Hành vi **chọn
+            host** không đổi.
     """
     busy_map = busy or {}
     run_map = running if running is not None else busy_map
     prefer = list(prefer_hosts or [])
+    wants = _normalize_needs(inferred_needs)
 
     rejected: dict[str, str] = {}
     candidates: list[Any] = []
@@ -436,16 +624,57 @@ def select(
     if not candidates:
         return None
 
-    available = {getattr(p, "alias", "?") for p in candidates}
-    preferred = next((alias for alias in prefer if alias in available), None)
-
-    best_profile = None
-    best_score = float("-inf")
-    best_reasons: list[str] = []
+    # --- điểm gốc (chưa cộng +50 của prefer) — dùng để chọn keeper ------
+    base_points: dict[str, float] = {}
+    base_reasons: dict[str, list[str]] = {}
     for profile in candidates:
         alias = getattr(profile, "alias", "?")
         used = int(busy_map.get(alias, 0) or 0)
         points, reasons = score(profile, need, cfg, used)
+        base_points[alias] = points
+        base_reasons[alias] = reasons
+
+    # --- W6f: 1 máy vật lý = 1 alias (loại TRƯỚC khi chọn winner) ---------
+    candidates, duplicates = _dedupe_physical_host(
+        candidates, prefer, base_points
+    )
+    for alias, reason in duplicates.items():
+        rejected[alias] = (
+            f"{rejected[alias]}; {reason}" if alias in rejected else reason
+        )
+    if not candidates:
+        return None
+
+    available = {getattr(p, "alias", "?") for p in candidates}
+    preferred = next((alias for alias in prefer if alias in available), None)
+
+    # --- W8b: bậc ưu tiên theo tool suy ra — tính TRƯỚC cho MỌI ứng viên ---
+    # Trước đây tier lẫn điểm tính trong **cùng 1 vòng** ⇒ không biết được
+    # "có host nào thực sự có tool suy ra không" mà không làm 2 vòng.
+    tiers: dict[str, int] = {}
+    matched_by_alias: dict[str, list[str]] = {}
+    missing_by_alias: dict[str, list[str]] = {}
+    for profile in candidates:
+        alias = getattr(profile, "alias", "?")
+        tier, matched, missing = _need_tier(profile, wants)
+        tiers[alias] = tier
+        matched_by_alias[alias] = matched
+        missing_by_alias[alias] = missing
+
+    # Lý do về tool suy ra chỉ **có ích** khi có **ít nhất một** ứng viên có
+    # tier > 0 (tức có host nào **thực sự** có tool đó). Nếu không host nào
+    # có ⇒ **không** kèm lý do đó: dòng "không có tool suy ra từ lệnh: …"
+    # lặp ở **mọi** host mà không giúp ích ai. Hành vi **chọn host** không đổi.
+    tool_reason_useful = any(tier > 0 for tier in tiers.values())
+
+    best_profile = None
+    best_score = float("-inf")
+    best_tier = -1
+    best_reasons: list[str] = []
+    for profile in candidates:
+        alias = getattr(profile, "alias", "?")
+        points = float(base_points.get(alias, 0.0))
+        reasons = list(base_reasons.get(alias, []))
         if preferred is not None and alias == preferred:
             points += WARM_DATA
             reasons = list(reasons) + [
@@ -460,29 +689,34 @@ def select(
             reasons = list(reasons) + [
                 "bridge đang bận (1 phiên/host) → job sẽ xếp hàng"
             ]
-        if points > best_score:
-            best_profile, best_score, best_reasons = profile, points, reasons
+        # --- W6b: ưu tiên host CÓ tool suy ra từ lệnh (tiêu chí mềm) ------
+        tier = int(tiers.get(alias, 0))
+        if wants and tool_reason_useful:
+            matched = matched_by_alias.get(alias, [])
+            missing = missing_by_alias.get(alias, [])
+            # Báo **mọi** tool suy ra (có ⇒ "có …", thiếu ⇒ "không có …") —
+            # câu chữ giữ nguyên như trước.
+            if matched:
+                reasons = list(reasons) + [
+                    f"có tool suy ra từ lệnh: {', '.join(matched)} (ưu tiên)"
+                ]
+            if missing:
+                reasons = list(reasons) + [
+                    "không có tool suy ra từ lệnh: "
+                    f"{', '.join(missing)} (vẫn dùng được — ưu tiên là mềm)"
+                ]
+        if tier > best_tier or (tier == best_tier and points > best_score):
+            best_profile, best_score, best_tier, best_reasons = (
+                profile,
+                points,
+                tier,
+                reasons,
+            )
 
     if best_profile is None:  # pragma: no cover - không xảy ra nếu candidates rỗng
         return None
 
     winner_alias = getattr(best_profile, "alias", "?")
-    # --- loại alias trùng máy vật lý (API-CONTRACT §15b.5) ---
-    # 1 máy vật lý chỉ được dùng qua 1 alias, nếu không 2 job có thể chạy song
-    # song trên cùng một máy (Muse: 4 CPU, RAM thật chỉ còn ~500 MB).
-    if same_physical_host is not None:
-        for profile in candidates:
-            alias = getattr(profile, "alias", "?")
-            if alias == winner_alias:
-                continue
-            if not same_physical_host(profile, best_profile):
-                continue
-            note = (
-                f"{alias}: cùng máy vật lý với {winner_alias} "
-                "(cùng boot_id + instance_token) — chỉ dùng 1 alias cho 1 máy"
-            )
-            rejected[alias] = f"{rejected[alias]}; {note}" if alias in rejected else note
-
     return Choice(
         host=winner_alias,
         score=round(best_score, 3),

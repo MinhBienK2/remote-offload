@@ -5,7 +5,6 @@ từ các phát hiện mới trên fleet thật (2026-11-22/23).
 
 Test này KHÔNG cần fleet thật — dùng ssh giả trong tests/fake/.
 """
-import json
 import os
 import subprocess
 import sys
@@ -16,7 +15,6 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from conftest import parse_json, run_cli  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 SKILL = REPO / "skill"
@@ -58,7 +56,6 @@ def test_r02_single_session_bridge_serializes(fake_ssh, cli_env):
     Lỗi v1: 2 worker đồng thời → HTTP 429 / kex closed.
     """
     roffkit()
-    from roffkit.probe import probe_many
 
     seen = []
 
@@ -492,12 +489,16 @@ def test_r21_memory_floor_adds_not_max(tmp_path):
 # ---------------------------------------------------------------- R22
 
 def test_r22_control_path_fits_unix_socket_limit(monkeypatch, tmp_path):
-    """R22: ControlPath phải ≤ 100 byte — Unix socket chỉ chứa được 108 byte.
+    """R22: ControlPath phải ≤ 88 byte — Unix socket chỉ chứa được 108 byte.
 
     Lỗi gặp thật khi nghiệm thu (23/11/2026): ``$ROFF_STATE_DIR`` sâu
     (``/tmp/pytest-of-.../test_.../state``) → ssh báo
     ``unix_listener: path ... too long for Unix domain socket`` → ControlMaster
     chết, mọi lệnh ssh rơi về ~3,5–7 s thay vì ~1 s.
+
+    Vì sao **88** chứ không phải 108: OpenSSH, khi socket cũ còn sót, **không
+    xoá** mà thử bind lại với hậu tố ngẫu nhiên tới **17 byte** ⇒ 108 + 17 vượt
+    giới hạn ⇒ ssh chết với thông báo gây hiểu nhầm. 88 + 17 = 105 vẫn vừa.
 
     Ngoài ra tunnel.py và sshx.py phải dùng CHUNG một đường dẫn, nếu không
     ``ssh -O cancel`` sẽ không trúng master đang giữ cổng.
@@ -527,9 +528,13 @@ def test_r22_control_path_fits_unix_socket_limit(monkeypatch, tmp_path):
     assert tunnel_mod.control_path("muse-pmb333") == str(path), (
         "tunnel và sshx phải dùng chung ControlPath")
 
-    # Đường dẫn tự nhiên ngắn thì giữ nguyên (không rút gọn thừa)
+    # Đường dẫn tự nhiên ngắn thì giữ nguyên (không rút gọn thừa).
+    # W5c/B14: tên socket chứa **fingerprint** tham số ssh ⇒ đổi config ⇒
+    # socket khác (xem tests/unit/test_w5c_fingerprint.py).
     monkeypatch.setenv("ROFF_STATE_DIR", str(tmp_path / "s"))
-    assert str(sshx.control_path("muse-a")) == str(tmp_path / "s" / "cm" / "muse-a.sock")
+    short = sshx.control_path("muse-a")
+    assert len(str(short)) <= sshx.UNIX_SOCKET_MAX_PATH
+    assert "muse-a" in short.name and short.name.endswith(".sock")
 
 
 def test_r23_stale_master_socket_is_cleaned(monkeypatch, tmp_path):

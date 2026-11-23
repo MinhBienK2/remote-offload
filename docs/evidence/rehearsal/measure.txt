@@ -1,0 +1,69 @@
+[đo] chạy lệnh tương tác trước khi có roff (baseline)…
+[đo] gọi roff do…
+[đo] roff do -> rc=0
+{
+  "ok": true,
+  "exit_code": 0,
+  "job": "261123-143941-024e",
+  "state": "launched",
+  "host": "muse-bienpm333",
+  "host_reasons": [
+    "project 'remote-offload' đã có sẵn trên host (+40)",
+    "toolchain đã cài sẵn (bin, node) (+10)",
+    "còn 4.0/4 core rảnh (×3 → +11.9)",
+    "RAM khả dụng 669 MB (+6.7)",
+    "layout bền vững (/home/hatch/.roff) (+15)",
+    "máy restart 1 lần trong 24h (-20)",
+    "không có tool suy ra từ lệnh: sleep (vẫn dùng được — ưu tiên là mềm)"
+  ],
+  "ledger": "/tmp/roff-measure-yg06dt_l/state/jobs/261123-143941-024e.json",
+  "next": [
+    "roff wait 261123-143941-024e --timeout 7200"
+  ],
+  "inferred_needs": [
+    "sleep"
+  ]
+}
+[đo] trong lúc job chạy: {
+  "max_cpu_pct_one_core": 3.0,
+  "mean_cpu_pct_one_core": 0.14,
+  "max_rss_mb": 109.9,
+  "iowait_pct": 1.11,
+  "idle_pct": 0.0,
+  "duration_s": 70.09,
+  "leaked_processes": [
+    "3412968 /usr/bin/python3 /home/minhbien/Documents/remote-offload/skill/roff.py __watch 2",
+    "3519801 /usr/bin/python3 /home/minhbien/Documents/remote-offload/skill/roff.py do --cmd ",
+    "3521684 rsync -a --no-owner --no-group --partial --stats --timeout=3600 --exclude=.git -",
+    "3521850 /usr/bin/python3 /home/minhbien/Documents/remote-offload/skill/roff.py doctor --",
+    "3523513 /usr/bin/python3 /home/minhbien/Documents/remote-offload/skill/roff.py do --cmd "
+  ]
+}
+[đo] chạy lệnh tương tác khi roff đang chạy…
+[đo] wait -> rc=0 {"ok": true, "exit_code": 0, "job": "261123-143941-024e", "state": "exited", "exit": 0, "host": "muse-bienpm333", "artifacts": [], "pulled": true}
+{
+  "cpu_pct_max": 3.0,
+  "cpu_ok": false,
+  "rss_mb_max": 109.9,
+  "rss_ok": false,
+  "idle_pct_min": 0.0,
+  "iowait_pct_max": 1.1,
+  "leaked": [
+    "3412968 /usr/bin/python3 /home/minhbien/Documents/remote-offload/skill/roff.py __watch 2",
+    "3519801 /usr/bin/python3 /home/minhbien/Documents/remote-offload/skill/roff.py do --cmd ",
+    "3521684 rsync -a --no-owner --no-group --partial --stats --timeout=3600 --exclude=.git -",
+    "3521850 /usr/bin/python3 /home/minhbien/Documents/remote-offload/skill/roff.py doctor --"
+  ],
+  "bench_baseline_s": 0.0246,
+  "bench_during_s": 0.0243,
+  "slowdown_pct": -1.2,
+  "slowdown_ok": true,
+  "budget_problems": [
+    "CPU 3.00% > 2.0% một core",
+    "RAM 109.9 MB > 100.0 MB",
+    "còn 4 tiến trình roff sót: ['3412968 /usr/bin/python3 /home/minhbien/Documents/remote-offload/skill/roff.py __watch 2', '3519801 /usr/bin/python3 /home/minhbien/Documents/remote-offload/skill/roff.py do --cmd ', '3521684 rsync -a --no-owner --no-group --partial --stats --timeout=3600 --exclude=.git -']"
+  ]
+}
+[đo] KẾT QUẢ: FAIL
+
+----- stderr -----

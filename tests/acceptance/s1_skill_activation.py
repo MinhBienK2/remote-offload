@@ -23,7 +23,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import uuid
 from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parents[2] / "skill"
@@ -130,6 +129,36 @@ def tool_calls(events: list[dict]) -> list[dict]:
     return out
 
 
+def _parse_events(raw: str) -> list[dict]:
+    """Đọc `stream-json` (mỗi dòng 1 JSON) ⇒ danh sách event."""
+    events: list[dict] = []
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            events.append(json.loads(line))
+        except ValueError:
+            continue
+    return events
+
+
+def _dump_tool_calls(raw: str) -> None:
+    """In các tool call agent đã thực hiện (từ log dạng text hoặc stream-json)."""
+    calls = tool_calls(_parse_events(raw))
+    if not calls:
+        print("  (chưa có tool call nào trong phần log)")
+        return
+    print(f"[S1] tool calls trong phần log ({len(calls)}):")
+    for block in calls:
+        name = block.get("name")
+        inp = block.get("input") or {}
+        if name == "Bash":
+            print(f"  Bash: {str(inp.get('command') or '')[:200]}")
+        else:
+            print(f"  {name}: {str(inp)[:160]}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=None)
@@ -163,8 +192,14 @@ def main() -> int:
     try:
         events = run_session(proj, args.model, args.timeout, hook_settings,
                              hook_off=args.hook_off)
-    except subprocess.TimeoutExpired:
-        print("[S1] FAIL: phiên Claude Code quá thời gian")
+    except subprocess.TimeoutExpired as exc:
+        # Phiên hết giờ ⇒ **không** mất luôn dấu vết: `TimeoutExpired` mang
+        # theo output một phần ⇒ in ra để biết agent đã làm gì tới lúc đó
+        # (đo thật 23/11/2026: lần đầu chỉ in "quá thời gian" ⇒ không biết
+        # agent có tự gọi `roff` hay không ⇒ phải đoán).
+        print("[S1] FAIL: phiên Claude Code quá thời gian "
+              "(timeout %ss) — dưới đây là phần log đã có:" % args.timeout)
+        _dump_tool_calls(exc.stdout or "")
         return 2
     finally:
         if not args.keep:

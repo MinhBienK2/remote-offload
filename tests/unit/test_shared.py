@@ -37,19 +37,24 @@ class FakeRemote:
 
     Không mô phỏng fs thật — chỉ những gì :mod:`roffkit.shared` cần:
     đọc/ghi marker (``cat``/``printf``), mutex (``mkdir``/``rmdir``/``rm -rf``),
-    khoá read-only (``chmod``) và tuổi của lock (``stat``).
+    khoá read-only (``chmod``), tuổi của lock (``stat``) và **liệt kê kho**
+    (``for p in "$root"/*``) để ``gc`` biết trong kho có gì.
     """
 
     def __init__(self) -> None:
         self.files: dict[str, str] = {}
         self.locks: set[str] = set()
+        self.dirs: set[str] = set()
         self.scripts: list[str] = []
         self.lock_mtime = time.time()
+        self.dir_mtime = time.time()
 
     # --- seam cho sshx.run_shell ---
     def exec(self, script: str) -> tuple[int, str]:
         """Chạy 1 script trên host giả; trả ``(rc, stdout)``."""
         self.scripts.append(script)
+        if "for p in" in script:
+            return 0, self._listing()
         out = ""
         for part in script.split("&&"):
             rc, text = self._exec(part.strip())
@@ -69,6 +74,23 @@ class FakeRemote:
 
         rc, out = self.exec(script)
         return sshx.RunResult(rc=rc, stdout=out, stderr="")
+
+    def _listing(self) -> str:
+        """Nội dung lệnh liệt kê kho (``for p in "$root"/*``).
+
+        Định dạng giống hệt kho thật: ``<kind>|<tên>|<mtime>|<size_kb>``.
+        """
+        rows: list[str] = []
+        for path in sorted(self.dirs):
+            rows.append(f"dir|{os.path.basename(path)}|{int(self.dir_mtime)}|2048")
+        for path in sorted(self.locks):
+            rows.append(f"dir|{os.path.basename(path)}|{int(self.lock_mtime)}|0")
+        for path in sorted(self.files):
+            if path.endswith(".complete"):
+                rows.append(
+                    f"file|{os.path.basename(path)}|{int(self.dir_mtime)}|1"
+                )
+        return "".join(row + "\n" for row in rows)
 
     def _exec(self, part: str) -> tuple[int, str]:
         if not part:
@@ -90,9 +112,25 @@ class FakeRemote:
         if head == "rm" and len(tokens) > 2:
             self.locks.discard(tokens[2])
             self.files.pop(tokens[2], None)
+            self.files.pop(tokens[2] + "/owner", None)
             return 0, ""
         if head == "stat" and len(tokens) > 3:
-            return 0, str(int(self.lock_mtime))
+            # ``stat`` chỉ trả về gì khi path **thực sự tồn tại** — nếu không,
+            # mọi lần "lock đã biến mất" sẽ bị báo sai.
+            path = tokens[3]
+            if path in self.locks or path in self.files:
+                return 0, str(int(self.lock_mtime))
+            return 1, ""
+        if head == "test" and len(tokens) > 2:
+            path = tokens[-1]
+            exists = path in self.locks or path in self.files
+            if tokens[1] == "!":
+                # ``test ! -e PATH`` ⇒ thành công khi path **không** còn.
+                return (0, "") if not exists else (1, "")
+            if tokens[1] == "-e":
+                return (0, "") if exists else (1, "")
+            # ``test -d``: giả lập "thư mục luôn tồn tại".
+            return 0, ""
         if head == "printf" and len(tokens) >= 5 and tokens[-2] == ">":
             self.files[tokens[-1]] = tokens[2]
             return 0, ""
@@ -372,6 +410,192 @@ def test_ensure_shared_input_missing_source_raises(remote, pushes, tmp_path):
         shared_mod.ensure_shared_input("muse-a", str(tmp_path / "khong-co"), "/r")
     assert exc.value.code == EXIT_INPUT
     assert not pushes
+
+
+# --------------------------------------------------------------------------
+# gc — dọn kho input trên host (W3g) + **lock mồ côi** (B22)
+# --------------------------------------------------------------------------
+def _store_lock(remote, root, key, age_s=3600.0, owner=None):
+    """Dựng 1 lock ``<key>.lock`` trong kho giả (mồ côi hoặc còn sống)."""
+    lock = f"{root}/inputs/{key}.lock"
+    remote.locks.add(lock)
+    remote.lock_mtime = time.time() - age_s
+    if owner is not None:
+        remote.files[lock + "/owner"] = json.dumps(owner)
+    return lock
+
+
+def _live_owner():
+    """Chủ lock **còn sống** (pid của tiến trình này + đúng máy local)."""
+    return {
+        "id": "tok-1",
+        "pid": os.getpid(),
+        "host": shared_mod._local_host(),
+        "started": time.time(),
+    }
+
+
+def test_gc_shared_store_removes_orphan_lock(remote):
+    """Lock mồ côi (quá hạn + không có chủ) ⇒ ``gc`` **dọn** nó (B22).
+
+    Trước B22, ``gc`` chỉ **giữ** mọi entry đang lock ⇒ lock mồ côi tích tụ
+    mãi trên host (kiểm kê thật 23/11/2026: 3 lock trên ``muse-pmb333``).
+    """
+    root = "/home/hatch/.roff"
+    key = "abc123"
+    lock = _store_lock(remote, root, key, age_s=3600.0)
+
+    result = shared_mod.gc_shared_store("muse-a", root, keep_keys=set())
+
+    assert result["removed_locks"] == [key], f"phải báo lock đã dọn: {result}"
+    assert lock not in remote.locks, "lock mồ côi phải bị xoá"
+
+
+def test_gc_shared_store_keeps_live_lock(remote):
+    """Lock **còn sống** (chủ còn sống) ⇒ giữ, reason ``"locked"``."""
+    root = "/home/hatch/.roff"
+    key = "abc123"
+    # tuổi > LOCK_STALE_S nhưng < LOCK_HARD_STALE_S ⇒ chỉ chết khi quá hạn cứng
+    lock = _store_lock(remote, root, key, age_s=60.0, owner=_live_owner())
+
+    result = shared_mod.gc_shared_store("muse-a", root, keep_keys=set())
+
+    assert result["removed_locks"] == [], "lock còn sống không được xoá"
+    assert lock in remote.locks, "lock của tiến trình còn sống phải còn lại"
+    reasons = {item["reason"] for item in result["skipped_locks"]}
+    assert "locked" in reasons, f"phải báo lý do giữ: {result['skipped_locks']}"
+
+
+def test_gc_shared_store_keeps_orphan_lock_of_key_in_use(remote):
+    """Lock mồ côi nhưng key **đang có job dùng** ⇒ giữ.
+
+    Thiếu ràng buộc này là xoá nhầm việc của job đang chạy/xếp hàng.
+    """
+    root = "/home/hatch/.roff"
+    key = "abc123"
+    lock = _store_lock(remote, root, key, age_s=3600.0)
+
+    result = shared_mod.gc_shared_store("muse-a", root, keep_keys={key})
+
+    assert result["removed_locks"] == [], "key đang dùng ⇒ không được xoá lock"
+    assert lock in remote.locks
+    reasons = {item["reason"] for item in result["skipped_locks"]}
+    assert "in_use" in reasons, f"phải báo lý do giữ: {result['skipped_locks']}"
+
+
+def test_gc_shared_store_removes_orphan_lock_only_once(remote):
+    """Chạy ``gc`` 2 lần ⇒ lần 2 **không** xoá gì thêm (idempotent)."""
+    root = "/home/hatch/.roff"
+    key = "abc123"
+    _store_lock(remote, root, key, age_s=3600.0)
+
+    first = shared_mod.gc_shared_store("muse-a", root, keep_keys=set())
+    second = shared_mod.gc_shared_store("muse-a", root, keep_keys=set())
+
+    assert first["removed_locks"] == [key]
+    assert second["removed_locks"] == [], "lần 2 không được xoá gì thêm"
+
+
+def test_gc_shared_store_survives_unreachable_host(remote, monkeypatch):
+    """Host **không với được** ⇒ ``gc`` không ném exception, bỏ qua lock đó.
+
+    Không được làm hỏng cả lệnh ``gc`` (một host chết không được chặn việc
+    dọn các host còn sống).
+    """
+    root = "/home/hatch/.roff"
+    key = "abc123"
+    lock = _store_lock(remote, root, key, age_s=3600.0)
+
+    def unreachable(host, script, timeout=60.0):
+        if "for p in" in script:
+            return remote.run_shell(host, script, timeout)
+        return (
+            255,
+            "",
+            "ssh: connect to host muse-a port 22: Connection refused",
+        )
+
+    monkeypatch.setattr(shared_mod, "_run_shell", unreachable)
+
+    result = shared_mod.gc_shared_store("muse-a", root, keep_keys=set())
+
+    assert result["removed_locks"] == [], "không biết lock còn sống ⇒ không xoá"
+    assert lock in remote.locks
+    reasons = {item["reason"] for item in result["skipped_locks"]}
+    assert "host_unreachable" in reasons, (
+        f"phải báo host không với được: {result['skipped_locks']}"
+    )
+
+
+def test_gc_shared_store_still_removes_old_unused_copy(remote):
+    """Bản copy cũ + có marker + không ai dùng ⇒ **vẫn** bị dọn (W3g)."""
+    root = "/home/hatch/.roff"
+    key = "abc123"
+    remote.dirs.add(f"{root}/inputs/{key}")
+    remote.files[f"{root}/inputs/{key}.complete"] = json.dumps(
+        {"source": "/x", "kind": "dir", "size": 1, "mtime": 1.0}
+    )
+    remote.dir_mtime = time.time() - 10000.0
+
+    result = shared_mod.gc_shared_store(
+        "muse-a", root, keep_keys=set(), max_age_s=100, now=time.time()
+    )
+
+    assert result["removed"] == [f"{root}/inputs/{key}"]
+    assert result["removed_locks"] == [], "lock mồ côi nào cũng không có"
+
+
+def test_gc_shared_store_keeps_copy_whose_lock_is_alive(remote):
+    """Bản copy **đang được đẩy** (lock còn sống) ⇒ giữ (reason ``locked``)."""
+    root = "/home/hatch/.roff"
+    key = "abc123"
+    remote.dirs.add(f"{root}/inputs/{key}")
+    remote.files[f"{root}/inputs/{key}.complete"] = json.dumps(
+        {"source": "/x", "kind": "dir", "size": 1, "mtime": 1.0}
+    )
+    remote.dir_mtime = time.time() - 10000.0
+    _store_lock(remote, root, key, age_s=60.0, owner=_live_owner())
+
+    result = shared_mod.gc_shared_store(
+        "muse-a", root, keep_keys=set(), max_age_s=100, now=time.time()
+    )
+
+    assert result["removed"] == [], "bản copy đang được đẩy ⇒ không xoá"
+    reasons = {item["reason"] for item in result["skipped"]}
+    assert "locked" in reasons, f"phải báo lý do giữ: {result['skipped']}"
+
+
+def test_gc_json_reports_removed_locks(monkeypatch, tmp_path):
+    """JSON của ``roff gc`` phải **hiện** lock mồ côi đã dọn (B22)."""
+    from roffkit import cli as cli_mod
+
+    monkeypatch.setenv("ROFF_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("ROFF_CACHE_DIR", str(tmp_path / "cache"))
+
+    class _Args:
+        max_age_days = 7.0
+        job_max_age_days = 30.0
+
+    monkeypatch.setattr(
+        cli_mod,
+        "_gc_host_stores",
+        lambda keep, age=None: [
+            {
+                "host": "muse-a",
+                "removed": [],
+                "removed_locks": ["abc123"],
+                "skipped": [],
+                "skipped_locks": [],
+                "freed_mb": 0.0,
+            }
+        ],
+    )
+
+    payload, code = cli_mod._cmd_gc(_Args())
+
+    assert code == 0
+    assert payload["removed_locks"] == ["muse-a:abc123"]
+    assert payload["removed_locks_count"] == 1
 
 
 # --------------------------------------------------------------------------

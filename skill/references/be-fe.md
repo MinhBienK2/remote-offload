@@ -102,6 +102,40 @@ The servers are dead, the pushed project and `node_modules` are not (they live
 on the durable mount). Re-run step 3 — skip steps 1 and 2. After a host *wipe*,
 start again at step 1.
 
+## Two hosts — backend on A, frontend on B
+
+When the two servers live on **different** hosts, host↔host does not connect
+directly on this fleet (the bridge dies at the SSH banner). `roff tunnel link`
+routes the traffic through the local machine:
+
+```bash
+# B phục vụ (backend). Dịch vụ trên B phải LISTEN trước.
+roff tunnel link --from <aliasA> --to <aliasB> --rport 8000 --to-port 8000
+```
+
+Now a process **on A** that calls `127.0.0.1:8000` reaches the service on B:
+
+```
+A :8000  ──(ssh -R)──▶  local :18500  ──(ssh -L)──▶  B :8000
+```
+
+* `--rport` is the port **A** listens on. `--to-port` is the port the service
+  listens on **B** (defaults to `--rport`). `--via-lport` is the intermediate
+  port on the local machine — auto-chosen in 18500–18599 when you omit it.
+* The link checks that **both** ends are LISTENing before reporting success
+  (`a_listening`, `b_listening` in the JSON). `b_listening: false` means the
+  service on B was not up and **nothing was opened**.
+* Start the frontend on A **after** the link, pointing it at
+  `127.0.0.1:<rport>` — not at B's address.
+
+Tear it down (clears both branches, not just one):
+
+```bash
+roff tunnel stop --from <aliasA> --rport 8000
+```
+
+`roff tunnel list` shows the links that are open.
+
 ## When not to use this recipe
 
 - The user wants the dev server on their own machine (HMR, their own GPU, a

@@ -53,8 +53,8 @@ roff do --cmd '<shell>' [options]
 | `--each` | | | glob item cho lô |
 | `--shards` | | 1 | số shard |
 | `--after` | | | chờ job khác xong, vd `job:261123-101530-ab12` |
-| `--sync-back` | | | kéo về các path chỉ định trong project; lặp lại được |
-| `--checkpoint` | | | thư mục để checkpoint định kỳ |
+| `--sync-back` | | | kéo path chỉ định về **project**; lặp lại được. Path **tương đối** ⇒ tính theo **thư mục làm việc lúc gọi `roff do`**; path **tuyệt đối** ⇒ giữ nguyên. Path nằm ngoài project **và** ngoài mọi `--in` ⇒ **từ chối lúc gửi job** (exit 2, `sync_back_outside_project`). Kéo hỏng ⇒ exit 74 `sync_back_failed` |
+| `--checkpoint` | | | thư mục **trên host** để **job tự** lưu checkpoint (`$ROFF_CHECKPOINT`). `roff` **không** tự chụp snapshot — nó chỉ tạo thư mục và export biến |
 | `--env` | | | `KEY=VALUE`; lặp lại được |
 | `--retry` | | 1 | số lần failover |
 | `--side-effects` | | | job không chạy lại được ⇒ không retry |
@@ -93,6 +93,12 @@ Nhiều `--in` → tất cả được đưa lên host, export:
 
 `host_reasons` là list string, đọc được bởi agent và người nghiệm thu.
 
+**`inferred_needs`** — tool **suy ra** từ câu lệnh (vd `ffmpeg -i in.mp4 out.mp4`
+⇒ `["ffmpeg"]`, `npm test` ⇒ `["node"]`), tên đã chuẩn hoá (`npm` ⇒ `node`).
+Đây là tiêu chí **MỀM**: host thiếu tool suy ra **vẫn được chọn**, chỉ bị
+đẩy xuống thấp hơn; `--need` (viết rõ) mới là tiêu chí **cứng** ⇒ thiếu tool
+thì host bị loại. `inferred_needs` là `[]` khi câu lệnh không đủ dấu hiệu.
+
 `state` có 2 giá trị:
 
 | `state` | Nghĩa | Job đã chạy chưa? |
@@ -120,12 +126,29 @@ Chờ tới trạng thái cuối. **Poll ledger cục bộ**, không ssh mỗi v
 |---|---|---|
 | job xong, exit 0 | 0 | `{"ok":true,"state":"exited","exit":0}` |
 | job xong, exit khác 0 | 1 | `{"ok":true,"state":"exited","exit":1,"reason":"job_failed"}` |
+| job xong, exit 0 nhưng **artifact chưa về** | **74** | `{"ok":false,"state":"exited","exit":0,"reason":"pull_failed","pulled":false,"pull_error":"…"}` |
+| job xong, exit 0, artifact **đã** về nhưng path `--sync-back` **chưa** về | **74** | `{"ok":false,"state":"exited","exit":0,"reason":"sync_back_failed","pulled":true,"sync_back_error":"…"}` — `pulled` vẫn `true` vì artifact **chính** đã về |
 | job mất | 69 | `{"ok":false,"state":"lost","reason":"host_restarted"}` |
 | hết giờ | **124** | `{"ok":true,"state":"running","exit_code":124}` — **không phải lỗi** |
 
 `state` trong JSON là **state thật** của job lúc hết giờ: `"running"` nếu đã
 launch, `"queued"` nếu còn đang chờ slot. Cả hai đều exit 124 và **không**
 phải lỗi.
+
+**Exit 74 — phải phân biệt với exit 1 (B23).** `1` = *job* fail ⇒ **đừng**
+chạy lại job. `74` = job **đã chạy xong thành công** (`exit` trong JSON vẫn là
+`0`) nhưng bước **kéo artifact về local** hỏng (thường do reverse tunnel rớt)
+⇒ **kéo lại** bằng `roff pull <job> --local <dir>`, **không** cần chạy lại job.
+
+`pulled` trong JSON là trạng thái thật của lần kéo: `true` = artifact **đã** nằm
+trong `--out`; `false` + `pull_error` khác rỗng = **chưa** về.
+
+**Exit 74 với `reason=sync_back_failed` (B26).** Job **đã** chạy xong (`exit:0`),
+artifact **đã** về (`pulled:true`), nhưng path `--sync-back` **không** về local
+(`sync_back_error` khác rỗng) ⇒ vẫn exit **74** ⇒ **kéo lại** bằng
+`roff pull <job> --local <dir>` (lần này kéo cả các path `--sync-back` về đúng
+đích của chúng), **không** chạy lại job. `roff pull` thành công ⇒ xoá
+`sync_back_error` ⇒ `roff wait` trở lại exit 0.
 
 ## 3. `roff status <job_id>`
 
@@ -187,10 +210,79 @@ Chạy setup script idempotent. JSON `{ok, host, name, ensured, skipped, detail}
 ```
 `remote_listening` là `true` / `false` / `null` (null = **không kiểm tra được**, khác hẳn false).
 
+### 13.1 `roff tunnel link --from A --to B --rport P [--via-lport V] [--to-port Q]`
+
+Nối phối hợp giữa **2 máy** qua máy local (host↔host không nối thẳng trên
+fleet này): tiến trình ở máy A gọi `127.0.0.1:P` là nói chuyện với dịch vụ
+đang LISTEN ở máy B.
+
+```json
+{"ok": true, "exit_code": 0, "from": "muse-pmb333", "to": "muse-tampt",
+ "rport": 19000, "to_port": 18899, "via_lport": 18500,
+ "a_listening": true, "b_listening": true, "note": "a_listening=True; b_listening=True"}
+```
+
+* `via_lport` — cổng trung gian trên máy local; mặc định tự chọn trong dải
+  **18500–18599** (chọn bằng cách bind thật). `--to-port` mặc định = `--rport`.
+* `a_listening` / `b_listening` — đã kiểm tra LISTEN ở cả hai đầu chưa; `null`
+  = **không kiểm tra được** (khác hẳn `false`).
+* Lỗi ⇒ `ok:false` + `reason` (xem `docs/API-CONTRACT.md` §17) + `error`
+  tiếng Việt; host không với được ⇒ exit 255 kèm `detail` nguyên văn lỗi ssh.
+  Nếu máy `--to` không có gì đang LISTEN ⇒ lỗi `remote_not_listening` và
+  **không** mở forward nào.
+
+### 13.2 `roff tunnel stop --from A --rport P`
+
+Dọn **cả hai** nhánh của link (`-R` trên A và `-L` qua B). JSON
+`{ok, from, rport, to_port, via_lport, stopped, remote_stopped, local_stopped,
+master_stopped, detail}`. `roff tunnel list` liệt kê link đang mở trong mảng
+`links`.
+
 ## 14. `roff gc`
 
 Dọn cache local theo LRU (giữ dưới `cache_max_mb`, không xoá khi disk trống < `cache_min_free_mb`).
 JSON `{ok, freed_mb, removed}`.
+
+| Cờ | Mặc định | Nghĩa |
+|---|---|---|
+| `--max-age-days N` | `7` | xoá bản copy trong **kho input dùng chung** của host nếu cũ hơn N ngày |
+| `--job-max-age-days N` | `30` | xoá job terminal trong ledger nếu cũ hơn N ngày |
+
+> **Cả hai cờ nhận giá trị `0`** ⇒ "xoá mọi thứ đủ điều kiện, kể cả thứ vừa
+> mới tạo" (dùng để dọn khi kiểm chứng). Giá trị **âm** ⇒ exit **2** với
+> `reason=invalid_option` (như `--timeout`/`--cpus`). Trước B32, `0` bị nuốt
+> (0 là *falsy*) ⇒ `--max-age-days 0` thành 7 ngày ⇒ kho input **phình vô hạn**.
+
+Ngoài ra `roff gc` **dọn ledger job**: xoá job **định dạng cũ** (file không
+có khoá `state` ⇒ rác, giữ slot ⇒ `roff wait` treo), job terminal quá
+`--job-max-age-days` (mặc định **30**), và file phụ `.heartbeat`/`.env` mồ côi.
+Job đang chạy/xếp hàng **không** bị xoá. JSON có thêm `removed_jobs`,
+`removed_jobs_count`, `skipped_jobs`, `freed_jobs_mb` (`freed_mb` = tổng).
+
+`gc` cũng dọn **lock mồ côi** trên host (B22): thư mục `<key>.lock` quá hạn mà
+chủ đã chết ⇒ xoá. Lock **còn chủ** (tiến trình đang giữ) hoặc thuộc job đang
+chạy ⇒ **giữ**. JSON có thêm `removed_locks` (dạng `"<host>:<key>"`) và
+`removed_locks_count`; từng host trong `hosts` có `removed_locks` +
+`skipped_locks` (`{"key", "reason"}`, reason: `in_use` / `locked` /
+`host_unreachable` / `remove_failed`).
+
+## 14.1 `roff doctor [--probe]`
+
+Chẩn đoán sức khoẻ hệ thống — **chỉ báo, không sửa gì** (không ghi file, không
+đổi quyền, không kill tiến trình).
+
+```json
+{"ok": false, "exit_code": 1, "problems": 2,
+ "checks": [{"name": "config", "ok": true, "detail": "..."}]}
+```
+
+* `problems` = số check `ok:false`; `ok` = (`problems == 0`); exit **1** khi có
+  vấn đề, **0** khi sạch.
+* Mặc định **không** probe mạng (đọc cache) ⇒ chạy < 1 s; `--probe` mới probe
+  thật host.
+* Check lỗi không làm hỏng lệnh (check đó thành `ok:false` với `detail`).
+* Tên check: `config`, `wrapper`, `hook`, `fleet`, `state_perms`,
+  `orphan_jobs`, `disk_local`.
 
 ## 15. `roff __watch <job_id>` (nội bộ)
 
@@ -231,11 +323,21 @@ dùng được ⇒ exit **10** với `error` liệt kê host nào bị loại v�
 |---|---|
 | `ROFF_STATE_DIR` | thư mục state (mặc định `~/.local/state/roff`) |
 | `ROFF_CONFIG` | đường dẫn config (mặc định `~/.config/roff/config.ini`) |
-| `ROFF_SSH_CONFIG` | đường dẫn `ssh config` khác (mặc định `~/.ssh/config`) |
+| `ROFF_SSH_CONFIG` | đường dẫn `ssh config` khác (mặc định `~/.ssh/config`) — mọi lệnh ssh sẽ dùng `-F` file này |
+| `ROFF_CACHE_DIR` | thư mục cache local mà `roff gc` dọn (mặc định `<state>/cache`) |
+| `ROFF_NICE` | nice level cho mọi tiến trình ssh/rsync của roff (mặc định `19`) |
+| `ROFF_IONICE` | ionice class cho mọi tiến trình ssh/rsync của roff (mặc định `idle`) |
 | `ROFF_SLOT_WAIT_S` | số giây chờ xin slot khi `roff do` (mặc định `900`) — **giữ cho tương thích**: `roff do` hiện không chờ slot (timeout 0), nên biến này không còn tác dụng |
+| `ROFF_PULL_RETRIES` | số lần **thử lại** kéo artifact khi pull hỏng (mặc định `3`) — reverse tunnel hay flap nên thử lại trước khi báo `pull_failed` (exit 74) |
+| `ROFF_PULL_RETRY_DELAY_S` | giãn cách giữa 2 lần thử kéo artifact, giây (mặc định `5`) |
 | `ROFF_NO_WATCHER=1` | không spawn watcher (chỉ dùng cho test) |
-| `ROFF_SKILL_DIR` | thư mục skill (mặc định: thư mục chứa `roff.py`) |
 | `ROFF_LOCAL=1` | hook bỏ qua; **không** có tác dụng với CLI |
+
+> Thư mục skill **không** cấu hình được: nó suy ra từ vị trí `roff.py` (`__file__`),
+> nên cài skill ở đâu thì chạy đúng bản đó.
+
+Biến của **hook** (không phải của CLI) — xem `skill/hooks/claude-code/README.md`:
+`ROFF_LOCAL=1`, `ROFF_HOOK_OFF=1`, `ROFF_HOOK_OUTPUT=json`, `ROFF_HOOK_TOOLS=name1,name2`.
 
 ## 18. Skill
 
